@@ -426,6 +426,7 @@ class KVTransferThread(threading.Thread):
         self.m_store.set_device()
         self.ready_event.set()
         while True:
+            request_data = None
             try:
                 request_data = self.request_queue.get()
                 if request_data is None:
@@ -440,9 +441,26 @@ class KVTransferThread(threading.Thread):
                     type(e).__name__,
                     e,
                 )
+                try:
+                    self._record_request_error(request_data, e)
+                except Exception as record_error:
+                    logger.error(
+                        "Failed to publish KV transfer thread error. "
+                        "thread=%s, type=%s, error=%s",
+                        self.name,
+                        type(record_error).__name__,
+                        record_error,
+                    )
 
     def _handle_request(self, req_meta: Any):
         pass
+
+    def _record_request_error(
+        self,
+        request_data: Any,
+        error: Exception,
+    ) -> None:
+        """Publish an asynchronous request failure when supported."""
 
     def lookup(
         self,
@@ -1341,6 +1359,35 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             page_size_bytes,
             num_layers,
         )
+        self._layer_errors: dict[int, str] = {}
+        self._layer_errors_lock = threading.Lock()
+
+    def _set_layer_error(self, layer_id: int, message: str) -> None:
+        with self._layer_errors_lock:
+            self._layer_errors[layer_id] = message
+
+    def pop_layer_error(self, layer_id: int) -> str | None:
+        with self._layer_errors_lock:
+            return self._layer_errors.pop(layer_id, None)
+
+    def clear_layer_errors(self) -> None:
+        with self._layer_errors_lock:
+            self._layer_errors.clear()
+
+    def _record_request_error(
+        self,
+        request_data: Any,
+        error: Exception,
+    ) -> None:
+        layer_id = getattr(request_data, "layer_id", None)
+        if not isinstance(layer_id, int):
+            return
+        self._set_layer_error(
+            layer_id,
+            "Layerwise KV load thread failed for "
+            f"layer {layer_id}: {type(error).__name__}: {error}",
+        )
+        self.layer_load_finished_events[layer_id].set()
 
     def build_shared_data(self, task: LayerTransferTask) -> SharedBlockData | None:
         """Pre-compute shared block data for all layers (GVA path)."""
@@ -1427,7 +1474,12 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.max_transfer_bytes,
         )
         if res != 0:
-            logger.error("Layerwise %d load batch_copy failed with return code %d", layer_id, res)
+            error_message = (
+                f"Layerwise KV load batch_copy failed for layer {layer_id} "
+                f"with return code {res}."
+            )
+            logger.error(error_message)
+            self._set_layer_error(layer_id, error_message)
         # Release read leases immediately after the last layer's batch_copy
         # completes. The lease was needed to protect the blob during all 27
         # layers of batch_copy G2L; once reading is done, release right away.
@@ -1438,7 +1490,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 len(req_meta.load_keys),
                 layer_id,
             )
-        if layer_id == self.final_layer_id:
+        if layer_id == self.final_layer_id and res == 0:
             for req_id, is_last_chunk in zip(req_meta.req_ids, req_meta.is_last_chunks):
                 if is_last_chunk:
                     self.set_finished_request(req_id)

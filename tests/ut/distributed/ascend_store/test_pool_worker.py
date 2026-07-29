@@ -1464,6 +1464,74 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         worker.wait_for_layer_load()
         self.assertEqual(worker.kv_recv_thread.add_request.call_count, 3)
 
+    def test_layerwise_load_wait_raises_transfer_error(self):
+        worker = self._make_worker()
+        worker.use_layerwise = True
+        worker.num_layers = 1
+        worker.current_load_layer = 0
+        worker.next_layer_to_submit = 0
+        worker.num_prefetch_layers = 1
+        worker.kv_recv_thread = MagicMock()
+        worker.kv_recv_thread.pop_layer_error.return_value = (
+            "Layerwise KV load batch_copy failed for layer 0."
+        )
+        worker.layer_load_tasks = [[MagicMock()]]
+        worker.layer_load_finished_events = [threading.Event()]
+        worker.layer_load_finished_events[0].set()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "batch_copy failed for layer 0",
+        ):
+            worker.wait_for_layer_load()
+
+        self.assertEqual(worker.current_load_layer, 1)
+        self.assertFalse(worker.layer_load_finished_events[0].is_set())
+
+    def test_layerwise_load_wait_raises_timeout(self):
+        worker = self._make_worker()
+        worker.use_layerwise = True
+        worker.num_layers = 1
+        worker.current_load_layer = 0
+        worker.next_layer_to_submit = 0
+        worker.num_prefetch_layers = 1
+        worker.kv_recv_thread = MagicMock()
+        worker.layer_load_tasks = [[MagicMock()]]
+        wait_event = MagicMock()
+        wait_event.wait.return_value = False
+        worker.layer_load_finished_events = [wait_event]
+
+        with self.assertRaisesRegex(
+            TimeoutError,
+            "waiting for layer 0",
+        ):
+            worker.wait_for_layer_load()
+
+        self.assertEqual(worker.current_load_layer, 0)
+        wait_event.clear.assert_not_called()
+
+    def test_layerwise_recv_thread_publishes_async_error(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
+            KVCacheStoreLayerRecvingThread,
+        )
+
+        recv_thread = KVCacheStoreLayerRecvingThread.__new__(
+            KVCacheStoreLayerRecvingThread
+        )
+        recv_thread._layer_errors = {}
+        recv_thread._layer_errors_lock = threading.Lock()
+        recv_thread.layer_load_finished_events = [threading.Event()]
+
+        recv_thread._record_request_error(
+            MagicMock(layer_id=0),
+            ValueError("broken transfer"),
+        )
+
+        self.assertTrue(recv_thread.layer_load_finished_events[0].is_set())
+        error = recv_thread.pop_layer_error(0)
+        self.assertIn("ValueError: broken transfer", error)
+        self.assertIsNone(recv_thread.pop_layer_error(0))
+
 
 if __name__ == "__main__":
     unittest.main()

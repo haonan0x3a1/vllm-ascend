@@ -668,6 +668,13 @@ class KVPoolWorker:
             if self.layer_save_finished_events is not None:
                 for event in self.layer_save_finished_events:
                     event.clear()
+            clear_load_errors = getattr(
+                self.kv_recv_thread,
+                "clear_layer_errors",
+                None,
+            )
+            if callable(clear_load_errors):
+                clear_load_errors()
             reset_attention_compute_start_gate()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
@@ -1194,10 +1201,20 @@ class KVPoolWorker:
             return
         is_finish = self.layer_load_finished_events[layer_id].wait(timeout=10)
         if not is_finish:
-            logger.info("Layerwise %d load wait timed out", layer_id)
+            raise TimeoutError(
+                f"Layerwise KV load timed out while waiting for layer {layer_id}."
+            )
+        error_getter = getattr(self.kv_recv_thread, "pop_layer_error", None)
+        layer_error = (
+            error_getter(layer_id)
+            if callable(error_getter)
+            else None
+        )
         logger.debug(">>>>>>>>>>>>>>>>>>>> clear load layer %d", layer_id)
         self.layer_load_finished_events[layer_id].clear()
         self.current_load_layer += 1
+        if isinstance(layer_error, str) and layer_error:
+            raise RuntimeError(layer_error)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         with self._invalid_block_ids_lock:
