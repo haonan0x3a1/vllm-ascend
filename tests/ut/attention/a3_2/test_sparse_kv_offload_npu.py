@@ -131,9 +131,7 @@ def test_host_mode_persists_prefill_rows_and_gathers_from_framework_swapped_kv(
     full_rope.fill_(-1)
     prefill_nope = torch.zeros_like(full_nope)
     prefill_rope = torch.zeros_like(full_rope)
-    logical_tokens = torch.arange(256, dtype=torch.float32, device=device).to(
-        dtype
-    )
+    logical_tokens = torch.arange(256, dtype=torch.float32, device=device).to(dtype)
 
     prefill_nope[2, :, 0, 0] = logical_tokens[:BLOCK_SIZE]
     prefill_nope[2, :, 0, 1] = logical_tokens[:BLOCK_SIZE] + 1

@@ -59,10 +59,7 @@ def _allocate_swapped_memory(
 ) -> torch.Tensor:
     allocator = getattr(torch_npu, "empty_with_swapped_memory", None)
     if not callable(allocator):
-        raise RuntimeError(
-            "torch_npu.empty_with_swapped_memory is required by "
-            "sparse_kv_offload."
-        )
+        raise RuntimeError("torch_npu.empty_with_swapped_memory is required by sparse_kv_offload.")
     return allocator(shape, dtype=dtype, device=device)
 
 
@@ -105,10 +102,7 @@ class SparseKVOffloadWorkspace:
                 f"A3 device, got {get_ascend_device_type().name}."
             )
         if index_topk != 2048:
-            raise ValueError(
-                f"sparse_kv_offload {mode} mode currently requires "
-                f"index_topk=2048, got {index_topk}."
-            )
+            raise ValueError(f"sparse_kv_offload {mode} mode currently requires index_topk=2048, got {index_topk}.")
 
         self.mode = mode
         self.index_topk = index_topk
@@ -233,10 +227,7 @@ class SparseKVOffloadWorkspace:
         if full_nope.dtype != full_rope.dtype:
             raise ValueError("MLA nope and rope cache dtypes must match.")
         if full_nope.dtype not in SUPPORTED_KV_DTYPES:
-            raise ValueError(
-                "sparse_kv_offload only supports BF16/FP16 KV cache, got "
-                f"{full_nope.dtype}."
-            )
+            raise ValueError(f"sparse_kv_offload only supports BF16/FP16 KV cache, got {full_nope.dtype}.")
         if full_nope.device != full_rope.device:
             raise ValueError("MLA nope and rope caches must be on the same device.")
 
@@ -335,8 +326,7 @@ class SparseKVOffloadWorkspace:
             raise ValueError("slot_mapping_cpu must reside on CPU.")
         if slot_mapping_cpu.ndim != 1:
             raise ValueError(
-                "slot_mapping_cpu must be a flat physical-slot tensor, got "
-                f"shape {tuple(slot_mapping_cpu.shape)}."
+                f"slot_mapping_cpu must be a flat physical-slot tensor, got shape {tuple(slot_mapping_cpu.shape)}."
             )
         if num_actual_tokens < 0 or num_actual_tokens > slot_mapping_cpu.numel():
             raise ValueError(
@@ -353,8 +343,7 @@ class SparseKVOffloadWorkspace:
         max_slot = int(valid_slots.max())
         if max_slot >= total_slots:
             raise ValueError(
-                f"slot_mapping references physical slot {max_slot}, but the "
-                f"KV cache has only {total_slots} slots."
+                f"slot_mapping references physical slot {max_slot}, but the KV cache has only {total_slots} slots."
             )
 
         device_slots = valid_slots.to(
@@ -404,10 +393,7 @@ class SparseKVOffloadWorkspace:
     ) -> tuple[int, ...]:
         """Copy the current layer's shared NPU prefill cache into Full Host KV."""
         if self.mode != "host":
-            raise RuntimeError(
-                "persist_prefill_blocks is only valid in sparse KV offload "
-                "host mode."
-            )
+            raise RuntimeError("persist_prefill_blocks is only valid in sparse KV offload host mode.")
         assert self.prefill_kv_cache is not None
         return self._copy_updated_slots(
             self.prefill_kv_cache,
@@ -430,10 +416,7 @@ class SparseKVOffloadWorkspace:
         computed blocks from its Host Full-KV before Attention can read them.
         """
         if self.mode != "host":
-            raise RuntimeError(
-                "restore_prefill_context is only valid in sparse KV offload "
-                "host mode."
-            )
+            raise RuntimeError("restore_prefill_context is only valid in sparse KV offload host mode.")
         if context_len < 0:
             raise ValueError(f"context_len must be non-negative, got {context_len}.")
         if context_len == 0:
@@ -447,22 +430,17 @@ class SparseKVOffloadWorkspace:
             )
         if context_len > self.num_full_blocks * self.block_size:
             raise ValueError(
-                f"context_len={context_len} exceeds Full KV capacity "
-                f"{self.num_full_blocks * self.block_size}."
+                f"context_len={context_len} exceeds Full KV capacity {self.num_full_blocks * self.block_size}."
             )
 
-        num_context_blocks = (
-            context_len + self.block_size - 1
-        ) // self.block_size
+        num_context_blocks = (context_len + self.block_size - 1) // self.block_size
         if num_context_blocks > full_block_table_cpu.shape[1]:
             raise ValueError(
                 f"Context requires {num_context_blocks} blocks, but the CPU "
                 f"block table has only {full_block_table_cpu.shape[1]} entries."
             )
 
-        physical_block_ids = torch.unique(
-            full_block_table_cpu[0, :num_context_blocks].to(torch.int64)
-        )
+        physical_block_ids = torch.unique(full_block_table_cpu[0, :num_context_blocks].to(torch.int64))
         if physical_block_ids.numel() == 0:
             return ()
         min_block = int(physical_block_ids.min())

@@ -86,9 +86,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
 
-    @patch(
-        "vllm_ascend.worker.model_runner_v1.torch_npu.empty_with_swapped_memory"
-    )
+    @patch("vllm_ascend.worker.model_runner_v1.torch_npu.empty_with_swapped_memory")
     def test_allocate_swapped_cache_uses_torch_npu_allocator(
         self,
         mock_empty_with_swapped_memory,
@@ -148,25 +146,13 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         runner._bind_sparse_kv_offload_prefill_cache(kv_caches)
 
-        first_prefill = (
-            first_layer.impl.set_sparse_kv_offload_prefill_cache.call_args.args[
-                0
-            ]
-        )
-        second_prefill = (
-            second_layer.impl.set_sparse_kv_offload_prefill_cache.call_args.args[
-                0
-            ]
-        )
+        first_prefill = first_layer.impl.set_sparse_kv_offload_prefill_cache.call_args.args[0]
+        second_prefill = second_layer.impl.set_sparse_kv_offload_prefill_cache.call_args.args[0]
         self.assertIs(first_prefill, second_prefill)
         self.assertEqual(first_prefill[0].shape, kv_caches[first_name][0].shape)
         self.assertEqual(first_prefill[1].shape, kv_caches[first_name][1].shape)
-        first_layer.impl.initialize_sparse_kv_offload_workspace.assert_called_once_with(
-            kv_caches[first_name]
-        )
-        second_layer.impl.initialize_sparse_kv_offload_workspace.assert_called_once_with(
-            kv_caches[second_name]
-        )
+        first_layer.impl.initialize_sparse_kv_offload_workspace.assert_called_once_with(kv_caches[first_name])
+        second_layer.impl.initialize_sparse_kv_offload_workspace.assert_called_once_with(kv_caches[second_name])
 
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
     def test_reset_host_mode_selection_state_for_sparse_mla_layers(

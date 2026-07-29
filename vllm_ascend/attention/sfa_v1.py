@@ -1357,13 +1357,9 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> None:
         """Bind the model-runner-owned cross-layer prefill NPU workspace."""
         if not self.sparse_kv_offload_config.enabled:
-            raise RuntimeError(
-                "Cannot bind a sparse KV offload prefill cache when the feature is disabled."
-            )
+            raise RuntimeError("Cannot bind a sparse KV offload prefill cache when the feature is disabled.")
         if self.sparse_kv_offload_config.mode != "host":
-            raise RuntimeError(
-                "The shared prefill cache is only used by sparse KV offload host mode."
-            )
+            raise RuntimeError("The shared prefill cache is only used by sparse KV offload host mode.")
         self.sparse_kv_offload_prefill_cache = prefill_kv_cache
 
     def initialize_sparse_kv_offload_workspace(
@@ -1406,8 +1402,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             return
         if attn_metadata.block_table_cpu is None:
             raise RuntimeError(
-                "sparse_kv_offload host mode requires a CPU block table for "
-                "chunked-prefill context restoration."
+                "sparse_kv_offload host mode requires a CPU block table for chunked-prefill context restoration."
             )
         if attn_metadata.num_computed_tokens_cpu is None:
             raise RuntimeError(

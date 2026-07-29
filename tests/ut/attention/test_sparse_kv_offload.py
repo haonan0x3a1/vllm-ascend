@@ -175,10 +175,13 @@ def test_host_workspace_uses_shared_prefill_cache_and_persists_only_touched_slot
     assert forward_cache[0] is prefill_nope
     assert forward_cache[1] is prefill_rope
     assert forward_cache[2] is indexer_cache
-    assert workspace.get_forward_kv_cache(
-        full_kv_cache,
-        is_decode=True,
-    ) is full_kv_cache
+    assert (
+        workspace.get_forward_kv_cache(
+            full_kv_cache,
+            is_decode=True,
+        )
+        is full_kv_cache
+    )
 
     updated_blocks = workspace.persist_prefill_blocks(
         full_kv_cache,
