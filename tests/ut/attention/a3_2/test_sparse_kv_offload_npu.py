@@ -30,6 +30,21 @@ BLOCK_SIZE = 128
 INDEX_TOPK = 2048
 
 
+def _allocate_framework_swapped_cache(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Match the model runner's raw-int8 swapped allocation and dtype view."""
+    dtype_size = torch.empty((), dtype=dtype).element_size()
+    raw_storage = torch_npu.empty_with_swapped_memory(
+        (math.prod(shape) * dtype_size,),
+        dtype=torch.int8,
+        device=device,
+    )
+    return raw_storage.view(dtype).view(shape)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gather_reads_full_kv_from_swapped_memory(dtype):
     device = torch.device("npu")
@@ -117,15 +132,15 @@ def test_host_mode_persists_prefill_rows_and_gathers_from_framework_swapped_kv(
     dtype,
 ):
     device = torch.device("npu")
-    full_nope = torch_npu.empty_with_swapped_memory(
+    full_nope = _allocate_framework_swapped_cache(
         (4, BLOCK_SIZE, 1, 2),
-        dtype=dtype,
-        device=device,
+        dtype,
+        device,
     )
-    full_rope = torch_npu.empty_with_swapped_memory(
+    full_rope = _allocate_framework_swapped_cache(
         (4, BLOCK_SIZE, 1, 1),
-        dtype=dtype,
-        device=device,
+        dtype,
+        device,
     )
     full_nope.fill_(-1)
     full_rope.fill_(-1)
@@ -214,15 +229,15 @@ def test_host_mode_persists_prefill_rows_and_gathers_from_framework_swapped_kv(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_host_mode_restores_chunked_prefill_context(dtype):
     device = torch.device("npu")
-    full_nope = torch_npu.empty_with_swapped_memory(
+    full_nope = _allocate_framework_swapped_cache(
         (4, BLOCK_SIZE, 1, 2),
-        dtype=dtype,
-        device=device,
+        dtype,
+        device,
     )
-    full_rope = torch_npu.empty_with_swapped_memory(
+    full_rope = _allocate_framework_swapped_cache(
         (4, BLOCK_SIZE, 1, 1),
-        dtype=dtype,
-        device=device,
+        dtype,
+        device,
     )
     full_nope.fill_(-1)
     full_rope.fill_(-1)
@@ -346,15 +361,15 @@ def test_host_gather_selected_sfa_matches_full_npu_kv_sfa(dtype):
         actual_key,
     )
 
-    host_nope = torch_npu.empty_with_swapped_memory(
+    host_nope = _allocate_framework_swapped_cache(
         tuple(full_nope.shape),
-        dtype=dtype,
-        device=device,
+        dtype,
+        device,
     )
-    host_rope = torch_npu.empty_with_swapped_memory(
+    host_rope = _allocate_framework_swapped_cache(
         tuple(full_rope.shape),
-        dtype=dtype,
-        device=device,
+        dtype,
+        device,
     )
     host_nope.fill_(0)
     host_rope.fill_(0)

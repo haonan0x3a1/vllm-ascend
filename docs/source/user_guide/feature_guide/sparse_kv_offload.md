@@ -119,6 +119,21 @@ non-block-aligned prompts. vLLM still recomputes the final prompt token before
 sampling; the consumer loads whichever full or request-tail block contains the
 preceding KV rows.
 
+Before starting a model, the exact mixed-memory transfer path can be verified
+without model weights. Start the MemCache MetaService, export
+`MMC_LOCAL_CONFIG_PATH`, and run:
+
+```bash
+VLLM_ASCEND_RUN_MEMCACHE_INTEGRATION_TEST=1 \
+python -m pytest -sv \
+  tests/e2e/nightly/single_node/ops/singlecard_ops/test_sparse_kv_offload_memcache.py
+```
+
+The opt-in test saves and reloads one mixed cache tuple containing Host-backed
+MLA Full KV tensors from `empty_with_swapped_memory` and an NPU-resident
+Lightning Indexer tensor. It is skipped by default because a live MemCache
+deployment is an external prerequisite.
+
 The feature is disabled by default. When disabled, allocation and SFA execution
 remain unchanged.
 
