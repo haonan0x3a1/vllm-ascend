@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import scipy  # type: ignore
@@ -19,12 +19,17 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
+from vllm_ascend.attention.sparse_kv_offload import (
+    GatherSelectionOp,
+    SparseKVOffloadWorkspace,
+    get_gather_selection_kv_cache_op,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
@@ -179,6 +184,8 @@ class AscendSFAMetadata:
     sin: torch.Tensor
     cos: torch.Tensor
 
+    # CPU slot mapping used by sparse KV offload without NPU synchronization.
+    slot_mapping_cpu: torch.Tensor | None = None
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
     # The dimension of the attention heads
@@ -303,11 +310,12 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
+        slot_mapping_cpu = common_attn_metadata.slot_mapping_cpu
+        if slot_mapping_cpu is not None:
+            slot_mapping_cpu = slot_mapping_cpu[:num_input_tokens]
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
 
         block_size = 128
-        if get_ascend_config().c8_enable_reshape_optim:
-            slot_mapping_cpu = common_attn_metadata.slot_mapping_cpu[:num_input_tokens]
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
@@ -425,6 +433,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             slot_mapping=slot_mapping,
+            slot_mapping_cpu=slot_mapping_cpu,
             head_dim=self.model_config.get_head_size(),
             attn_mask=self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config),
             attn_state=common_attn_metadata.attn_state,
@@ -513,6 +522,25 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         ascend_config = get_ascend_config()
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
+        sparse_kv_offload_config = getattr(
+            ascend_config,
+            "sparse_kv_offload",
+            None,
+        )
+        self.sparse_kv_offload_config = (
+            sparse_kv_offload_config
+            if isinstance(sparse_kv_offload_config, SparseKVOffloadConfig)
+            else SparseKVOffloadConfig()
+        )
+        self.sparse_kv_offload_workspace: SparseKVOffloadWorkspace | None = None
+        self.sparse_kv_offload_gather_op: GatherSelectionOp | None = None
+        if self.sparse_kv_offload_config.enabled:
+            if get_ascend_device_type() != AscendDeviceType.A3:
+                raise RuntimeError(
+                    "sparse_kv_offload mirror mode currently requires an "
+                    f"Ascend A3 device, got {get_ascend_device_type().name}."
+                )
+            self.sparse_kv_offload_gather_op = get_gather_selection_kv_cache_op()
 
         # The MLAPO operator fuses the pre-processing steps on Q/K/V in MLA into a single operator
         # NOTE: it imposes a limit on the number of input tokens and conflicts with FlashComm
@@ -1279,6 +1307,78 @@ class AscendSFAImpl(MLAAttentionImpl):
             topk_indices_to_cache = topk_indices_to_cache.squeeze(1)
         topk_indices_buffer.copy_(topk_indices_to_cache)
 
+    def _get_sparse_kv_offload_workspace(
+        self,
+        kv_cache: tuple[torch.Tensor, ...],
+    ) -> SparseKVOffloadWorkspace:
+        workspace = self.sparse_kv_offload_workspace
+        if workspace is None:
+            hf_text_config = self.vllm_config.model_config.hf_text_config
+            workspace = SparseKVOffloadWorkspace(
+                kv_cache,
+                index_topk=hf_text_config.index_topk,
+                block_size=self.vllm_config.cache_config.block_size,
+                gather_op=self.sparse_kv_offload_gather_op,
+            )
+            self.sparse_kv_offload_workspace = workspace
+        return workspace
+
+    def _prepare_sparse_kv_offload_attention(
+        self,
+        kv_cache: tuple[torch.Tensor, ...],
+        topk_indices: torch.Tensor,
+        attn_metadata: M,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+    ) -> tuple[
+        tuple[torch.Tensor, ...],
+        torch.Tensor,
+        M,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        if not self.sparse_kv_offload_config.enabled:
+            return (
+                kv_cache,
+                topk_indices,
+                attn_metadata,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+            )
+
+        workspace = self._get_sparse_kv_offload_workspace(kv_cache)
+        workspace.sync_updated_blocks(
+            kv_cache,
+            attn_metadata.slot_mapping_cpu,
+            attn_metadata.num_actual_tokens,
+        )
+        if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+            return (
+                kv_cache,
+                topk_indices,
+                attn_metadata,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+            )
+
+        selection = workspace.gather(
+            topk_indices=topk_indices,
+            full_block_table=attn_metadata.block_table,
+            full_actual_seq_lengths=actual_seq_lengths_key,
+            full_query_actual_seq_lengths=actual_seq_lengths_query,
+        )
+        selected_metadata = replace(
+            attn_metadata,
+            block_table=selection.block_table,
+        )
+        return (
+            selection.kv_cache,
+            selection.sparse_indices,
+            selected_metadata,
+            selection.actual_seq_lengths_query,
+            selection.actual_seq_lengths_kv,
+        )
+
     def _execute_sparse_flash_attention_process(
         self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
     ):
@@ -1624,8 +1724,28 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
 
+        (
+            kv_cache_for_attention,
+            topk_indices,
+            attn_metadata_for_attention,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+        ) = self._prepare_sparse_kv_offload_attention(
+            kv_cache,
+            topk_indices,
+            attn_metadata,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+        )
+
         attn_output = self._execute_sparse_flash_attention_process(
-            ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+            ql_nope,
+            q_pe,
+            kv_cache_for_attention,
+            topk_indices,
+            attn_metadata_for_attention,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
         )
 
         attn_output = self._v_up_proj(attn_output)

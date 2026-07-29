@@ -20,6 +20,7 @@ epd_disaggregation
 kv_pool
 layerwise_kv_pool
 kv_cache_cpu_offload
+sparse_kv_offload_mirror
 external_dp
 large_scale_ep
 ucm_deployment

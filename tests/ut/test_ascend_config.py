@@ -21,7 +21,12 @@ from unittest.mock import patch
 from vllm.config import KVTransferConfig, VllmConfig
 
 from tests.ut.base import TestBase
-from vllm_ascend.ascend_config import clear_ascend_config, get_ascend_config, init_ascend_config
+from vllm_ascend.ascend_config import (
+    SparseKVOffloadConfig,
+    clear_ascend_config,
+    get_ascend_config,
+    init_ascend_config,
+)
 from vllm_ascend.utils import clear_enable_sp, enable_sp, get_flashcomm2_config_and_validate
 
 
@@ -61,6 +66,7 @@ class TestAscendConfig(TestBase):
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
+        self.assertFalse(ascend_config.sparse_kv_offload.enabled)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -420,3 +426,120 @@ class TestAscendConfig(TestBase):
         second_ascend_config = init_ascend_config(second_vllm_config)
         self.assertIsNot(first_ascend_config, second_ascend_config)
         self.assertTrue(second_ascend_config.ascend_compilation_config.enable_npugraph_ex)
+
+
+class TestSparseKVOffloadConfig(TestBase):
+    @staticmethod
+    def _make_vllm_config():
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    index_topk=2048,
+                    model_type="deepseek_v32",
+                ),
+                enforce_eager=True,
+            ),
+            scheduler_config=SimpleNamespace(max_num_seqs=1),
+            cache_config=SimpleNamespace(
+                block_size=128,
+                enable_prefix_caching=False,
+            ),
+            speculative_config=None,
+            kv_transfer_config=None,
+            additional_config={},
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+            ),
+        )
+
+    def test_parse_defaults_and_mirror_mode(self):
+        self.assertEqual(SparseKVOffloadConfig.from_dict(None), SparseKVOffloadConfig())
+        self.assertEqual(
+            SparseKVOffloadConfig.from_dict(
+                {
+                    "enabled": True,
+                    "mode": "mirror",
+                }
+            ),
+            SparseKVOffloadConfig(enabled=True, mode="mirror"),
+        )
+
+    def test_parse_rejects_invalid_values(self):
+        invalid_configs = [
+            (True, "must be a dict"),
+            ({"enabled": 1}, "enabled must be a bool"),
+            ({"mode": 1}, "mode must be a string"),
+            ({"mode": "host"}, "only supports 'mirror'"),
+            ({"unknown": True}, "unsupported keys"),
+        ]
+        for raw_config, expected_error in invalid_configs:
+            with self.subTest(raw_config=raw_config), self.assertRaisesRegex(ValueError, expected_error):
+                SparseKVOffloadConfig.from_dict(raw_config)
+
+    def test_validate_accepts_single_request_eager_mirror(self):
+        config = SparseKVOffloadConfig(enabled=True)
+        config.validate(self._make_vllm_config(), enable_sparse_c8=False)
+
+    def test_validate_rejects_unsupported_runtime_combinations(self):
+        cases = [
+            (
+                lambda cfg: setattr(
+                    cfg.model_config.hf_text_config,
+                    "model_type",
+                    "glm_moe_dsa",
+                ),
+                "supports only DeepSeek-V3.2",
+            ),
+            (
+                lambda cfg: setattr(cfg.model_config, "enforce_eager", False),
+                "requires --enforce-eager",
+            ),
+            (
+                lambda cfg: setattr(cfg.scheduler_config, "max_num_seqs", 2),
+                "requires --max-num-seqs 1",
+            ),
+            (
+                lambda cfg: setattr(cfg.cache_config, "block_size", 16),
+                "requires KV cache block_size=128",
+            ),
+            (
+                lambda cfg: setattr(cfg.cache_config, "enable_prefix_caching", True),
+                "does not support prefix caching",
+            ),
+            (
+                lambda cfg: setattr(cfg, "speculative_config", object()),
+                "does not support speculative decoding",
+            ),
+            (
+                lambda cfg: setattr(cfg, "kv_transfer_config", object()),
+                "cannot be combined with KV transfer",
+            ),
+            (
+                lambda cfg: cfg.additional_config.update({"enable_dsa_cp": True}),
+                "does not support DSA context parallelism",
+            ),
+            (
+                lambda cfg: setattr(
+                    cfg.parallel_config,
+                    "decode_context_parallel_size",
+                    2,
+                ),
+                "does not support DSA context parallelism",
+            ),
+        ]
+        config = SparseKVOffloadConfig(enabled=True)
+        for mutate, expected_error in cases:
+            vllm_config = self._make_vllm_config()
+            mutate(vllm_config)
+            with (
+                self.subTest(expected_error=expected_error),
+                self.assertRaisesRegex(
+                    ValueError,
+                    expected_error,
+                ),
+            ):
+                config.validate(vllm_config, enable_sparse_c8=False)
+
+        with self.assertRaisesRegex(ValueError, "does not support sparse C8"):
+            config.validate(self._make_vllm_config(), enable_sparse_c8=True)

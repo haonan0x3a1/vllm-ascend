@@ -15,6 +15,7 @@
 # limitations under the License.
 import json
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import logger
@@ -22,6 +23,101 @@ from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+
+@dataclass(frozen=True)
+class SparseKVOffloadConfig:
+    """Experimental DeepSeek-V3.2 sparse KV offload configuration.
+
+    ``mirror`` keeps the framework-owned full KV cache on the NPU and mirrors
+    updated blocks into swapped memory. It validates the Host KV -> selected
+    NPU KV -> SFA data path without claiming NPU memory savings.
+    """
+
+    enabled: bool = False
+    mode: str = "mirror"
+
+    @classmethod
+    def from_dict(cls, config: Any) -> "SparseKVOffloadConfig":
+        if config is None:
+            return cls()
+        if not isinstance(config, dict):
+            raise ValueError(f"additional_config.sparse_kv_offload must be a dict, got {type(config).__name__}.")
+
+        supported_keys = {"enabled", "mode"}
+        unknown_keys = sorted(set(config) - supported_keys)
+        if unknown_keys:
+            raise ValueError(f"additional_config.sparse_kv_offload contains unsupported keys: {unknown_keys}.")
+
+        enabled = config.get("enabled", False)
+        mode = config.get("mode", "mirror")
+        if not isinstance(enabled, bool):
+            raise ValueError(
+                f"additional_config.sparse_kv_offload.enabled must be a bool, got {type(enabled).__name__}."
+            )
+        if not isinstance(mode, str):
+            raise ValueError(f"additional_config.sparse_kv_offload.mode must be a string, got {type(mode).__name__}.")
+        if mode != "mirror":
+            raise ValueError(
+                f"additional_config.sparse_kv_offload.mode only supports 'mirror' in the current PoC, got {mode!r}."
+            )
+        return cls(enabled=enabled, mode=mode)
+
+    def validate(self, vllm_config: "VllmConfig", enable_sparse_c8: bool) -> None:
+        if not self.enabled:
+            return
+
+        model_config = vllm_config.model_config
+        if model_config is None:
+            raise ValueError("sparse_kv_offload requires a valid model_config.")
+        hf_text_config = getattr(model_config, "hf_text_config", None)
+        index_topk = getattr(hf_text_config, "index_topk", None)
+        model_type = getattr(hf_text_config, "model_type", None)
+        if model_type != "deepseek_v32":
+            raise ValueError(
+                "sparse_kv_offload currently supports only DeepSeek-V3.2 "
+                f"(model_type='deepseek_v32'), got {model_type!r}."
+            )
+        if index_topk != 2048:
+            raise ValueError(
+                f"sparse_kv_offload currently requires a DSA model with index_topk=2048, got {index_topk!r}."
+            )
+        if not getattr(model_config, "enforce_eager", False):
+            raise ValueError("sparse_kv_offload mirror mode requires --enforce-eager.")
+
+        scheduler_config = vllm_config.scheduler_config
+        if scheduler_config.max_num_seqs != 1:
+            raise ValueError(
+                "sparse_kv_offload mirror mode currently requires "
+                f"--max-num-seqs 1, got {scheduler_config.max_num_seqs}."
+            )
+
+        cache_config = vllm_config.cache_config
+        if cache_config.block_size != 128:
+            raise ValueError(
+                f"sparse_kv_offload mirror mode requires KV cache block_size=128, got {cache_config.block_size}."
+            )
+        if getattr(cache_config, "enable_prefix_caching", False):
+            raise ValueError(
+                "sparse_kv_offload mirror mode does not support prefix caching. Set --no-enable-prefix-caching."
+            )
+        if vllm_config.speculative_config is not None:
+            raise ValueError("sparse_kv_offload mirror mode does not support speculative decoding or MTP.")
+        if vllm_config.kv_transfer_config is not None:
+            raise ValueError(
+                "sparse_kv_offload mirror mode cannot be combined with KV transfer or PD disaggregation yet."
+            )
+        if enable_sparse_c8:
+            raise ValueError("sparse_kv_offload mirror mode does not support sparse C8 KV cache.")
+
+        additional_config = vllm_config.additional_config or {}
+        parallel_config = vllm_config.parallel_config
+        if (
+            additional_config.get("enable_dsa_cp", False)
+            or parallel_config.prefill_context_parallel_size > 1
+            or parallel_config.decode_context_parallel_size > 1
+        ):
+            raise ValueError("sparse_kv_offload mirror mode does not support DSA context parallelism, PCP, or DCP.")
 
 
 class AscendConfig:
@@ -275,6 +371,8 @@ class AscendConfig:
 
         self.enable_sparse_c8 = additional_config.get("enable_sparse_c8", False) and use_sparse
         self.c8_enable_reshape_optim = self.enable_sparse_c8 and additional_config.get("c8_enable_reshape_optim", False)
+        self.sparse_kv_offload = SparseKVOffloadConfig.from_dict(additional_config.get("sparse_kv_offload"))
+        self.sparse_kv_offload.validate(vllm_config, self.enable_sparse_c8)
         quant_config = getattr(vllm_config, "quant_config", None)
         self._sparse_c8_layer_ids, self._sparse_c8_layer_names = self._parse_sparse_c8_layers_from_quant_config(
             quant_config
