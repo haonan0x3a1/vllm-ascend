@@ -289,26 +289,43 @@ class KVPoolScheduler:
         token_len: int,
         num_computed_tokens: int,
     ) -> int:
-        num_blocks = token_len // self._block_size
-        block_hashes_to_check = request.block_hashes[:num_blocks]
+        num_full_blocks = token_len // self._block_size
+        num_hashed_blocks = min(num_full_blocks, len(request.block_hashes))
         # In layerwise mode, always query from block 0 because the remote
         # pool stores per-layer data that may not match local prefix cache.
-        query_start_block = 0 if self.use_layerwise else min(num_computed_tokens // self._block_size, num_blocks)
-        block_hashes_to_query = block_hashes_to_check[query_start_block:]
-        if not block_hashes_to_query:
-            return 0
+        query_start_block = (
+            0
+            if self.use_layerwise
+            else min(
+                num_computed_tokens // self._block_size,
+                num_hashed_blocks,
+            )
+        )
+        block_hashes_to_query = request.block_hashes[query_start_block:num_hashed_blocks]
         # Keys use head_or_tp_rank (= tp_rank // put_step).  Ranks in
         # the same put_step group share one key (same KV cache for MLA latent).
         # Only tp_size // put_step keys per block, not tp_size.
         head_or_tp_ranks = self.tp_size // self.put_step
         keys_by_block = [
-            [f"{self.model_name}@{bh.hex()}@{h}" for h in range(head_or_tp_ranks)] for bh in block_hashes_to_query
+            [f"{self.model_name}@{block_hash.hex()}@{head_or_tp_rank}" for head_or_tp_rank in range(head_or_tp_ranks)]
+            for block_hash in block_hashes_to_query
         ]
+        has_request_last_block = token_len % self._block_size != 0 or num_full_blocks > num_hashed_blocks
+        if has_request_last_block:
+            keys_by_block.append(
+                [
+                    f"{self.model_name}@{request.request_id}_lastblock@{head_or_tp_rank}"
+                    for head_or_tp_rank in range(head_or_tp_ranks)
+                ]
+            )
+        if not keys_by_block:
+            return 0
         all_keys = [key for block_keys in keys_by_block for key in block_keys]
         logger.debug(
-            "[KVPOOL] hit_check req=%s query_blocks=%d head_or_tp_ranks=%d total_keys=%d",
+            "[KVPOOL] hit_check req=%s query_blocks=%d has_last_block=%s head_or_tp_ranks=%d total_keys=%d",
             request.request_id,
-            len(keys_by_block),
+            len(block_hashes_to_query),
+            has_request_last_block,
             head_or_tp_ranks,
             len(all_keys),
         )
@@ -324,26 +341,35 @@ class KVPoolScheduler:
                 f"actual={len(key_infos)}"
             )
         num_queried_hit_blocks = 0
+        last_block_hit = False
         offset = 0
-        for block_keys in keys_by_block:
+        for block_index, block_keys in enumerate(keys_by_block):
             block_infos = key_infos[offset : offset + len(block_keys)]
             offset += len(block_keys)
             # A block is considered hit only when every rank's key returns a
             # valid GVA (i.e., save is complete).
             if all(ki.size() and ki.size() > 0 for ki in block_infos):
-                num_queried_hit_blocks += 1
+                if has_request_last_block and block_index == len(keys_by_block) - 1:
+                    last_block_hit = True
+                else:
+                    num_queried_hit_blocks += 1
                 continue
             break
         num_hit_blocks = query_start_block + num_queried_hit_blocks
+        num_hit_tokens = num_hit_blocks * self._block_size
+        if last_block_hit:
+            num_hit_tokens = token_len
         hit_sample = [1 if (ki.size() and ki.size() > 0) else 0 for ki in key_infos[: min(8, len(key_infos))]]
         logger.info(
-            "[KVPOOL] hit_check req=%s hit_blocks=%d/%d gva_states_sample=%s",
+            "[KVPOOL] hit_check req=%s hit_blocks=%d/%d last_block_hit=%s hit_tokens=%d gva_states_sample=%s",
             request.request_id,
             num_queried_hit_blocks,
-            len(keys_by_block),
+            len(block_hashes_to_query),
+            last_block_hit,
+            num_hit_tokens,
             hit_sample,
         )
-        return num_hit_blocks * self._block_size
+        return num_hit_tokens
 
     def _infer_group_families(self) -> list[str]:
         kv_cache_groups = self.kv_cache_config.kv_cache_groups if self.kv_cache_config is not None else None
@@ -474,7 +500,7 @@ class KVPoolScheduler:
         else:
             token_len = len(request.prompt_token_ids)
 
-        if token_len < self.cache_transfer_granularity:
+        if token_len < self.cache_transfer_granularity and not self.use_gva_layerwise:
             return 0, False
 
         if self.use_gva_layerwise:

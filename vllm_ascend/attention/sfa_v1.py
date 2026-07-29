@@ -752,8 +752,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             and not self.enable_mlapo
         ):
             raise RuntimeError(
-                "sparse_kv_offload host mode requires the A3 "
-                "npu_mla_prolog_v3 path so decode can write new KV directly "
+                "sparse_kv_offload host mode requires the fused A3 MLAPO "
+                "decode path so decode can write new KV directly "
                 "to swapped Full KV. Enable MLAPO and use its supported W8A8 "
                 "DeepSeek-V3.2 checkpoint."
             )

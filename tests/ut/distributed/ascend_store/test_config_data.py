@@ -444,6 +444,7 @@ class TestReqMeta(unittest.TestCase):
         meta = ReqMeta.from_request_tracker(tracker, cache_transfer_granularity=16, discard_partial_chunks=True)
         self.assertIsNotNone(meta)
         self.assertEqual(meta.token_len_chunk, 16)
+        self.assertIsNone(meta.partial_block_index)
 
     def test_from_request_tracker_no_discard(self):
         tracker = RequestTracker(
@@ -455,6 +456,28 @@ class TestReqMeta(unittest.TestCase):
         meta = ReqMeta.from_request_tracker(tracker, cache_transfer_granularity=16, discard_partial_chunks=False)
         self.assertIsNotNone(meta)
         self.assertEqual(meta.token_len_chunk, 20)
+        self.assertEqual(meta.partial_block_index, 1)
+        self.assertIsNone(meta.last_block_gva)
+
+    def test_from_request_tracker_boundary_without_hash_uses_request_tail(self):
+        tracker = RequestTracker(
+            req_id="r1",
+            token_len=16,
+            allocated_block_ids=[0],
+            num_saved_tokens=0,
+        )
+
+        meta = ReqMeta.from_request_tracker(
+            tracker,
+            cache_transfer_granularity=16,
+            block_hashes=[],
+            discard_partial_chunks=False,
+        )
+
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta.token_len_chunk, 0)
+        self.assertEqual(meta.partial_block_index, 0)
+        self.assertIsNone(meta.last_block_gva)
 
     def test_from_request_tracker_already_saved(self):
         tracker = RequestTracker(

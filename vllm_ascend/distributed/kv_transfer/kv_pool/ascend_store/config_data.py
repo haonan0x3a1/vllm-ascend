@@ -894,9 +894,12 @@ class ReqMeta:
         )
         if boundary_without_hash:
             num_tokens_to_save = len(block_hashes) * cache_transfer_granularity
-        if tracker.last_block_gva is not None and (
-            target_token_len % cache_transfer_granularity != 0 or boundary_without_hash
-        ):
+        has_request_last_block = (
+            not discard_partial_chunks
+            and target_token_len > 0
+            and (target_token_len % cache_transfer_granularity != 0 or boundary_without_hash)
+        )
+        if has_request_last_block:
             partial_block_index = (
                 full_block_count if target_token_len % cache_transfer_granularity != 0 else full_block_count - 1
             )

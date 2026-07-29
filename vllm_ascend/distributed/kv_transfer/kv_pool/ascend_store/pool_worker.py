@@ -17,6 +17,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -863,28 +864,20 @@ class KVPoolWorker:
                 continue
             cached_tokens = request.load_spec.kvpool_cached_tokens
             load_start_block = request.load_spec.vllm_cached_tokens // self.block_size
-            cached_full_blocks = cached_tokens // self.block_size
-            full_blocks = min(cached_full_blocks, len(request.block_hashes))
-            needs_last_block_at_boundary = (
-                cached_tokens > 0 and cached_tokens % self.block_size == 0 and full_blocks < cached_full_blocks
+            cached_blocks = cdiv(cached_tokens, self.block_size)
+            hashed_blocks = min(cached_blocks, len(request.block_hashes))
+            partial_block_index = (
+                cached_blocks - 1 if request.last_block_gva is not None and cached_blocks > hashed_blocks else None
             )
-            if request.last_block_gva is not None and (
-                cached_tokens % self.block_size != 0 or needs_last_block_at_boundary
-            ):
-                partial_block_index = (
-                    cached_full_blocks if cached_tokens % self.block_size != 0 else cached_full_blocks - 1
-                )
-            else:
-                partial_block_index = None
             if partial_block_index is not None and partial_block_index < load_start_block:
                 partial_block_index = None
-            if load_start_block >= full_blocks and partial_block_index is None:
+            if load_start_block >= hashed_blocks and partial_block_index is None:
                 continue
             request_block_ranges.append(
                 LayerBlockRange(
                     request=request,
                     start_block=load_start_block,
-                    end_block=full_blocks,
+                    end_block=hashed_blocks,
                     partial_block_index=partial_block_index,
                 )
             )
@@ -975,12 +968,11 @@ class KVPoolWorker:
                     last_block_is_new,
                 )
                 new_gvas = self.m_store.batch_alloc(alloc_keys, [alloc_size] * len(alloc_keys))
-                if any(gva <= 0 for gva in new_gvas):
-                    logger.error(
-                        "Request %s: batch_alloc failed for some keys, gvas=%s. "
-                        "Save will likely fail; continuing without crash.",
-                        request.req_id,
-                        new_gvas,
+                if len(new_gvas) != len(alloc_keys) or any(gva <= 0 for gva in new_gvas):
+                    raise RuntimeError(
+                        "Layerwise KV save GVA allocation failed for request "
+                        f"{request.req_id}: expected={len(alloc_keys)}, "
+                        f"actual={len(new_gvas)}, gvas={new_gvas}"
                     )
                 logger.debug(
                     "[KVPOOL] save_alloc req=%s tp_rank=%d batch_alloc done gvas=%s",
@@ -1021,22 +1013,20 @@ class KVPoolWorker:
                 continue
             cached_tokens = request.load_spec.kvpool_cached_tokens
             load_start_block = request.load_spec.vllm_cached_tokens // self.block_size
-            cached_full_blocks = cached_tokens // self.block_size
-            full_blocks = min(cached_full_blocks, len(request.block_hashes))
-            if load_start_block >= full_blocks and cached_tokens % self.block_size == 0:
+            cached_blocks = cdiv(cached_tokens, self.block_size)
+            hashed_blocks = min(cached_blocks, len(request.block_hashes))
+            needs_request_last_block = cached_blocks > hashed_blocks
+            if load_start_block >= hashed_blocks and not needs_request_last_block:
                 continue
 
             block_hashes = request.block_hashes
             keys = [
                 f"{self.model_name}@{block_hashes[i].hex()}@{self.head_or_tp_rank}"
-                for i in range(load_start_block, full_blocks)
+                for i in range(load_start_block, hashed_blocks)
             ]
 
-            needs_last_block_at_boundary = (
-                cached_tokens > 0 and cached_tokens % self.block_size == 0 and full_blocks < cached_full_blocks
-            )
             last_block_key: str | None = None
-            if cached_tokens % self.block_size != 0 or needs_last_block_at_boundary:
+            if needs_request_last_block:
                 last_block_key = f"{self.model_name}@{request.req_id}_lastblock@{self.head_or_tp_rank}"
                 keys.append(last_block_key)
             if not keys:
@@ -1048,25 +1038,25 @@ class KVPoolWorker:
                 self.tp_rank,
                 len(keys),
                 load_start_block,
-                full_blocks,
+                hashed_blocks,
                 cached_tokens,
                 last_block_key is not None,
             )
             # 1. Fetch per-rank GVA via batch_get_key_info.
             key_infos = self.m_store.batch_get_key_info(keys)
+            if len(key_infos) != len(keys):
+                raise RuntimeError(
+                    "Layerwise KV load GVA lookup returned an unexpected "
+                    f"number of results for request {request.req_id}: "
+                    f"expected={len(keys)}, actual={len(key_infos)}"
+                )
             gvas: list[int] = []
-            for ki in key_infos:
-                sizes = ki.size()
-                if sizes and sizes > 0:
-                    gvas.append(ki.gva_list()[0])
-                else:
-                    logger.error(
-                        "Request %s: batch_get_key_info returned no gva for a "
-                        "key expected to be in the pool. Load will likely fail; "
-                        "continuing without crash.",
-                        request.req_id,
-                    )
-                    gvas.append(0)
+            for key, key_info in zip(keys, key_infos):
+                sizes = key_info.size()
+                gva_list = key_info.gva_list() if sizes and sizes > 0 else []
+                if not gva_list or gva_list[0] <= 0:
+                    raise RuntimeError(f"Layerwise KV load GVA lookup failed for request {request.req_id}, key={key}")
+                gvas.append(gva_list[0])
             logger.info(
                 "[KVPOOL] load_prepare req=%s tp_rank=%d get_key_info done gvas=%s",
                 request.req_id,
@@ -1076,11 +1066,11 @@ class KVPoolWorker:
 
             # 2. Acquire read lease (registers blob in per-process gvaBlobTracker).
             lease_results = self.m_store.batch_add_lease(keys, LAYERWISE_READ_LEASE_TTL_MS)
-            if any(r != 0 for r in lease_results):
-                logger.error(
-                    "Request %s: batch_add_lease failed, results=%s. Load will likely fail; continuing without crash.",
-                    request.req_id,
-                    lease_results,
+            if len(lease_results) != len(keys) or any(result != 0 for result in lease_results):
+                raise RuntimeError(
+                    "Layerwise KV load lease acquisition failed for request "
+                    f"{request.req_id}: expected={len(keys)}, "
+                    f"actual={len(lease_results)}, results={lease_results}"
                 )
             logger.info(
                 "[KVPOOL] load_prepare req=%s tp_rank=%d add_lease done results=%s ttl_ms=%d",
@@ -1093,7 +1083,7 @@ class KVPoolWorker:
             # lease immediately after batch_copy G2L completes.
             request.load_keys = keys
 
-            num_block_keys = full_blocks - load_start_block
+            num_block_keys = hashed_blocks - load_start_block
             request.load_block_gvas_np = np.asarray(gvas[:num_block_keys], dtype=np.int64)
             request.load_gva_block_offset = load_start_block
             if last_block_key is not None:

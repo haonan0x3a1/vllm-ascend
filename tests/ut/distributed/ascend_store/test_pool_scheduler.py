@@ -113,6 +113,34 @@ class TestKVPoolScheduler(unittest.TestCase):
         self.assertEqual(result, (0, False))
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_get_num_new_matched_tokens_layerwise_loads_short_tail(self, mock_client_cls):
+        config = self._make_config(
+            kv_role="kv_consumer",
+            extra_config={
+                "backend": "memcache",
+                "consumer_is_to_load": True,
+            },
+            block_size=64,
+        )
+        scheduler = KVPoolScheduler(config, use_layerwise=True)
+        key_info = MagicMock()
+        key_info.size.return_value = 1
+        key_info.gva_list.return_value = [0x1000]
+        scheduler.store_scheduler.batch_get_key_info.return_value = [key_info]
+
+        request = MagicMock()
+        request.prompt_token_ids = list(range(32))
+        request.num_tokens = 32
+        request.request_id = "r1"
+        request.block_hashes = []
+
+        need, is_async = scheduler.get_num_new_matched_tokens(request, 0)
+
+        self.assertEqual(need, 31)
+        self.assertFalse(is_async)
+        self.assertEqual(scheduler.load_specs["r1"].kvpool_cached_tokens, 31)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_get_num_new_matched_tokens_hit(self, mock_client_cls):
         config = self._make_config(block_size=16)
         scheduler = KVPoolScheduler(config, use_layerwise=False)
@@ -1150,6 +1178,64 @@ class TestKVPoolSchedulerGetLayerwiseGvaHitTokens(unittest.TestCase):
         request.block_hashes = [b"\xaa", b"\xbb", b"\xcc", b"\xdd"]
         result = scheduler._get_layerwise_gva_hit_tokens(request, 64, 32)
         self.assertEqual(result, 64)
+
+    def test_partial_request_tail_hit(self):
+        scheduler = self._make_scheduler()
+        scheduler.use_layerwise = True
+        hit_info = MagicMock()
+        hit_info.size.return_value = 1
+        hit_info.gva_list.return_value = [0x1000]
+        scheduler.store_scheduler.batch_get_key_info.return_value = [
+            hit_info,
+            hit_info,
+        ]
+
+        request = MagicMock()
+        request.request_id = "r1"
+        request.block_hashes = [b"\xaa"]
+
+        result = scheduler._get_layerwise_gva_hit_tokens(request, 24, 0)
+
+        self.assertEqual(result, 24)
+        queried_keys = scheduler.store_scheduler.batch_get_key_info.call_args.args[0]
+        self.assertIn("r1_lastblock", queried_keys[-1])
+
+    def test_short_request_tail_hit_without_hashes(self):
+        scheduler = self._make_scheduler()
+        scheduler.use_layerwise = True
+        hit_info = MagicMock()
+        hit_info.size.return_value = 1
+        hit_info.gva_list.return_value = [0x1000]
+        scheduler.store_scheduler.batch_get_key_info.return_value = [hit_info]
+
+        request = MagicMock()
+        request.request_id = "r1"
+        request.block_hashes = []
+
+        result = scheduler._get_layerwise_gva_hit_tokens(request, 8, 0)
+
+        self.assertEqual(result, 8)
+
+    def test_request_tail_is_not_hit_before_full_prefix(self):
+        scheduler = self._make_scheduler()
+        scheduler.use_layerwise = True
+        miss_info = MagicMock()
+        miss_info.size.return_value = 0
+        hit_info = MagicMock()
+        hit_info.size.return_value = 1
+        hit_info.gva_list.return_value = [0x1000]
+        scheduler.store_scheduler.batch_get_key_info.return_value = [
+            miss_info,
+            hit_info,
+        ]
+
+        request = MagicMock()
+        request.request_id = "r1"
+        request.block_hashes = [b"\xaa"]
+
+        result = scheduler._get_layerwise_gva_hit_tokens(request, 24, 0)
+
+        self.assertEqual(result, 0)
 
 
 class TestKVPoolSchedulerUpdateStateAfterAllocBranches(unittest.TestCase):

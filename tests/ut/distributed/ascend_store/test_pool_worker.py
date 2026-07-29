@@ -1389,6 +1389,164 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         worker._process_load_for_layer_batch([req], 0)
         self.assertEqual(len(worker.layer_load_tasks[0]), 0)
 
+    def test_partial_cached_count_loads_available_hashed_block(self):
+        worker = self._make_worker()
+        worker.block_size = 16
+        load_spec = LoadSpec(
+            vllm_cached_tokens=0,
+            kvpool_cached_tokens=15,
+            can_load=True,
+        )
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            block_ids=[3],
+            block_hashes=[b"\xaa"],
+            load_spec=load_spec,
+        )
+
+        worker._process_load_for_layer_batch([req], 0)
+
+        block_range = worker.layer_load_tasks[0][0].block_ranges[0]
+        self.assertEqual(block_range.start_block, 0)
+        self.assertEqual(block_range.end_block, 1)
+        self.assertIsNone(block_range.partial_block_index)
+
+    def test_partial_cached_count_loads_request_tail_after_hashed_blocks(self):
+        worker = self._make_worker()
+        worker.block_size = 16
+        load_spec = LoadSpec(
+            vllm_cached_tokens=0,
+            kvpool_cached_tokens=31,
+            can_load=True,
+        )
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=32,
+            block_ids=[3, 4],
+            block_hashes=[b"\xaa"],
+            load_spec=load_spec,
+            last_block_gva=0x2000,
+        )
+
+        worker._process_load_for_layer_batch([req], 0)
+
+        block_range = worker.layer_load_tasks[0][0].block_ranges[0]
+        self.assertEqual(block_range.end_block, 1)
+        self.assertEqual(block_range.partial_block_index, 1)
+
+    def test_prepare_load_gvas_uses_hash_for_partial_cached_count(self):
+        worker = self._make_worker()
+        worker.use_gva_layerwise = True
+        worker.block_size = 16
+        worker.model_name = "model"
+        worker.head_or_tp_rank = 0
+        worker.tp_rank = 0
+        worker.m_store = MagicMock()
+        key_info = MagicMock()
+        key_info.size.return_value = 1
+        key_info.gva_list.return_value = [0x1000]
+        worker.m_store.batch_get_key_info.return_value = [key_info]
+        worker.m_store.batch_add_lease.return_value = [0]
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            block_ids=[3],
+            block_hashes=[b"\xaa"],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                kvpool_cached_tokens=15,
+                can_load=True,
+            ),
+        )
+
+        worker._prepare_load_gvas([req])
+
+        self.assertEqual(req.load_block_gvas_np.tolist(), [0x1000])
+        self.assertIsNone(req.last_block_gva)
+        queried_keys = worker.m_store.batch_get_key_info.call_args.args[0]
+        self.assertEqual(queried_keys, ["model@aa@0"])
+
+    def test_prepare_load_gvas_fails_on_invalid_lookup(self):
+        worker = self._make_worker()
+        worker.use_gva_layerwise = True
+        worker.block_size = 16
+        worker.model_name = "model"
+        worker.head_or_tp_rank = 0
+        worker.tp_rank = 0
+        worker.m_store = MagicMock()
+        key_info = MagicMock()
+        key_info.size.return_value = 0
+        worker.m_store.batch_get_key_info.return_value = [key_info]
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            block_ids=[3],
+            block_hashes=[b"\xaa"],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                kvpool_cached_tokens=15,
+                can_load=True,
+            ),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "GVA lookup failed"):
+            worker._prepare_load_gvas([req])
+
+    def test_prepare_load_gvas_fails_on_lease_error(self):
+        worker = self._make_worker()
+        worker.use_gva_layerwise = True
+        worker.block_size = 16
+        worker.model_name = "model"
+        worker.head_or_tp_rank = 0
+        worker.tp_rank = 0
+        worker.m_store = MagicMock()
+        key_info = MagicMock()
+        key_info.size.return_value = 1
+        key_info.gva_list.return_value = [0x1000]
+        worker.m_store.batch_get_key_info.return_value = [key_info]
+        worker.m_store.batch_add_lease.return_value = [1]
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            block_ids=[3],
+            block_hashes=[b"\xaa"],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                kvpool_cached_tokens=15,
+                can_load=True,
+            ),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "lease acquisition failed"):
+            worker._prepare_load_gvas([req])
+
+    def test_alloc_gvas_for_save_fails_on_invalid_allocation(self):
+        worker = self._make_worker()
+        worker.use_gva_layerwise = True
+        worker.kv_role = "kv_producer"
+        worker.tp_rank = 0
+        worker.put_step = 1
+        worker.page_size_bytes = 128
+        worker.num_layers = 2
+        worker.model_name = "model"
+        worker.head_or_tp_rank = 0
+        worker._allocated_gvas = {}
+        worker.m_store = MagicMock()
+        worker.m_store.batch_alloc.return_value = [0]
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            save_start_token=0,
+            save_end_token=16,
+            block_ids=[3],
+            block_hashes=[b"\xaa"],
+            can_save=True,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "GVA allocation failed"):
+            worker._alloc_gvas_for_save([req])
+
     def test_layerwise_start_resets_tasks_events_and_cursors(self):
         worker = self._make_worker()
         worker.use_layerwise = True

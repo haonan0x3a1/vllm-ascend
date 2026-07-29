@@ -32,7 +32,7 @@ block, while allocating only the Indexer cache and runtime workspaces in HBM.
 - The `custom_ops` wheel built from `cann-recipes-infer`, including
   `torch_npu.npu_gather_selection_kv_cache`.
 - A DeepSeek-V3.2 DSA model with `index_topk=2048`.
-- Host mode requires the A3 `npu_mla_prolog_v3` path and a supported W8A8
+- Host mode requires the fused A3 MLAPO decode path and a supported W8A8
   checkpoint.
 
 Before serving a model, run the focused configuration, workspace, and
@@ -42,7 +42,9 @@ model-runner tests:
 pytest -sv \
   tests/ut/test_ascend_config.py::TestSparseKVOffloadConfig \
   tests/ut/attention/test_sparse_kv_offload.py \
-  tests/ut/worker/a2/test_model_runner_v1.py::TestNPUModelRunnerKVCache
+  tests/ut/worker/a2/test_model_runner_v1.py::TestNPUModelRunnerKVCache \
+  tests/ut/distributed/ascend_store/test_pool_scheduler.py \
+  tests/ut/distributed/ascend_store/test_pool_worker.py
 ```
 
 Then run the NPU tests that explicitly create Full KV in swapped memory:
@@ -105,6 +107,12 @@ Use the dedicated layerwise proxy and memcache setup described in
 [Layerwise KV Pool](layerwise_kv_pool.md). The mixed cache tuple is transferred
 layer by layer: Full MLA KV targets swapped memory while the Indexer cache
 targets NPU memory.
+
+Layerwise memcache transfers request tails as request-scoped blocks in addition
+to hash-addressed full blocks. This covers prompts shorter than one block and
+non-block-aligned prompts. vLLM still recomputes the final prompt token before
+sampling; the consumer loads whichever full or request-tail block contains the
+preceding KV rows.
 
 The feature is disabled by default. When disabled, allocation and SFA execution
 remain unchanged.
