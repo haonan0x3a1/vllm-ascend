@@ -445,8 +445,7 @@ class KVTransferThread(threading.Thread):
                     self._record_request_error(request_data, e)
                 except Exception as record_error:
                     logger.error(
-                        "Failed to publish KV transfer thread error. "
-                        "thread=%s, type=%s, error=%s",
+                        "Failed to publish KV transfer thread error. thread=%s, type=%s, error=%s",
                         self.name,
                         type(record_error).__name__,
                         record_error,
@@ -1234,6 +1233,36 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             page_size_bytes,
             num_layers,
         )
+        self._layer_errors: dict[int, str] = {}
+        self._layer_errors_lock = threading.Lock()
+
+    def _set_layer_error(self, layer_id: int, message: str) -> None:
+        with self._layer_errors_lock:
+            self._layer_errors[layer_id] = message
+
+    def pop_layer_error(self, layer_id: int) -> str | None:
+        with self._layer_errors_lock:
+            return self._layer_errors.pop(layer_id, None)
+
+    def clear_layer_errors(self) -> None:
+        with self._layer_errors_lock:
+            self._layer_errors.clear()
+
+    def _record_request_error(
+        self,
+        request_data: Any,
+        error: Exception,
+    ) -> None:
+        if not isinstance(request_data, list) or len(request_data) != 1:
+            return
+        layer_id = getattr(request_data[0], "layer_id", None)
+        if not isinstance(layer_id, int):
+            return
+        self._set_layer_error(
+            layer_id,
+            f"Layerwise KV save thread failed for layer {layer_id}: {type(error).__name__}: {error}",
+        )
+        self.layer_save_finished_events[layer_id].set()
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -1291,8 +1320,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             gvas_array.tolist(),
             size_array.tolist(),
         )
-        for req_id in req_meta.req_ids:
-            self.dec_stored_request(req_id)
         self.sync_save_events[layer_id].synchronize()
         res = self._batch_copy_with_limits(
             gvas_array,
@@ -1303,10 +1330,16 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             self.max_transfer_bytes,
         )
         if res != 0:
-            logger.error("Layerwise %d save batch_copy failed with return code %d", layer_id, res)
-        for req_id in req_meta.req_ids:
-            if self.try_finish_and_delete_stored_request(req_id):
-                self.set_finished_request(req_id)
+            error_message = f"Layerwise KV save batch_copy failed for layer {layer_id} with return code {res}."
+            logger.error(error_message)
+            self._set_layer_error(layer_id, error_message)
+            for req_id in req_meta.req_ids:
+                self.delete_finished_stored_request(req_id)
+        else:
+            for req_id in req_meta.req_ids:
+                self.dec_stored_request(req_id)
+                if self.try_finish_and_delete_stored_request(req_id):
+                    self.set_finished_request(req_id)
         assert not self.layer_save_finished_events[layer_id].is_set(), f"thread: {layer_id} save failed "
         logger.debug("Layer save event set: layer %d", layer_id)
         self.layer_save_finished_events[layer_id].set()
@@ -1384,8 +1417,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             return
         self._set_layer_error(
             layer_id,
-            "Layerwise KV load thread failed for "
-            f"layer {layer_id}: {type(error).__name__}: {error}",
+            f"Layerwise KV load thread failed for layer {layer_id}: {type(error).__name__}: {error}",
         )
         self.layer_load_finished_events[layer_id].set()
 
@@ -1474,10 +1506,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.max_transfer_bytes,
         )
         if res != 0:
-            error_message = (
-                f"Layerwise KV load batch_copy failed for layer {layer_id} "
-                f"with return code {res}."
-            )
+            error_message = f"Layerwise KV load batch_copy failed for layer {layer_id} with return code {res}."
             logger.error(error_message)
             self._set_layer_error(layer_id, error_message)
         # Release read leases immediately after the last layer's batch_copy

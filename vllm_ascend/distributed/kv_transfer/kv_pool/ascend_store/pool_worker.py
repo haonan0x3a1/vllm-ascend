@@ -675,6 +675,13 @@ class KVPoolWorker:
             )
             if callable(clear_load_errors):
                 clear_load_errors()
+            clear_save_errors = getattr(
+                self.kv_send_thread,
+                "clear_layer_errors",
+                None,
+            )
+            if callable(clear_save_errors):
+                clear_save_errors()
             reset_attention_compute_start_gate()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
@@ -1201,15 +1208,9 @@ class KVPoolWorker:
             return
         is_finish = self.layer_load_finished_events[layer_id].wait(timeout=10)
         if not is_finish:
-            raise TimeoutError(
-                f"Layerwise KV load timed out while waiting for layer {layer_id}."
-            )
+            raise TimeoutError(f"Layerwise KV load timed out while waiting for layer {layer_id}.")
         error_getter = getattr(self.kv_recv_thread, "pop_layer_error", None)
-        layer_error = (
-            error_getter(layer_id)
-            if callable(error_getter)
-            else None
-        )
+        layer_error = error_getter(layer_id) if callable(error_getter) else None
         logger.debug(">>>>>>>>>>>>>>>>>>>> clear load layer %d", layer_id)
         self.layer_load_finished_events[layer_id].clear()
         self.current_load_layer += 1
@@ -1243,11 +1244,18 @@ class KVPoolWorker:
         if self.current_layer == self.num_layers - 1:
             is_finish = self.layer_save_finished_events[self.num_layers - 1].wait(timeout=10)
             if not is_finish:
-                logger.info("Layerwise %d save wait timed out", self.current_layer)
+                raise TimeoutError(f"Layerwise KV save timed out while waiting for final layer {self.current_layer}.")
+            error_getter = getattr(self.kv_send_thread, "pop_layer_error", None)
+            save_errors = []
             for layer_id in range(self.num_layers):
+                layer_error = error_getter(layer_id) if callable(error_getter) else None
+                if isinstance(layer_error, str) and layer_error:
+                    save_errors.append(layer_error)
                 if self.layer_save_finished_events[layer_id].is_set():
                     logger.debug(">>>>>>>>>>>>>>>>>>>> clear save layer %d", layer_id)
                     self.layer_save_finished_events[layer_id].clear()
+            if save_errors:
+                raise RuntimeError("Layerwise KV save failed: " + " | ".join(save_errors))
 
         self.current_layer = self.current_layer + 1
 
