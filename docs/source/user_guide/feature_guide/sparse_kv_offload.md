@@ -89,10 +89,15 @@ using `kv_producer` for Prefill and `kv_consumer` for Decode:
   "kv_connector_extra_config": {
     "backend": "memcache",
     "mooncake_rpc_port": "0",
-    "use_layerwise": true
+    "use_layerwise": true,
+    "consumer_is_to_load": true
   }
 }'
 ```
+
+`consumer_is_to_load=true` is mandatory on the Decode consumer; without it,
+the Decode scheduler reports no external KV hit and recomputes the prompt.
+Using the same JSON on the producer is harmless.
 
 Use the dedicated layerwise proxy and memcache setup described in
 [Layerwise KV Pool](layerwise_kv_pool.md). The mixed cache tuple is transferred

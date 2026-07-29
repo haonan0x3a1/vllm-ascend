@@ -143,6 +143,15 @@ class SparseKVOffloadConfig:
                     "PD-disaggregated kv_producer/kv_consumer roles, got "
                     f"{kv_transfer_config.kv_role!r}."
                 )
+            if (
+                kv_transfer_config.kv_role == "kv_consumer"
+                and extra_config.get("consumer_is_to_load") is not True
+            ):
+                raise ValueError(
+                    "sparse_kv_offload host mode on the kv_consumer requires "
+                    "AscendStoreConnector consumer_is_to_load=true; otherwise "
+                    "the Decode scheduler will not claim or load the Prefill KV."
+                )
         if enable_sparse_c8:
             raise ValueError(f"sparse_kv_offload {self.mode} mode does not support sparse C8 KV cache.")
 

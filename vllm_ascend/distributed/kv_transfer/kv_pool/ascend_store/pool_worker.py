@@ -281,6 +281,9 @@ class KVPoolWorker:
         self.layer_load_finished_events: list[threading.Event] | None = None
         self.layer_save_finished_events: list[threading.Event] | None = None
 
+        # Loading and saving may both be enabled for kv_both. Keep independent
+        # cursors so a load wait cannot advance the producer save state.
+        self.current_load_layer = 0
         self.next_layer_to_submit = 0
         self.num_prefetch_layers = int(self._extra_config.get("layerwise_prefetch_layers", 1))
         self.sync_save_events: list[torch.npu.Event] | None = None
@@ -653,7 +656,18 @@ class KVPoolWorker:
         self.current_layer = 0
         self.layerwise_retrievers: list[Any] = []
         if self.use_layerwise:
+            self.current_load_layer = 0
             self.next_layer_to_submit = 0
+            for layer_tasks in self.layer_load_tasks:
+                layer_tasks.clear()
+            for layer_tasks in self.layer_save_tasks:
+                layer_tasks.clear()
+            if self.layer_load_finished_events is not None:
+                for event in self.layer_load_finished_events:
+                    event.clear()
+            if self.layer_save_finished_events is not None:
+                for event in self.layer_save_finished_events:
+                    event.clear()
             reset_attention_compute_start_gate()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
@@ -1158,7 +1172,7 @@ class KVPoolWorker:
             )
             return True
 
-        submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
+        submit_count = self.num_prefetch_layers if self.current_load_layer == 0 else 1
         submitted_layers = 0
         while submitted_layers < submit_count and self.next_layer_to_submit < self.num_layers:
             layer_id = self.next_layer_to_submit
@@ -1168,17 +1182,22 @@ class KVPoolWorker:
 
     def wait_for_layer_load(self) -> None:
         assert self.layer_load_finished_events is not None
+        if self.current_load_layer >= self.num_layers:
+            return
         reset_attention_compute_start_gate()
         self._submit_ready_layer_loads()
-        should_wait = bool(self.layer_load_tasks[self.current_layer])
+        layer_id = self.current_load_layer
+        should_wait = bool(self.layer_load_tasks[layer_id])
         if not should_wait:
-            self.layer_load_finished_events[self.current_layer].clear()
+            self.layer_load_finished_events[layer_id].clear()
+            self.current_load_layer += 1
             return
-        is_finish = self.layer_load_finished_events[self.current_layer].wait(timeout=10)
+        is_finish = self.layer_load_finished_events[layer_id].wait(timeout=10)
         if not is_finish:
-            logger.info("Layerwise %d load wait timed out", self.current_layer)
-        logger.debug(">>>>>>>>>>>>>>>>>>>> clear load layer %d", self.current_layer)
-        self.layer_load_finished_events[self.current_layer].clear()
+            logger.info("Layerwise %d load wait timed out", layer_id)
+        logger.debug(">>>>>>>>>>>>>>>>>>>> clear load layer %d", layer_id)
+        self.layer_load_finished_events[layer_id].clear()
+        self.current_load_layer += 1
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         with self._invalid_block_ids_lock:

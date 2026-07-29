@@ -501,20 +501,22 @@ class TestSparseKVOffloadConfig(TestBase):
         self.assertEqual(vllm_config.cache_config.num_gpu_blocks_override, 33)
 
     def test_validate_host_accepts_layerwise_memcache_pd(self):
-        vllm_config = self._make_vllm_config()
-        vllm_config.kv_transfer_config = SimpleNamespace(
-            kv_connector="AscendStoreConnector",
-            kv_connector_extra_config={
-                "backend": "memcache",
-                "use_layerwise": True,
-            },
-            kv_role="kv_producer",
-        )
+        for kv_role in ("kv_producer", "kv_consumer"):
+            vllm_config = self._make_vllm_config()
+            vllm_config.kv_transfer_config = SimpleNamespace(
+                kv_connector="AscendStoreConnector",
+                kv_connector_extra_config={
+                    "backend": "memcache",
+                    "use_layerwise": True,
+                    "consumer_is_to_load": True,
+                },
+                kv_role=kv_role,
+            )
 
-        SparseKVOffloadConfig(enabled=True, mode="host").validate(
-            vllm_config,
-            enable_sparse_c8=False,
-        )
+            SparseKVOffloadConfig(enabled=True, mode="host").validate(
+                vllm_config,
+                enable_sparse_c8=False,
+            )
 
     def test_validate_host_rejects_unsupported_pd_and_capacity(self):
         cases = [
@@ -558,6 +560,17 @@ class TestSparseKVOffloadConfig(TestBase):
                     kv_role="kv_both",
                 ),
                 "kv_producer/kv_consumer",
+            ),
+            (
+                SimpleNamespace(
+                    kv_connector="AscendStoreConnector",
+                    kv_connector_extra_config={
+                        "backend": "memcache",
+                        "use_layerwise": True,
+                    },
+                    kv_role="kv_consumer",
+                ),
+                "consumer_is_to_load=true",
             ),
         ]
         config = SparseKVOffloadConfig(enabled=True, mode="host")

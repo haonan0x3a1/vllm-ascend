@@ -214,7 +214,7 @@ def test_host_mode_persists_prefill_rows_and_gathers_from_framework_swapped_kv(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_swapped_gather_selected_sfa_matches_full_kv_sfa(dtype):
+def test_host_gather_selected_sfa_matches_full_npu_kv_sfa(dtype):
     torch.manual_seed(2026)
     device = torch.device("npu")
     num_blocks = 4
@@ -287,21 +287,43 @@ def test_swapped_gather_selected_sfa_matches_full_kv_sfa(dtype):
         actual_key,
     )
 
+    host_nope = torch_npu.empty_with_swapped_memory(
+        tuple(full_nope.shape),
+        dtype=dtype,
+        device=device,
+    )
+    host_rope = torch_npu.empty_with_swapped_memory(
+        tuple(full_rope.shape),
+        dtype=dtype,
+        device=device,
+    )
+    host_nope.fill_(0)
+    host_rope.fill_(0)
     workspace = SparseKVOffloadWorkspace(
-        (full_nope, full_rope),
+        (host_nope, host_rope),
         index_topk=INDEX_TOPK,
         block_size=BLOCK_SIZE,
+        mode="host",
+        prefill_kv_cache=(full_nope, full_rope),
     )
-    workspace.sync_updated_blocks(
-        (full_nope, full_rope),
-        torch.tensor(
-            [
+    physical_slots = torch.cat(
+        (
+            torch.arange(
                 2 * BLOCK_SIZE,
-                1 * BLOCK_SIZE,
-            ],
-            dtype=torch.int64,
-        ),
-        num_actual_tokens=2,
+                3 * BLOCK_SIZE,
+                dtype=torch.int64,
+            ),
+            torch.arange(
+                BLOCK_SIZE,
+                2 * BLOCK_SIZE,
+                dtype=torch.int64,
+            ),
+        )
+    )
+    workspace.persist_prefill_blocks(
+        (host_nope, host_rope),
+        physical_slots,
+        num_actual_tokens=physical_slots.numel(),
     )
     selection = workspace.gather(
         topk_indices=topk_indices,

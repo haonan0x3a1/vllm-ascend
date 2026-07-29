@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -1387,6 +1388,81 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         )
         worker._process_load_for_layer_batch([req], 0)
         self.assertEqual(len(worker.layer_load_tasks[0]), 0)
+
+    def test_layerwise_start_resets_tasks_events_and_cursors(self):
+        worker = self._make_worker()
+        worker.use_layerwise = True
+        worker.current_layer = 1
+        worker.current_load_layer = 1
+        worker.next_layer_to_submit = 2
+        worker.layer_load_tasks = [[MagicMock()], [MagicMock()]]
+        worker.layer_save_tasks = [[MagicMock()], [MagicMock()]]
+        worker.layer_load_finished_events = [
+            threading.Event(),
+            threading.Event(),
+        ]
+        worker.layer_save_finished_events = [
+            threading.Event(),
+            threading.Event(),
+        ]
+        for event in (
+            worker.layer_load_finished_events
+            + worker.layer_save_finished_events
+        ):
+            event.set()
+
+        worker.start_load_kv(AscendConnectorMetadata(set(), set()))
+
+        self.assertEqual(worker.current_layer, 0)
+        self.assertEqual(worker.current_load_layer, 0)
+        self.assertEqual(worker.next_layer_to_submit, 0)
+        self.assertTrue(all(not tasks for tasks in worker.layer_load_tasks))
+        self.assertTrue(all(not tasks for tasks in worker.layer_save_tasks))
+        self.assertTrue(
+            all(
+                not event.is_set()
+                for event in (
+                    worker.layer_load_finished_events
+                    + worker.layer_save_finished_events
+                )
+            )
+        )
+
+    def test_layerwise_load_wait_advances_each_layer_independently(self):
+        worker = self._make_worker()
+        worker.use_layerwise = True
+        worker.num_layers = 3
+        worker.current_layer = 0
+        worker.current_load_layer = 0
+        worker.next_layer_to_submit = 0
+        worker.num_prefetch_layers = 1
+        worker.kv_recv_thread = MagicMock()
+        worker.layer_load_tasks = [
+            [MagicMock()],
+            [MagicMock()],
+            [MagicMock()],
+        ]
+        worker.layer_load_finished_events = [
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        ]
+        for event in worker.layer_load_finished_events:
+            event.set()
+
+        for _ in range(worker.num_layers):
+            worker.wait_for_layer_load()
+
+        self.assertEqual(worker.current_load_layer, worker.num_layers)
+        self.assertEqual(worker.current_layer, 0)
+        submitted_layer_ids = [
+            call.args[0].layer_id
+            for call in worker.kv_recv_thread.add_request.call_args_list
+        ]
+        self.assertEqual(submitted_layer_ids, [0, 1, 2])
+
+        worker.wait_for_layer_load()
+        self.assertEqual(worker.kv_recv_thread.add_request.call_count, 3)
 
 
 if __name__ == "__main__":
