@@ -3186,6 +3186,9 @@ class NPUModelRunner(GPUModelRunner):
             return blk_table_tensor, slot_mapping
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
+        block_table_cpu_gid_0 = self.input_batch.block_table[0].get_cpu_tensor()[
+            :num_reqs_padded
+        ]
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
@@ -3221,6 +3224,7 @@ class NPUModelRunner(GPUModelRunner):
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
+            block_table_cpu=block_table_cpu_gid_0,
             slot_mapping=slot_mapping_gid_0,
             slot_mapping_cpu=self.cpu_slot_mapping,
             causal=True,

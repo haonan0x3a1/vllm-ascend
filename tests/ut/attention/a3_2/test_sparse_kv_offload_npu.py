@@ -214,6 +214,67 @@ def test_host_mode_persists_prefill_rows_and_gathers_from_framework_swapped_kv(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_host_mode_restores_chunked_prefill_context(dtype):
+    device = torch.device("npu")
+    full_nope = torch_npu.empty_with_swapped_memory(
+        (4, BLOCK_SIZE, 1, 2),
+        dtype=dtype,
+        device=device,
+    )
+    full_rope = torch_npu.empty_with_swapped_memory(
+        (4, BLOCK_SIZE, 1, 1),
+        dtype=dtype,
+        device=device,
+    )
+    full_nope.fill_(-1)
+    full_rope.fill_(-1)
+    full_nope[2].fill_(20)
+    full_rope[2].fill_(21)
+    full_nope[1].fill_(10)
+    full_rope[1].fill_(11)
+    prefill_nope = torch.full(
+        tuple(full_nope.shape),
+        99,
+        dtype=dtype,
+        device=device,
+    )
+    prefill_rope = torch.full(
+        tuple(full_rope.shape),
+        77,
+        dtype=dtype,
+        device=device,
+    )
+    workspace = SparseKVOffloadWorkspace(
+        (full_nope, full_rope),
+        index_topk=INDEX_TOPK,
+        block_size=BLOCK_SIZE,
+        mode="host",
+        prefill_kv_cache=(prefill_nope, prefill_rope),
+    )
+
+    restored_blocks = workspace.restore_prefill_context(
+        (full_nope, full_rope),
+        torch.tensor([[2, 1, 3]], dtype=torch.int32),
+        context_len=BLOCK_SIZE + 1,
+    )
+    torch.npu.synchronize()
+
+    assert restored_blocks == (1, 2)
+    torch.testing.assert_close(prefill_nope[2], full_nope[2])
+    torch.testing.assert_close(prefill_rope[2], full_rope[2])
+    torch.testing.assert_close(prefill_nope[1], full_nope[1])
+    torch.testing.assert_close(prefill_rope[1], full_rope[1])
+    torch.testing.assert_close(
+        prefill_nope[3].float().cpu(),
+        torch.full(tuple(prefill_nope[3].shape), 99, dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        prefill_rope[3].float().cpu(),
+        torch.full(tuple(prefill_rope[3].shape), 77, dtype=torch.float32),
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_host_gather_selected_sfa_matches_full_npu_kv_sfa(dtype):
     torch.manual_seed(2026)
     device = torch.device("npu")

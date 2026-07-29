@@ -416,6 +416,77 @@ class SparseKVOffloadWorkspace:
             num_actual_tokens,
         )
 
+    def restore_prefill_context(
+        self,
+        full_kv_cache: tuple[torch.Tensor, ...],
+        full_block_table_cpu: torch.Tensor,
+        context_len: int,
+    ) -> tuple[int, ...]:
+        """Restore prior prompt blocks before reusing the Prefill workspace.
+
+        A single NPU Prefill cache is shared by every sparse layer. After one
+        chunk has traversed all layers, that cache contains the final layer's
+        data. A later chunk must therefore reload each current layer's already
+        computed blocks from its Host Full-KV before Attention can read them.
+        """
+        if self.mode != "host":
+            raise RuntimeError(
+                "restore_prefill_context is only valid in sparse KV offload "
+                "host mode."
+            )
+        if context_len < 0:
+            raise ValueError(f"context_len must be non-negative, got {context_len}.")
+        if context_len == 0:
+            return ()
+        if full_block_table_cpu.device.type != "cpu":
+            raise ValueError("full_block_table_cpu must reside on CPU.")
+        if full_block_table_cpu.ndim != 2 or full_block_table_cpu.shape[0] != 1:
+            raise ValueError(
+                "sparse_kv_offload host mode expects a CPU block table with "
+                f"shape [1, max_blocks], got {tuple(full_block_table_cpu.shape)}."
+            )
+        if context_len > self.num_full_blocks * self.block_size:
+            raise ValueError(
+                f"context_len={context_len} exceeds Full KV capacity "
+                f"{self.num_full_blocks * self.block_size}."
+            )
+
+        num_context_blocks = (
+            context_len + self.block_size - 1
+        ) // self.block_size
+        if num_context_blocks > full_block_table_cpu.shape[1]:
+            raise ValueError(
+                f"Context requires {num_context_blocks} blocks, but the CPU "
+                f"block table has only {full_block_table_cpu.shape[1]} entries."
+            )
+
+        physical_block_ids = torch.unique(
+            full_block_table_cpu[0, :num_context_blocks].to(torch.int64)
+        )
+        if physical_block_ids.numel() == 0:
+            return ()
+        min_block = int(physical_block_ids.min())
+        max_block = int(physical_block_ids.max())
+        if min_block < 0 or max_block >= self.num_full_blocks:
+            raise ValueError(
+                "CPU block table references physical blocks outside Full KV: "
+                f"min={min_block}, max={max_block}, "
+                f"num_full_blocks={self.num_full_blocks}."
+            )
+
+        assert self.prefill_kv_cache is not None
+        block_ids = tuple(int(block_id) for block_id in physical_block_ids.tolist())
+        for source, target in zip(
+            (full_kv_cache[0], full_kv_cache[1]),
+            self.prefill_kv_cache,
+        ):
+            for block_id in block_ids:
+                target[block_id].copy_(
+                    source[block_id],
+                    non_blocking=False,
+                )
+        return block_ids
+
     def gather(
         self,
         *,

@@ -238,11 +238,59 @@ def test_host_workspace_requires_matching_shared_prefill_cache():
         )
 
 
+def test_host_workspace_restores_chunked_prefill_context_from_full_kv():
+    full_nope = torch.full((4, BLOCK_SIZE, 1, 2), -1, dtype=torch.bfloat16)
+    full_rope = torch.full((4, BLOCK_SIZE, 1, 1), -1, dtype=torch.bfloat16)
+    full_nope[2].fill_(20)
+    full_rope[2].fill_(21)
+    full_nope[1].fill_(10)
+    full_rope[1].fill_(11)
+    prefill_nope = torch.full_like(full_nope, 99)
+    prefill_rope = torch.full_like(full_rope, 77)
+    full_kv_cache = (
+        full_nope,
+        full_rope,
+        torch.empty(4, BLOCK_SIZE, 1, 4, dtype=torch.bfloat16),
+    )
+    workspace = SparseKVOffloadWorkspace(
+        full_kv_cache,
+        index_topk=INDEX_TOPK,
+        block_size=BLOCK_SIZE,
+        mode="host",
+        prefill_kv_cache=(prefill_nope, prefill_rope),
+        gather_op=_fake_gather_selection_kv_cache,
+        validate_device=False,
+    )
+
+    restored_blocks = workspace.restore_prefill_context(
+        full_kv_cache,
+        torch.tensor([[2, 1, 3]], dtype=torch.int32),
+        context_len=BLOCK_SIZE + 1,
+    )
+
+    assert restored_blocks == (1, 2)
+    torch.testing.assert_close(prefill_nope[2], full_nope[2])
+    torch.testing.assert_close(prefill_rope[2], full_rope[2])
+    torch.testing.assert_close(prefill_nope[1], full_nope[1])
+    torch.testing.assert_close(prefill_rope[1], full_rope[1])
+    # Blocks outside the logical prefix must not be copied.
+    torch.testing.assert_close(
+        prefill_nope[3],
+        torch.full_like(prefill_nope[3], 99),
+    )
+    torch.testing.assert_close(
+        prefill_rope[3],
+        torch.full_like(prefill_rope[3], 77),
+    )
+
+
 def _make_sfa_metadata(attn_state: AscendAttentionState) -> AscendSFAMetadata:
     return AscendSFAMetadata(
         num_actual_tokens=1,
         slot_mapping=torch.tensor([128], dtype=torch.int64),
         slot_mapping_cpu=torch.tensor([128], dtype=torch.int64),
+        block_table_cpu=torch.tensor([[3, 1]], dtype=torch.int32),
+        num_computed_tokens_cpu=torch.tensor([128], dtype=torch.int32),
         seq_lens=torch.tensor([129], dtype=torch.int32),
         seq_lens_cpu=torch.tensor([129], dtype=torch.int32),
         cum_query_lens=torch.tensor([1], dtype=torch.int32),
@@ -251,6 +299,57 @@ def _make_sfa_metadata(attn_state: AscendAttentionState) -> AscendSFAMetadata:
         cos=torch.zeros(1, 1),
         attn_state=attn_state,
     )
+
+
+def test_sfa_host_chunked_prefill_restores_prior_context():
+    full_kv_cache = (
+        torch.empty(4, BLOCK_SIZE, 1, 2),
+        torch.empty(4, BLOCK_SIZE, 1, 1),
+        torch.empty(4, BLOCK_SIZE, 1, 4),
+    )
+    metadata = _make_sfa_metadata(AscendAttentionState.ChunkedPrefill)
+    workspace = MagicMock()
+    fake_impl = MagicMock()
+    fake_impl.sparse_kv_offload_config = SparseKVOffloadConfig(
+        enabled=True,
+        mode="host",
+    )
+    fake_impl._get_sparse_kv_offload_workspace.return_value = workspace
+
+    AscendSFAImpl._restore_sparse_kv_offload_prefill_context(
+        fake_impl,
+        full_kv_cache,
+        metadata,
+    )
+
+    workspace.restore_prefill_context.assert_called_once_with(
+        full_kv_cache,
+        metadata.block_table_cpu,
+        128,
+    )
+
+
+def test_sfa_host_initial_prefill_does_not_restore_context():
+    full_kv_cache = (
+        torch.empty(4, BLOCK_SIZE, 1, 2),
+        torch.empty(4, BLOCK_SIZE, 1, 1),
+        torch.empty(4, BLOCK_SIZE, 1, 4),
+    )
+    metadata = _make_sfa_metadata(AscendAttentionState.ChunkedPrefill)
+    metadata.num_computed_tokens_cpu.zero_()
+    fake_impl = MagicMock()
+    fake_impl.sparse_kv_offload_config = SparseKVOffloadConfig(
+        enabled=True,
+        mode="host",
+    )
+
+    AscendSFAImpl._restore_sparse_kv_offload_prefill_context(
+        fake_impl,
+        full_kv_cache,
+        metadata,
+    )
+
+    fake_impl._get_sparse_kv_offload_workspace.assert_not_called()
 
 
 def test_sfa_decode_switches_to_selected_kv_and_metadata():

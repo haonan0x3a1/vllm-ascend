@@ -225,6 +225,10 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # CPU tensor of slot mapping for host-side operations.
     slot_mapping_cpu: torch.Tensor = None
 
+    # CPU block table used by Host-resident sparse KV offload to restore a
+    # layer's history before a later chunked-prefill forward.
+    block_table_cpu: torch.Tensor = None
+
     # Current attention state (e.g., ChunkedPrefill, DecodeOnly).
     attn_state: Any = None
 
@@ -259,6 +263,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             # there will be error about shape mismatch during reshape and cache.
             # This is really strange since vLLM slices them as well
             block_table_tensor=self.block_table_tensor,
+            block_table_cpu=self.block_table_cpu,
             slot_mapping=self.slot_mapping,
             slot_mapping_cpu=self.slot_mapping_cpu,
             causal=self.causal,

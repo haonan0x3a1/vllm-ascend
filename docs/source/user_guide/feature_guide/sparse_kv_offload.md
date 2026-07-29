@@ -7,8 +7,10 @@ Atlas A3:
 
 1. The full MLA latent/RoPE KV cache resides in Host-backed swapped memory.
 2. The Lightning Indexer cache remains on the NPU.
-3. Prefill uses one NPU workspace shared by all layers and persists only the
-   token rows touched by the current forward into Full Host KV.
+3. Prefill uses one NPU workspace shared by all layers. A later
+   chunked-prefill chunk first restores that layer's prior physical blocks
+   from Full Host KV, then persists only the token rows touched by the current
+   forward back into Host KV.
 4. Lightning Indexer produces Top-K token indices for a decode step.
 5. `npu_gather_selection_kv_cache` reads Full Host KV and materializes selected
    KV on the NPU.
@@ -124,6 +126,7 @@ and memory allocation only; it is not an accuracy result.
 - Selected KV state is reused across decode steps and reset at Prefill/request
   boundaries. The current device buffer holds one Top-K working set rather than
   a larger configurable LRU pool.
-- Prefill row persistence is synchronous for correctness.
+- Chunked-prefill context restoration and Prefill row persistence are
+  synchronous for correctness.
 - Gather/SFA overlap, asynchronous prefill D2H, and performance claims require
   separate profiling.
