@@ -1361,6 +1361,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         """Allocate selected-KV state during KV-cache initialization."""
         self._get_sparse_kv_offload_workspace(full_kv_cache)
 
+    def reset_sparse_kv_offload_selection_state(self) -> None:
+        """Invalidate the selected-KV mapping at a request boundary."""
+        workspace = self.sparse_kv_offload_workspace
+        if workspace is not None:
+            workspace.reset_selection_state()
+
     def _get_sparse_kv_offload_forward_cache(
         self,
         full_kv_cache: tuple[torch.Tensor, ...],

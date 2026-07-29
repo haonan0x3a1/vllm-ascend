@@ -310,6 +310,23 @@ def test_sfa_decode_switches_to_selected_kv_and_metadata():
     assert result[4] is selection.actual_seq_lengths_kv
 
 
+def test_sfa_request_boundary_resets_existing_selection_workspace():
+    workspace = MagicMock()
+    fake_impl = MagicMock()
+    fake_impl.sparse_kv_offload_workspace = workspace
+
+    AscendSFAImpl.reset_sparse_kv_offload_selection_state(fake_impl)
+
+    workspace.reset_selection_state.assert_called_once_with()
+
+
+def test_sfa_request_boundary_before_workspace_initialization_is_noop():
+    fake_impl = MagicMock()
+    fake_impl.sparse_kv_offload_workspace = None
+
+    AscendSFAImpl.reset_sparse_kv_offload_selection_state(fake_impl)
+
+
 def test_sfa_prefill_only_updates_host_mirror():
     full_kv_cache = (
         torch.empty(4, BLOCK_SIZE, 1, 2),

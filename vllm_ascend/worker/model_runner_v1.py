@@ -735,7 +735,37 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
-        return super()._update_states(scheduler_output)
+        states_updated = super()._update_states(scheduler_output)
+        if scheduler_output.scheduled_new_reqs:
+            self._reset_sparse_kv_offload_selection_state()
+        return states_updated
+
+    def _reset_sparse_kv_offload_selection_state(self) -> None:
+        """Invalidate request-local selected-KV reuse state.
+
+        A PD consumer can schedule a new request directly as DecodeOnly after
+        loading its prompt KV from the connector. Therefore, the attention
+        implementation cannot rely on seeing a local Prefill forward to reset
+        the selected-KV status inherited from the previous request.
+        """
+        sparse_offload_config = self.ascend_config.sparse_kv_offload
+        if not sparse_offload_config.enabled:
+            return
+
+        attn_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,
+        )
+        for layer in attn_layers.values():
+            if not isinstance(layer, MLAAttention):
+                continue
+            resetter = getattr(
+                layer.impl,
+                "reset_sparse_kv_offload_selection_state",
+                None,
+            )
+            if callable(resetter):
+                resetter()
 
     def _pad_query_start_loc_for_fia(
         self,

@@ -168,6 +168,75 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             kv_caches[second_name]
         )
 
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_reset_host_mode_selection_state_for_sparse_mla_layers(
+        self,
+        mock_get_layers,
+    ):
+        runner = self._build_runner()
+        runner.ascend_config = SimpleNamespace(
+            sparse_kv_offload=SimpleNamespace(
+                enabled=True,
+                mode="host",
+            )
+        )
+
+        sparse_layer = MLAAttention.__new__(MLAAttention)
+        torch.nn.Module.__init__(sparse_layer)
+        sparse_layer.impl = MagicMock()
+        mock_get_layers.return_value = {
+            "model.layers.0.self_attn.attn": sparse_layer,
+        }
+
+        runner._reset_sparse_kv_offload_selection_state()
+
+        resetter = sparse_layer.impl.reset_sparse_kv_offload_selection_state
+        resetter.assert_called_once_with()
+
+    @patch.object(NPUModelRunner, "_reset_sparse_kv_offload_selection_state")
+    @patch(
+        "vllm.v1.worker.gpu_model_runner.GPUModelRunner._update_states",
+        return_value=None,
+    )
+    def test_update_states_resets_selection_for_new_pd_request(
+        self,
+        mock_super_update_states,
+        mock_reset_selection,
+    ):
+        runner = self._build_runner()
+        runner.use_async_scheduling = False
+        scheduler_output = SimpleNamespace(
+            scheduled_new_reqs=[SimpleNamespace(req_id="request-0")],
+            scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        )
+
+        runner._update_states(scheduler_output)
+
+        mock_super_update_states.assert_called_once_with(scheduler_output)
+        mock_reset_selection.assert_called_once_with()
+
+    @patch.object(NPUModelRunner, "_reset_sparse_kv_offload_selection_state")
+    @patch(
+        "vllm.v1.worker.gpu_model_runner.GPUModelRunner._update_states",
+        return_value=None,
+    )
+    def test_update_states_preserves_selection_for_continuing_decode(
+        self,
+        mock_super_update_states,
+        mock_reset_selection,
+    ):
+        runner = self._build_runner()
+        runner.use_async_scheduling = False
+        scheduler_output = SimpleNamespace(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(req_ids=["request-0"]),
+        )
+
+        runner._update_states(scheduler_output)
+
+        mock_super_update_states.assert_called_once_with(scheduler_output)
+        mock_reset_selection.assert_not_called()
+
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
     def test_sparse_layer_without_indexer_allocates_only_mla_kv_cache(
