@@ -25,10 +25,40 @@ from vllm_ascend.attention.sparse_kv_offload import (
     SparseKVOffloadWorkspace,
     SparseKVSelection,
     get_gather_selection_kv_cache_op,
+    make_sparse_kv_offload_memory_plan,
 )
 
 BLOCK_SIZE = 128
 INDEX_TOPK = 2048
+
+
+def test_host_mode_memory_plan_accounts_for_persistent_npu_state():
+    plan = make_sparse_kv_offload_memory_plan(
+        num_blocks=5,
+        block_size=BLOCK_SIZE,
+        index_topk=INDEX_TOPK,
+        full_kv_head_dim=576,
+        index_head_dim=128,
+        kv_dtype_size=2,
+        num_sparse_layers=2,
+        num_indexer_layers=1,
+        indexer_alignment_bytes_per_layer=2 * 1024 * 1024,
+    )
+
+    assert plan.indexer_cache_bytes == 5 * BLOCK_SIZE * 128 * 2
+    assert plan.indexer_alignment_bytes == 2 * 1024 * 1024
+    assert plan.shared_prefill_bytes == 5 * BLOCK_SIZE * 576 * 2
+    assert plan.selected_cache_bytes == 2 * INDEX_TOPK * 576 * 2
+    assert plan.selection_metadata_bytes == 2 * (
+        2 * (INDEX_TOPK // BLOCK_SIZE) * 4 + (INDEX_TOPK + 1) * 4 + INDEX_TOPK * 4
+    )
+    assert plan.total_bytes == (
+        plan.indexer_cache_bytes
+        + plan.indexer_alignment_bytes
+        + plan.shared_prefill_bytes
+        + plan.selected_cache_bytes
+        + plan.selection_metadata_bytes
+    )
 
 
 def _cpu_swapped_allocator(

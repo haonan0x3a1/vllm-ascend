@@ -908,6 +908,30 @@ class NPUWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+        sparse_offload_config = getattr(
+            getattr(self.model_runner, "ascend_config", None),
+            "sparse_kv_offload",
+            None,
+        )
+        if (
+            getattr(sparse_offload_config, "enabled", False) is True
+            and getattr(sparse_offload_config, "mode", None) == "host"
+        ):
+            available_memory_bytes = getattr(
+                self,
+                "available_kv_cache_memory_bytes",
+                None,
+            )
+            if available_memory_bytes is None:
+                available_memory_bytes = self.cache_config.kv_cache_memory_bytes
+            if available_memory_bytes is None:
+                raise RuntimeError(
+                    "sparse_kv_offload host mode requires the worker memory profile before KV-cache initialization."
+                )
+            self.model_runner.validate_sparse_kv_offload_memory(
+                kv_cache_config,
+                int(available_memory_bytes),
+            )
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
             context = allocator.use_memory_pool(tag="kv_cache")

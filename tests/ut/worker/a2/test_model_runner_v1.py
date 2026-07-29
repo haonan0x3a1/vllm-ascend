@@ -155,6 +155,68 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         second_layer.impl.initialize_sparse_kv_offload_workspace.assert_called_once_with(kv_caches[second_name])
 
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_host_mode_memory_plan_uses_local_sparse_layer_layout(
+        self,
+        mock_get_layers,
+    ):
+        runner = self._build_runner()
+        runner.ascend_config = SimpleNamespace(
+            sparse_kv_offload=SimpleNamespace(
+                enabled=True,
+                mode="host",
+            )
+        )
+        runner.block_size = 128
+        runner.kv_cache_dtype = torch.bfloat16
+        runner.vllm_config.kv_transfer_config = MagicMock()
+        runner.model_config.hf_text_config = SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            index_topk=2048,
+        )
+
+        first_layer = MLAAttention.__new__(MLAAttention)
+        torch.nn.Module.__init__(first_layer)
+        first_layer.impl = SimpleNamespace(has_indexer=True)
+        second_layer = MLAAttention.__new__(MLAAttention)
+        torch.nn.Module.__init__(second_layer)
+        second_layer.impl = SimpleNamespace(has_indexer=False)
+        first_name = "model.layers.0.self_attn.attn"
+        second_name = "model.layers.1.self_attn.attn"
+        mock_get_layers.return_value = {
+            first_name: first_layer,
+            second_name: second_layer,
+        }
+        kv_cache_config = SimpleNamespace(
+            num_blocks=5,
+            kv_cache_groups=[
+                SimpleNamespace(layer_names=[first_name, second_name]),
+            ],
+        )
+
+        plan = runner.get_sparse_kv_offload_memory_plan(kv_cache_config)
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.indexer_cache_bytes, 5 * 128 * 128 * 2)
+        self.assertEqual(plan.indexer_alignment_bytes, 2 * 1024 * 1024)
+        self.assertEqual(plan.shared_prefill_bytes, 5 * 128 * 576 * 2)
+        self.assertEqual(plan.selected_cache_bytes, 2 * 2048 * 576 * 2)
+        runner.validate_sparse_kv_offload_memory(
+            kv_cache_config,
+            plan.total_bytes,
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires .* bytes of persistent NPU memory",
+        ):
+            runner.validate_sparse_kv_offload_memory(
+                kv_cache_config,
+                plan.total_bytes - 1,
+            )
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
     def test_reset_host_mode_selection_state_for_sparse_mla_layers(
         self,
         mock_get_layers,

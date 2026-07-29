@@ -24,6 +24,7 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 SELECTION_TOPK_BLOCK_SIZE = 1
 SUPPORTED_KV_DTYPES = (torch.bfloat16, torch.float16)
+INT32_BYTES = 4
 
 SwappedAllocator = Callable[..., torch.Tensor]
 GatherSelectionOp = Callable[..., torch.Tensor]
@@ -70,6 +71,83 @@ class SparseKVSelection:
     sparse_indices: torch.Tensor
     actual_seq_lengths_query: torch.Tensor
     actual_seq_lengths_kv: torch.Tensor
+
+
+@dataclass(frozen=True)
+class SparseKVOffloadMemoryPlan:
+    """Persistent NPU memory owned by sparse KV offload Host mode."""
+
+    indexer_cache_bytes: int
+    indexer_alignment_bytes: int
+    shared_prefill_bytes: int
+    selected_cache_bytes: int
+    selection_metadata_bytes: int
+
+    @property
+    def total_bytes(self) -> int:
+        return (
+            self.indexer_cache_bytes
+            + self.indexer_alignment_bytes
+            + self.shared_prefill_bytes
+            + self.selected_cache_bytes
+            + self.selection_metadata_bytes
+        )
+
+
+def make_sparse_kv_offload_memory_plan(
+    *,
+    num_blocks: int,
+    block_size: int,
+    index_topk: int,
+    full_kv_head_dim: int,
+    index_head_dim: int,
+    kv_dtype_size: int,
+    num_sparse_layers: int,
+    num_indexer_layers: int,
+    indexer_alignment_bytes_per_layer: int = 0,
+) -> SparseKVOffloadMemoryPlan:
+    """Plan Host-mode persistent NPU allocations before creating tensors."""
+    positive_values = {
+        "num_blocks": num_blocks,
+        "block_size": block_size,
+        "index_topk": index_topk,
+        "full_kv_head_dim": full_kv_head_dim,
+        "index_head_dim": index_head_dim,
+        "kv_dtype_size": kv_dtype_size,
+        "num_sparse_layers": num_sparse_layers,
+    }
+    invalid_values = {name: value for name, value in positive_values.items() if value <= 0}
+    if invalid_values:
+        raise ValueError(f"sparse KV offload memory planning requires positive dimensions, got {invalid_values}.")
+    if not 0 <= num_indexer_layers <= num_sparse_layers:
+        raise ValueError(
+            f"num_indexer_layers must be in [0, num_sparse_layers], got {num_indexer_layers} and {num_sparse_layers}."
+        )
+    if indexer_alignment_bytes_per_layer < 0:
+        raise ValueError(
+            f"indexer_alignment_bytes_per_layer must be non-negative, got {indexer_alignment_bytes_per_layer}."
+        )
+
+    full_tokens = num_blocks * block_size
+    selection_num_blocks = (index_topk + block_size - 1) // block_size
+    selected_tokens = selection_num_blocks * block_size
+
+    indexer_cache_bytes = num_indexer_layers * full_tokens * index_head_dim * kv_dtype_size
+    shared_prefill_bytes = full_tokens * full_kv_head_dim * kv_dtype_size
+    selected_cache_bytes = num_sparse_layers * selected_tokens * full_kv_head_dim * kv_dtype_size
+    # Each layer owns a block-table template and its mutable copy, a status
+    # table with one sentinel entry, and the default Top-K index vector.
+    selection_metadata_bytes = num_sparse_layers * (
+        2 * selection_num_blocks * INT32_BYTES + (index_topk + 1) * INT32_BYTES + index_topk * INT32_BYTES
+    )
+
+    return SparseKVOffloadMemoryPlan(
+        indexer_cache_bytes=indexer_cache_bytes,
+        indexer_alignment_bytes=(num_indexer_layers * indexer_alignment_bytes_per_layer),
+        shared_prefill_bytes=shared_prefill_bytes,
+        selected_cache_bytes=selected_cache_bytes,
+        selection_metadata_bytes=selection_metadata_bytes,
+    )
 
 
 class SparseKVOffloadWorkspace:

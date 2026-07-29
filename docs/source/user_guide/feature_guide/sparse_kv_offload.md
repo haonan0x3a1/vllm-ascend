@@ -24,6 +24,11 @@ memory. It validates Gather and SFA correctness but does not save HBM.
 `host` mode is the memory-saving implementation. It automatically reserves the
 number of logical blocks required by `max_model_len`, including vLLM's null
 block, while allocating only the Indexer cache and runtime workspaces in HBM.
+Before allocation, the worker validates the real persistent NPU footprint
+(Indexer cache, transfer alignment, shared Prefill workspace, per-layer
+Selected KV, and selection metadata) against the memory left by model
+profiling. This keeps the logical-block override from hiding an insufficient
+HBM budget.
 
 ## Prerequisites
 

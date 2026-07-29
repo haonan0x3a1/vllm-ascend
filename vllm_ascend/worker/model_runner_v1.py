@@ -188,6 +188,10 @@ else:
 
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
+from vllm_ascend.attention.sparse_kv_offload import (
+    SparseKVOffloadMemoryPlan,
+    make_sparse_kv_offload_memory_plan,
+)
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -198,6 +202,7 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+KV_TRANSFER_CACHE_ALIGNMENT_BYTES = 2 * 1024 * 1024
 
 
 @dataclass
@@ -4004,6 +4009,105 @@ class NPUModelRunner(GPUModelRunner):
 
         return kv_caches
 
+    def get_sparse_kv_offload_memory_plan(
+        self,
+        kv_cache_config: KVCacheConfig,
+    ) -> SparseKVOffloadMemoryPlan | None:
+        """Return the Host-mode persistent NPU allocation plan.
+
+        Full MLA latent/RoPE tensors use swapped memory and therefore do not
+        consume the NPU KV-cache budget. The Indexer cache, shared Prefill
+        workspace, and per-layer Selected KV workspaces do consume that budget.
+        They are allocated after the normal profiling run, so account for them
+        explicitly before any tensors are created.
+        """
+        sparse_offload_config = self.ascend_config.sparse_kv_offload
+        if (
+            not sparse_offload_config.enabled
+            or sparse_offload_config.mode != "host"
+        ):
+            return None
+
+        configured_layer_names = [
+            layer_name
+            for group in kv_cache_config.kv_cache_groups
+            for layer_name in group.layer_names
+        ]
+        attn_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,
+            configured_layer_names,
+        )
+        sparse_layers = [
+            layer
+            for layer in attn_layers.values()
+            if isinstance(layer, MLAAttention)
+        ]
+        if not sparse_layers:
+            raise RuntimeError(
+                "sparse_kv_offload host mode cannot plan NPU memory because "
+                "the KV cache config contains no sparse MLA layers."
+            )
+
+        hf_text_config = self.model_config.hf_text_config
+        full_kv_head_dim = (
+            hf_text_config.kv_lora_rank
+            + hf_text_config.qk_rope_head_dim
+        )
+        num_indexer_layers = sum(
+            bool(getattr(layer.impl, "has_indexer", False))
+            for layer in sparse_layers
+        )
+        indexer_alignment_bytes_per_layer = (
+            KV_TRANSFER_CACHE_ALIGNMENT_BYTES
+            if self.vllm_config.kv_transfer_config is not None
+            else 0
+        )
+        return make_sparse_kv_offload_memory_plan(
+            num_blocks=kv_cache_config.num_blocks,
+            block_size=self.block_size,
+            index_topk=hf_text_config.index_topk,
+            full_kv_head_dim=full_kv_head_dim,
+            index_head_dim=hf_text_config.index_head_dim,
+            kv_dtype_size=get_dtype_size(self.kv_cache_dtype),
+            num_sparse_layers=len(sparse_layers),
+            num_indexer_layers=num_indexer_layers,
+            indexer_alignment_bytes_per_layer=(
+                indexer_alignment_bytes_per_layer
+            ),
+        )
+
+    def validate_sparse_kv_offload_memory(
+        self,
+        kv_cache_config: KVCacheConfig,
+        available_memory_bytes: int,
+    ) -> None:
+        """Fail before allocation when Host-mode persistent NPU state cannot fit."""
+        plan = self.get_sparse_kv_offload_memory_plan(kv_cache_config)
+        if plan is None:
+            return
+
+        logger.info(
+            "Sparse KV offload Host-mode NPU memory plan: total=%d, "
+            "indexer=%d, alignment=%d, shared_prefill=%d, selected=%d, "
+            "metadata=%d, available=%d bytes.",
+            plan.total_bytes,
+            plan.indexer_cache_bytes,
+            plan.indexer_alignment_bytes,
+            plan.shared_prefill_bytes,
+            plan.selected_cache_bytes,
+            plan.selection_metadata_bytes,
+            available_memory_bytes,
+        )
+        if plan.total_bytes > available_memory_bytes:
+            raise ValueError(
+                "sparse_kv_offload host mode requires "
+                f"{plan.total_bytes} bytes of persistent NPU memory for the "
+                "Indexer cache and offload workspaces, but only "
+                f"{available_memory_bytes} bytes remain after model profiling. "
+                "Increase gpu_memory_utilization or reduce max_model_len."
+            )
+
     def _bind_sparse_kv_offload_prefill_cache(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -4237,7 +4341,7 @@ class NPUModelRunner(GPUModelRunner):
         # init kv cache tensors
         kv_cache_raw_tensors: dict[str, torch.Tensor | torch.Tensor | None | None] = {}
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
-        alignment = 2 * 1024 * 1024
+        alignment = KV_TRANSFER_CACHE_ALIGNMENT_BYTES
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
         # If some tensors are shared by linear layers and attention layers,
         # the same tensor format must be maintained even if some layers

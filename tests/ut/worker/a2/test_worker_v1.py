@@ -1264,6 +1264,39 @@ class TestNPUWorker(TestBase):
             # Verify calls
             worker.model_runner.initialize_kv_cache.assert_called_once_with(mock_kv_cache_config)
 
+    @patch("vllm_ascend.worker.worker.ensure_kv_transfer_initialized")
+    def test_initialize_from_config_validates_host_offload_memory(
+        self,
+        mock_ensure_kv_transfer,
+    ):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+            worker.model_runner = MagicMock()
+            sparse_offload_config = MagicMock()
+            sparse_offload_config.enabled = True
+            sparse_offload_config.mode = "host"
+            worker.model_runner.ascend_config.sparse_kv_offload = sparse_offload_config
+            worker.available_kv_cache_memory_bytes = 1234
+            worker.vllm_config = MagicMock()
+            worker.vllm_config.model_config.enable_sleep_mode = False
+            worker.vllm_config.speculative_config = None
+            worker.cache_config = MagicMock()
+            kv_cache_config = MagicMock()
+
+            worker.initialize_from_config(kv_cache_config)
+
+            worker.model_runner.validate_sparse_kv_offload_memory.assert_called_once_with(
+                kv_cache_config,
+                1234,
+            )
+            worker.model_runner.initialize_kv_cache.assert_called_once_with(kv_cache_config)
+            mock_ensure_kv_transfer.assert_called_once_with(
+                worker.vllm_config,
+                kv_cache_config,
+            )
+
     @patch("vllm_ascend.worker.worker.get_ascend_config")
     @patch("vllm_ascend.worker.worker.enable_sp", return_value=False)
     @patch("vllm_ascend.worker.worker.get_pp_group")
