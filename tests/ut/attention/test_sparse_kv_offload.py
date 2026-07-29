@@ -40,6 +40,10 @@ def _cpu_swapped_allocator(
     return torch.empty(shape, dtype=dtype, device=device)
 
 
+def _unexpected_swapped_allocator(*args, **kwargs):
+    raise AssertionError("host mode must not allocate a second Full KV mirror")
+
+
 def _fake_gather_selection_kv_cache(**kwargs) -> torch.Tensor:
     topk_indices = kwargs["selection_topk_indices"][0, 0]
     full_actual_seq = int(kwargs["full_kv_actual_seq"][0])
@@ -116,12 +120,14 @@ def test_workspace_mirrors_touched_blocks_and_gathers_selected_kv(dtype):
 
     topk_indices = torch.full((1, 1, INDEX_TOPK), -1, dtype=torch.int32)
     topk_indices[0, 0, :2] = torch.tensor([130, 5], dtype=torch.int32)
+    workspace.reset_selection_state = MagicMock()
     selection = workspace.gather(
         topk_indices=topk_indices,
         full_block_table=torch.tensor([[3, 1]], dtype=torch.int32),
         full_actual_seq_lengths=torch.tensor([256], dtype=torch.int32),
         full_query_actual_seq_lengths=torch.tensor([1], dtype=torch.int32),
     )
+    workspace.reset_selection_state.assert_not_called()
 
     assert selection.kv_cache[0].shape == (16, BLOCK_SIZE, 1, 2)
     assert selection.kv_cache[1].shape == (16, BLOCK_SIZE, 1, 1)
@@ -135,6 +141,101 @@ def test_workspace_mirrors_touched_blocks_and_gathers_selected_kv(dtype):
     )
     assert selection.actual_seq_lengths_kv.tolist() == [2]
     assert selection.sparse_indices[0, 0, :3].tolist() == [0, 1, -1]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_host_workspace_uses_shared_prefill_cache_and_persists_only_touched_slots(
+    dtype,
+):
+    full_nope = torch.full((2, BLOCK_SIZE, 1, 2), -1, dtype=dtype)
+    full_rope = torch.full((2, BLOCK_SIZE, 1, 1), -1, dtype=dtype)
+    indexer_cache = torch.zeros(2, BLOCK_SIZE, 1, 4, dtype=dtype)
+    prefill_nope = torch.full_like(full_nope, 99)
+    prefill_rope = torch.full_like(full_rope, 77)
+    full_kv_cache = (full_nope, full_rope, indexer_cache)
+    prefill_kv_cache = (prefill_nope, prefill_rope)
+
+    workspace = SparseKVOffloadWorkspace(
+        full_kv_cache,
+        index_topk=INDEX_TOPK,
+        block_size=BLOCK_SIZE,
+        mode="host",
+        prefill_kv_cache=prefill_kv_cache,
+        swapped_allocator=_unexpected_swapped_allocator,
+        gather_op=_fake_gather_selection_kv_cache,
+        validate_device=False,
+    )
+
+    assert workspace.full_nope_source is full_nope
+    assert workspace.full_rope_source is full_rope
+    forward_cache = workspace.get_forward_kv_cache(
+        full_kv_cache,
+        is_decode=False,
+    )
+    assert forward_cache[0] is prefill_nope
+    assert forward_cache[1] is prefill_rope
+    assert forward_cache[2] is indexer_cache
+    assert workspace.get_forward_kv_cache(
+        full_kv_cache,
+        is_decode=True,
+    ) is full_kv_cache
+
+    updated_blocks = workspace.persist_prefill_blocks(
+        full_kv_cache,
+        torch.tensor(
+            [
+                3,
+                BLOCK_SIZE + 5,
+                -1,
+            ],
+            dtype=torch.int64,
+        ),
+        num_actual_tokens=3,
+    )
+
+    assert updated_blocks == (0, 1)
+    torch.testing.assert_close(full_nope[0, 3], prefill_nope[0, 3])
+    torch.testing.assert_close(full_rope[1, 5], prefill_rope[1, 5])
+    # A whole-block copy would incorrectly replace these untouched rows.
+    torch.testing.assert_close(
+        full_nope[0, 4],
+        torch.full_like(full_nope[0, 4], -1),
+    )
+    torch.testing.assert_close(
+        full_rope[1, 6],
+        torch.full_like(full_rope[1, 6], -1),
+    )
+
+
+def test_host_workspace_requires_matching_shared_prefill_cache():
+    full_kv_cache = (
+        torch.empty(2, BLOCK_SIZE, 1, 2),
+        torch.empty(2, BLOCK_SIZE, 1, 1),
+        torch.empty(2, BLOCK_SIZE, 1, 4),
+    )
+    with pytest.raises(ValueError, match="requires the shared prefill"):
+        SparseKVOffloadWorkspace(
+            full_kv_cache,
+            index_topk=INDEX_TOPK,
+            block_size=BLOCK_SIZE,
+            mode="host",
+            gather_op=_fake_gather_selection_kv_cache,
+            validate_device=False,
+        )
+
+    with pytest.raises(ValueError, match="does not match Full KV shape"):
+        SparseKVOffloadWorkspace(
+            full_kv_cache,
+            index_topk=INDEX_TOPK,
+            block_size=BLOCK_SIZE,
+            mode="host",
+            prefill_kv_cache=(
+                torch.empty(1, BLOCK_SIZE, 1, 2),
+                torch.empty(2, BLOCK_SIZE, 1, 1),
+            ),
+            gather_op=_fake_gather_selection_kv_cache,
+            validate_device=False,
+        )
 
 
 def _make_sfa_metadata(attn_state: AscendAttentionState) -> AscendSFAMetadata:
@@ -182,6 +283,7 @@ def test_sfa_decode_switches_to_selected_kv_and_metadata():
     result = AscendSFAImpl._prepare_sparse_kv_offload_attention(
         fake_impl,
         full_kv_cache,
+        full_kv_cache,
         topk_indices,
         metadata,
         actual_query,
@@ -193,6 +295,7 @@ def test_sfa_decode_switches_to_selected_kv_and_metadata():
         metadata.slot_mapping_cpu,
         metadata.num_actual_tokens,
     )
+    workspace.reset_selection_state.assert_not_called()
     workspace.gather.assert_called_once_with(
         topk_indices=topk_indices,
         full_block_table=metadata.block_table,
@@ -226,6 +329,7 @@ def test_sfa_prefill_only_updates_host_mirror():
     result = AscendSFAImpl._prepare_sparse_kv_offload_attention(
         fake_impl,
         full_kv_cache,
+        full_kv_cache,
         topk_indices,
         metadata,
         actual_query,
@@ -233,9 +337,55 @@ def test_sfa_prefill_only_updates_host_mirror():
     )
 
     workspace.sync_updated_blocks.assert_called_once()
+    workspace.reset_selection_state.assert_called_once_with()
     workspace.gather.assert_not_called()
     assert result[0] is full_kv_cache
     assert result[1] is topk_indices
     assert result[2] is metadata
     assert result[3] is actual_query
     assert result[4] is actual_key
+
+
+def test_sfa_host_prefill_persists_workspace_without_gathering():
+    full_kv_cache = (
+        torch.empty(4, BLOCK_SIZE, 1, 2),
+        torch.empty(4, BLOCK_SIZE, 1, 1),
+        torch.empty(4, BLOCK_SIZE, 1, 4),
+    )
+    forward_kv_cache = (
+        torch.empty_like(full_kv_cache[0]),
+        torch.empty_like(full_kv_cache[1]),
+        full_kv_cache[2],
+    )
+    topk_indices = torch.full((1, 1, INDEX_TOPK), -1, dtype=torch.int32)
+    actual_query = torch.tensor([1], dtype=torch.int32)
+    actual_key = torch.tensor([1], dtype=torch.int32)
+    metadata = _make_sfa_metadata(AscendAttentionState.ChunkedPrefill)
+
+    workspace = MagicMock()
+    fake_impl = MagicMock()
+    fake_impl.sparse_kv_offload_config = SparseKVOffloadConfig(
+        enabled=True,
+        mode="host",
+    )
+    fake_impl._get_sparse_kv_offload_workspace.return_value = workspace
+
+    result = AscendSFAImpl._prepare_sparse_kv_offload_attention(
+        fake_impl,
+        full_kv_cache,
+        forward_kv_cache,
+        topk_indices,
+        metadata,
+        actual_query,
+        actual_key,
+    )
+
+    workspace.sync_updated_blocks.assert_not_called()
+    workspace.persist_prefill_blocks.assert_called_once_with(
+        full_kv_cache,
+        metadata.slot_mapping_cpu,
+        metadata.num_actual_tokens,
+    )
+    workspace.reset_selection_state.assert_called_once_with()
+    workspace.gather.assert_not_called()
+    assert result[0] is forward_kv_cache

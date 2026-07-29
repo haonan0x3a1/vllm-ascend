@@ -103,7 +103,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `enable_fused_mc2`                  | int  | `0`     | Fused MC2 configuration. Can also be configured via the `VLLM_ASCEND_ENABLE_FUSED_MC2` environment variable during the migration period. |
 | `enable_transpose_kv_cache_by_block`| bool | `True`  | Whether to enable transpose KV cache by block. Can also be configured via the `VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK` environment variable during the migration period. |
 | `enable_dsa_cp`                     | bool | `False` | Whether to enable dsa_cp for DeepSeek V3.2, DeepSeek V4, and other models with the same architecture. This feature depends on FLASHCOMM1. Please ensure that FLASHCOMM1 is enabled before enabling this feature.|
-| `sparse_kv_offload`                 | dict | `{"enabled": false, "mode": "mirror"}` | Experimental DeepSeek-V3.2 sparse KV offload mirror PoC. See [Sparse KV Offload Mirror PoC](../feature_guide/sparse_kv_offload_mirror.md). |
+| `sparse_kv_offload`                 | dict | `{"enabled": false, "mode": "mirror"}` | Experimental DeepSeek-V3.2 sparse KV offload. See [DeepSeek-V3.2 Sparse KV Offload](../feature_guide/sparse_kv_offload.md). |
 | `rejection_sampler_config`          | dict | `{}`    | Configuration options for rejection sampler (block verify and entropy verify). |
 | `multistream_dsv4_dsa_overlap`      | bool | `True`  | Whether to enable dsa multi-stream overlap for DeepSeek V4.  |
 
@@ -182,7 +182,7 @@ The details of each configuration option are as follows:
 | Name | Type | Default | Description |
 | ---- | ---- | ------- | ----------- |
 | `enabled` | bool | `False` | Enables the experimental sparse KV offload path. |
-| `mode` | str | `"mirror"` | Keeps full KV on the NPU while mirroring updated blocks into swapped memory. This mode validates correctness but does not reduce NPU KV memory. |
+| `mode` | str | `"mirror"` | `"mirror"` keeps Full KV on the NPU and mirrors it to swapped memory for validation. `"host"` allocates Full MLA KV in Host-backed swapped memory, keeps Indexer KV on the NPU, and uses NPU Prefill/Top-K workspaces. |
 
 ### Example
 

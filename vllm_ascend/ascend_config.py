@@ -32,6 +32,11 @@ class SparseKVOffloadConfig:
     ``mirror`` keeps the framework-owned full KV cache on the NPU and mirrors
     updated blocks into swapped memory. It validates the Host KV -> selected
     NPU KV -> SFA data path without claiming NPU memory savings.
+
+    ``host`` makes the framework-owned MLA latent/RoPE cache use swapped
+    memory directly while keeping the Lightning Indexer cache on the NPU.
+    Prefill uses one shared NPU KV workspace; decode gathers the selected
+    Top-K KV rows from the swapped cache into an NPU workspace.
     """
 
     enabled: bool = False
@@ -57,9 +62,10 @@ class SparseKVOffloadConfig:
             )
         if not isinstance(mode, str):
             raise ValueError(f"additional_config.sparse_kv_offload.mode must be a string, got {type(mode).__name__}.")
-        if mode != "mirror":
+        if mode not in {"mirror", "host"}:
             raise ValueError(
-                f"additional_config.sparse_kv_offload.mode only supports 'mirror' in the current PoC, got {mode!r}."
+                "additional_config.sparse_kv_offload.mode must be one of "
+                f"['host', 'mirror'], got {mode!r}."
             )
         return cls(enabled=enabled, mode=mode)
 
@@ -83,32 +89,62 @@ class SparseKVOffloadConfig:
                 f"sparse_kv_offload currently requires a DSA model with index_topk=2048, got {index_topk!r}."
             )
         if not getattr(model_config, "enforce_eager", False):
-            raise ValueError("sparse_kv_offload mirror mode requires --enforce-eager.")
+            raise ValueError(f"sparse_kv_offload {self.mode} mode requires --enforce-eager.")
 
         scheduler_config = vllm_config.scheduler_config
         if scheduler_config.max_num_seqs != 1:
             raise ValueError(
-                "sparse_kv_offload mirror mode currently requires "
+                f"sparse_kv_offload {self.mode} mode currently requires "
                 f"--max-num-seqs 1, got {scheduler_config.max_num_seqs}."
             )
 
         cache_config = vllm_config.cache_config
         if cache_config.block_size != 128:
             raise ValueError(
-                f"sparse_kv_offload mirror mode requires KV cache block_size=128, got {cache_config.block_size}."
+                f"sparse_kv_offload {self.mode} mode requires KV cache "
+                f"block_size=128, got {cache_config.block_size}."
             )
         if getattr(cache_config, "enable_prefix_caching", False):
             raise ValueError(
-                "sparse_kv_offload mirror mode does not support prefix caching. Set --no-enable-prefix-caching."
+                f"sparse_kv_offload {self.mode} mode does not support prefix "
+                "caching. Set --no-enable-prefix-caching."
             )
         if vllm_config.speculative_config is not None:
-            raise ValueError("sparse_kv_offload mirror mode does not support speculative decoding or MTP.")
-        if vllm_config.kv_transfer_config is not None:
+            raise ValueError(f"sparse_kv_offload {self.mode} mode does not support speculative decoding or MTP.")
+
+        kv_transfer_config = vllm_config.kv_transfer_config
+        if self.mode == "mirror" and kv_transfer_config is not None:
             raise ValueError(
                 "sparse_kv_offload mirror mode cannot be combined with KV transfer or PD disaggregation yet."
             )
+        if self.mode == "host" and kv_transfer_config is not None:
+            connector = kv_transfer_config.kv_connector
+            if connector != "AscendStoreConnector":
+                raise ValueError(
+                    "sparse_kv_offload host mode with PD disaggregation "
+                    "currently requires AscendStoreConnector with the memcache "
+                    f"layerwise backend, got {connector!r}."
+                )
+            extra_config = kv_transfer_config.kv_connector_extra_config or {}
+            if not extra_config.get("use_layerwise", False):
+                raise ValueError(
+                    "sparse_kv_offload host mode requires "
+                    "AscendStoreConnector use_layerwise=true."
+                )
+            if str(extra_config.get("backend", "")).lower() != "memcache":
+                raise ValueError(
+                    "sparse_kv_offload host mode requires "
+                    "AscendStoreConnector backend='memcache' so the mixed "
+                    "Host/NPU cache tuple is transferred layerwise."
+                )
+            if kv_transfer_config.kv_role not in {"kv_producer", "kv_consumer"}:
+                raise ValueError(
+                    "sparse_kv_offload host mode currently supports only "
+                    "PD-disaggregated kv_producer/kv_consumer roles, got "
+                    f"{kv_transfer_config.kv_role!r}."
+                )
         if enable_sparse_c8:
-            raise ValueError("sparse_kv_offload mirror mode does not support sparse C8 KV cache.")
+            raise ValueError(f"sparse_kv_offload {self.mode} mode does not support sparse C8 KV cache.")
 
         additional_config = vllm_config.additional_config or {}
         parallel_config = vllm_config.parallel_config
@@ -117,7 +153,32 @@ class SparseKVOffloadConfig:
             or parallel_config.prefill_context_parallel_size > 1
             or parallel_config.decode_context_parallel_size > 1
         ):
-            raise ValueError("sparse_kv_offload mirror mode does not support DSA context parallelism, PCP, or DCP.")
+            raise ValueError(
+                f"sparse_kv_offload {self.mode} mode does not support DSA "
+                "context parallelism, PCP, or DCP."
+            )
+
+        if self.mode == "host":
+            # vLLM reserves physical block 0 as the null/padding block.
+            required_num_blocks = (
+                cdiv(model_config.max_model_len, cache_config.block_size) + 1
+            )
+            configured_num_blocks = cache_config.num_gpu_blocks_override
+            if configured_num_blocks is not None and configured_num_blocks < required_num_blocks:
+                raise ValueError(
+                    "sparse_kv_offload host mode requires enough framework "
+                    "blocks for max_model_len: "
+                    f"num_gpu_blocks_override={configured_num_blocks}, "
+                    f"required={required_num_blocks}."
+                )
+            if configured_num_blocks is None:
+                cache_config.num_gpu_blocks_override = required_num_blocks
+                logger.info(
+                    "sparse_kv_offload host mode sets "
+                    "num_gpu_blocks_override=%d for max_model_len=%d.",
+                    required_num_blocks,
+                    model_config.max_model_len,
+                )
 
 
 class AscendConfig:
@@ -373,6 +434,15 @@ class AscendConfig:
         self.c8_enable_reshape_optim = self.enable_sparse_c8 and additional_config.get("c8_enable_reshape_optim", False)
         self.sparse_kv_offload = SparseKVOffloadConfig.from_dict(additional_config.get("sparse_kv_offload"))
         self.sparse_kv_offload.validate(vllm_config, self.enable_sparse_c8)
+        if (
+            self.sparse_kv_offload.enabled
+            and self.sparse_kv_offload.mode == "host"
+            and not self.enable_mlapo
+        ):
+            raise ValueError(
+                "sparse_kv_offload host mode requires enable_mlapo=true for "
+                "direct decode writes to swapped Full KV."
+            )
         quant_config = getattr(vllm_config, "quant_config", None)
         self._sparse_c8_layer_ids, self._sparse_c8_layer_names = self._parse_sparse_c8_layers_from_quant_config(
             quant_config

@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch_npu
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
@@ -3954,6 +3955,7 @@ class NPUModelRunner(GPUModelRunner):
 
             num_attn_module = 2 if self.model_config.hf_text_config.model_type == "longcat_flash" else 1
             bind_kv_cache(kv_caches, self.compilation_config.static_forward_context, self.kv_caches, num_attn_module)
+            self._bind_sparse_kv_offload_prefill_cache(kv_caches)
 
         if self.enable_hamming_sparse is True:
             from vllm_ascend.worker.kvcomp_utils import init_and_bind_hashk_cache
@@ -3967,6 +3969,90 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         return kv_caches
+
+    def _bind_sparse_kv_offload_prefill_cache(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> None:
+        """Allocate one cross-layer NPU prefill cache for Host Full-KV mode."""
+        sparse_offload_config = self.ascend_config.sparse_kv_offload
+        if not sparse_offload_config.enabled or sparse_offload_config.mode != "host":
+            return
+
+        attn_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,
+            list(kv_caches),
+        )
+        sparse_layer_names = [
+            layer_name
+            for layer_name, layer in attn_layers.items()
+            if isinstance(layer, MLAAttention)
+            and isinstance(kv_caches.get(layer_name), tuple)
+            and len(kv_caches[layer_name]) >= 2
+        ]
+        if not sparse_layer_names:
+            raise RuntimeError(
+                "sparse_kv_offload host mode did not find any bound sparse MLA KV caches."
+            )
+
+        first_full_kv = kv_caches[sparse_layer_names[0]]
+        assert isinstance(first_full_kv, tuple)
+        shared_prefill_kv = (
+            torch.empty(
+                tuple(first_full_kv[0].shape),
+                dtype=first_full_kv[0].dtype,
+                device=self.device,
+            ),
+            torch.empty(
+                tuple(first_full_kv[1].shape),
+                dtype=first_full_kv[1].dtype,
+                device=self.device,
+            ),
+        )
+
+        for layer_name in sparse_layer_names:
+            full_kv = kv_caches[layer_name]
+            assert isinstance(full_kv, tuple)
+            if (
+                full_kv[0].shape != shared_prefill_kv[0].shape
+                or full_kv[1].shape != shared_prefill_kv[1].shape
+                or full_kv[0].dtype != shared_prefill_kv[0].dtype
+                or full_kv[1].dtype != shared_prefill_kv[1].dtype
+            ):
+                raise ValueError(
+                    "sparse_kv_offload host mode requires uniform MLA Full-KV "
+                    f"layouts across layers; {layer_name} does not match "
+                    f"{sparse_layer_names[0]}."
+                )
+            impl = attn_layers[layer_name].impl
+            setter = getattr(impl, "set_sparse_kv_offload_prefill_cache", None)
+            if not callable(setter):
+                raise RuntimeError(
+                    "The SFA implementation does not expose "
+                    "set_sparse_kv_offload_prefill_cache."
+                )
+            setter(shared_prefill_kv)
+            initializer = getattr(
+                impl,
+                "initialize_sparse_kv_offload_workspace",
+                None,
+            )
+            if not callable(initializer):
+                raise RuntimeError(
+                    "The SFA implementation does not expose "
+                    "initialize_sparse_kv_offload_workspace."
+                )
+            initializer(full_kv)
+
+        prefill_bytes = sum(tensor.numel() * tensor.element_size() for tensor in shared_prefill_kv)
+        logger.info(
+            "Allocated one shared sparse KV offload prefill workspace: "
+            "layers=%d, blocks=%d, bytes=%d.",
+            len(sparse_layer_names),
+            shared_prefill_kv[0].shape[0],
+            prefill_bytes,
+        )
 
     def _get_layer_kv_cache_specs(self, kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}
@@ -4026,6 +4112,22 @@ class NPUModelRunner(GPUModelRunner):
             device=self.device,
         )
         return self._align_memory(raw_tensor, alignment)[:numel]
+
+    def _allocate_swapped_int8_cache_tensor(self, numel: int) -> torch.Tensor:
+        """Allocate framework-owned Host/Swapped raw KV storage."""
+        if numel <= 0:
+            raise ValueError(f"Invalid swapped cache tensor size: {numel}")
+        allocator = getattr(torch_npu, "empty_with_swapped_memory", None)
+        if not callable(allocator):
+            raise RuntimeError(
+                "sparse_kv_offload host mode requires "
+                "torch_npu.empty_with_swapped_memory."
+            )
+        return allocator(
+            (numel,),
+            dtype=torch.int8,
+            device=self.device,
+        )
 
     def _allocate_sparse_c8_indexer_tensors(
         self,
@@ -4216,15 +4318,30 @@ class NPUModelRunner(GPUModelRunner):
                     dsa_k_tensor = None
                     dsa_k_scale_tensor = None
                     v_tensor = None
-                    k_tensor = self._allocate_int8_cache_tensor(
-                        k_tensor_size,
-                        alignment,
+                    use_host_full_kv = (
+                        self.use_sparse
+                        and self.ascend_config.sparse_kv_offload.enabled
+                        and self.ascend_config.sparse_kv_offload.mode == "host"
                     )
-                    if v_tensor_size is not None:
-                        v_tensor = self._allocate_int8_cache_tensor(
-                            v_tensor_size,
+                    if use_host_full_kv:
+                        k_tensor = self._allocate_swapped_int8_cache_tensor(
+                            k_tensor_size,
+                        )
+                    else:
+                        k_tensor = self._allocate_int8_cache_tensor(
+                            k_tensor_size,
                             alignment,
                         )
+                    if v_tensor_size is not None:
+                        if use_host_full_kv:
+                            v_tensor = self._allocate_swapped_int8_cache_tensor(
+                                v_tensor_size,
+                            )
+                        else:
+                            v_tensor = self._allocate_int8_cache_tensor(
+                                v_tensor_size,
+                                alignment,
+                            )
 
                     if self.use_sparse and has_indexer_cache:
                         assert dsa_k_tensor_size is not None

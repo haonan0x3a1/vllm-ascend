@@ -59,7 +59,10 @@ def _allocate_swapped_memory(
 ) -> torch.Tensor:
     allocator = getattr(torch_npu, "empty_with_swapped_memory", None)
     if not callable(allocator):
-        raise RuntimeError("torch_npu.empty_with_swapped_memory is required by sparse_kv_offload mirror mode.")
+        raise RuntimeError(
+            "torch_npu.empty_with_swapped_memory is required by "
+            "sparse_kv_offload."
+        )
     return allocator(shape, dtype=dtype, device=device)
 
 
@@ -73,7 +76,13 @@ class SparseKVSelection:
 
 
 class SparseKVOffloadWorkspace:
-    """Per-layer Host-mirror and selected-KV workspace for the mirror PoC."""
+    """Per-layer sparse KV offload runtime workspace.
+
+    Mirror mode owns a swapped-memory mirror of the framework NPU KV cache.
+    Host mode treats the framework KV cache itself as the swapped-memory Full
+    KV store and uses a model-runner-owned, cross-layer NPU cache for prefill.
+    Both modes own a per-layer selected-KV NPU workspace for decode.
+    """
 
     def __init__(
         self,
@@ -81,19 +90,27 @@ class SparseKVOffloadWorkspace:
         *,
         index_topk: int,
         block_size: int,
+        mode: str = "mirror",
+        prefill_kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
         swapped_allocator: SwappedAllocator | None = None,
         gather_op: GatherSelectionOp | None = None,
         validate_device: bool = True,
     ) -> None:
         self._validate_full_kv_cache(full_kv_cache, block_size)
+        if mode not in {"host", "mirror"}:
+            raise ValueError(f"Unsupported sparse KV offload mode: {mode!r}.")
         if validate_device and get_ascend_device_type() != AscendDeviceType.A3:
             raise RuntimeError(
-                "sparse_kv_offload mirror mode currently requires an Ascend "
+                f"sparse_kv_offload {mode} mode currently requires an Ascend "
                 f"A3 device, got {get_ascend_device_type().name}."
             )
         if index_topk != 2048:
-            raise ValueError(f"sparse_kv_offload mirror mode currently requires index_topk=2048, got {index_topk}.")
+            raise ValueError(
+                f"sparse_kv_offload {mode} mode currently requires "
+                f"index_topk=2048, got {index_topk}."
+            )
 
+        self.mode = mode
         self.index_topk = index_topk
         self.block_size = block_size
         self.num_full_blocks = full_kv_cache[0].shape[0]
@@ -102,16 +119,33 @@ class SparseKVOffloadWorkspace:
         self.gather_op = gather_op or get_gather_selection_kv_cache_op()
         allocator = swapped_allocator or _allocate_swapped_memory
 
-        self.full_nope_mirror = allocator(
-            tuple(full_kv_cache[0].shape),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.full_rope_mirror = allocator(
-            tuple(full_kv_cache[1].shape),
-            dtype=self.dtype,
-            device=self.device,
-        )
+        if mode == "mirror":
+            self.full_nope_source = allocator(
+                tuple(full_kv_cache[0].shape),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.full_rope_source = allocator(
+                tuple(full_kv_cache[1].shape),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.prefill_kv_cache = None
+        else:
+            if prefill_kv_cache is None:
+                raise ValueError(
+                    "sparse_kv_offload host mode requires the shared prefill "
+                    "NPU KV cache allocated by the model runner."
+                )
+            self._validate_prefill_kv_cache(prefill_kv_cache, full_kv_cache)
+            self.full_nope_source = full_kv_cache[0]
+            self.full_rope_source = full_kv_cache[1]
+            self.prefill_kv_cache = prefill_kv_cache
+
+        # Backwards-compatible aliases retained for the mirror-mode unit tests
+        # and for code that inspected the first PoC workspace.
+        self.full_nope_mirror = self.full_nope_source
+        self.full_rope_mirror = self.full_rope_source
 
         selection_num_blocks = (index_topk + block_size - 1) // block_size
         self.selected_nope = torch.empty(
@@ -151,6 +185,34 @@ class SparseKVOffloadWorkspace:
         ).view(1, index_topk)
 
     @staticmethod
+    def _validate_prefill_kv_cache(
+        prefill_kv_cache: tuple[torch.Tensor, torch.Tensor],
+        full_kv_cache: tuple[torch.Tensor, ...],
+    ) -> None:
+        if len(prefill_kv_cache) != 2:
+            raise ValueError("The shared prefill KV cache must contain exactly nope and rope tensors.")
+        for name, prefill_tensor, full_tensor in zip(
+            ("nope", "rope"),
+            prefill_kv_cache,
+            full_kv_cache[:2],
+        ):
+            if prefill_tensor.shape != full_tensor.shape:
+                raise ValueError(
+                    f"Shared prefill {name} shape {tuple(prefill_tensor.shape)} "
+                    f"does not match Full KV shape {tuple(full_tensor.shape)}."
+                )
+            if prefill_tensor.dtype != full_tensor.dtype:
+                raise ValueError(
+                    f"Shared prefill {name} dtype {prefill_tensor.dtype} "
+                    f"does not match Full KV dtype {full_tensor.dtype}."
+                )
+            if prefill_tensor.device != full_tensor.device:
+                raise ValueError(
+                    f"Shared prefill {name} device {prefill_tensor.device} "
+                    f"does not match Full KV device {full_tensor.device}."
+                )
+
+    @staticmethod
     def _validate_full_kv_cache(
         full_kv_cache: tuple[torch.Tensor, ...],
         block_size: int,
@@ -171,23 +233,39 @@ class SparseKVOffloadWorkspace:
         if full_nope.dtype != full_rope.dtype:
             raise ValueError("MLA nope and rope cache dtypes must match.")
         if full_nope.dtype not in SUPPORTED_KV_DTYPES:
-            raise ValueError(f"sparse_kv_offload mirror mode only supports BF16/FP16 KV cache, got {full_nope.dtype}.")
+            raise ValueError(
+                "sparse_kv_offload only supports BF16/FP16 KV cache, got "
+                f"{full_nope.dtype}."
+            )
         if full_nope.device != full_rope.device:
             raise ValueError("MLA nope and rope caches must be on the same device.")
 
     def reset_selection_state(self) -> None:
-        """Disable cross-step reuse for the first single-request PoC."""
+        """Drop selected-KV reuse state at a request/prefill boundary."""
         self.selection_block_table.copy_(self._selection_block_table_template)
         self.selection_block_status.fill_(-1)
 
-    def sync_updated_blocks(
+    def get_forward_kv_cache(
         self,
         full_kv_cache: tuple[torch.Tensor, ...],
+        *,
+        is_decode: bool,
+    ) -> tuple[torch.Tensor, ...]:
+        """Return the cache that MLA Prolog/Prefill Attention should access."""
+        self._validate_full_kv_cache(full_kv_cache, self.block_size)
+        if self.mode == "host" and not is_decode:
+            assert self.prefill_kv_cache is not None
+            return (*self.prefill_kv_cache, *full_kv_cache[2:])
+        return full_kv_cache
+
+    def _copy_updated_blocks(
+        self,
+        source_kv_cache: tuple[torch.Tensor, ...],
+        target_kv_cache: tuple[torch.Tensor, torch.Tensor],
         slot_mapping_cpu: torch.Tensor,
         num_actual_tokens: int,
     ) -> tuple[int, ...]:
-        """Synchronously mirror physical KV blocks touched by this forward."""
-        self._validate_full_kv_cache(full_kv_cache, self.block_size)
+        self._validate_full_kv_cache(source_kv_cache, self.block_size)
         if slot_mapping_cpu is None:
             raise RuntimeError(
                 "sparse_kv_offload requires CPU slot_mapping metadata to avoid "
@@ -224,15 +302,119 @@ class SparseKVOffloadWorkspace:
                     f"slot_mapping references physical block {block_id}, but "
                     f"the KV cache has only {self.num_full_blocks} blocks."
                 )
-            self.full_nope_mirror[block_id].copy_(
-                full_kv_cache[0][block_id],
+            target_kv_cache[0][block_id].copy_(
+                source_kv_cache[0][block_id],
                 non_blocking=False,
             )
-            self.full_rope_mirror[block_id].copy_(
-                full_kv_cache[1][block_id],
+            target_kv_cache[1][block_id].copy_(
+                source_kv_cache[1][block_id],
                 non_blocking=False,
             )
         return tuple(int(block_id) for block_id in physical_block_ids)
+
+    def _copy_updated_slots(
+        self,
+        source_kv_cache: tuple[torch.Tensor, torch.Tensor],
+        target_kv_cache: tuple[torch.Tensor, torch.Tensor],
+        slot_mapping_cpu: torch.Tensor,
+        num_actual_tokens: int,
+    ) -> tuple[int, ...]:
+        """Copy only touched token rows from the shared prefill workspace.
+
+        The prefill workspace is reused by every layer. Copying whole physical
+        blocks would therefore corrupt earlier tokens when chunked prefill
+        revisits a partially filled block after another layer has reused the
+        workspace.
+        """
+        if slot_mapping_cpu is None:
+            raise RuntimeError(
+                "sparse_kv_offload requires CPU slot_mapping metadata to avoid "
+                "an NPU-to-CPU synchronization in the attention hot path."
+            )
+        if slot_mapping_cpu.device.type != "cpu":
+            raise ValueError("slot_mapping_cpu must reside on CPU.")
+        if slot_mapping_cpu.ndim != 1:
+            raise ValueError(
+                "slot_mapping_cpu must be a flat physical-slot tensor, got "
+                f"shape {tuple(slot_mapping_cpu.shape)}."
+            )
+        if num_actual_tokens < 0 or num_actual_tokens > slot_mapping_cpu.numel():
+            raise ValueError(
+                f"Invalid num_actual_tokens={num_actual_tokens} for "
+                f"slot_mapping_cpu with {slot_mapping_cpu.numel()} entries."
+            )
+
+        valid_slots = slot_mapping_cpu[:num_actual_tokens]
+        valid_slots = torch.unique(valid_slots[valid_slots >= 0])
+        if valid_slots.numel() == 0:
+            return ()
+
+        total_slots = self.num_full_blocks * self.block_size
+        max_slot = int(valid_slots.max())
+        if max_slot >= total_slots:
+            raise ValueError(
+                f"slot_mapping references physical slot {max_slot}, but the "
+                f"KV cache has only {total_slots} slots."
+            )
+
+        device_slots = valid_slots.to(
+            device=self.device,
+            dtype=torch.int64,
+            non_blocking=True,
+        )
+        for source, target in zip(source_kv_cache, target_kv_cache):
+            source_rows = source.view(total_slots, source.shape[-1])
+            target_rows = target.view(total_slots, target.shape[-1])
+            target_rows.index_copy_(
+                0,
+                device_slots,
+                source_rows.index_select(0, device_slots),
+            )
+
+        physical_block_ids = torch.unique(
+            torch.div(
+                valid_slots,
+                self.block_size,
+                rounding_mode="floor",
+            )
+        )
+        return tuple(int(block_id) for block_id in physical_block_ids.tolist())
+
+    def sync_updated_blocks(
+        self,
+        full_kv_cache: tuple[torch.Tensor, ...],
+        slot_mapping_cpu: torch.Tensor,
+        num_actual_tokens: int,
+    ) -> tuple[int, ...]:
+        """Synchronously update the swapped mirror in mirror mode."""
+        if self.mode != "mirror":
+            raise RuntimeError("sync_updated_blocks is only valid in sparse KV offload mirror mode.")
+        return self._copy_updated_blocks(
+            full_kv_cache,
+            (self.full_nope_source, self.full_rope_source),
+            slot_mapping_cpu,
+            num_actual_tokens,
+        )
+
+    def persist_prefill_blocks(
+        self,
+        full_kv_cache: tuple[torch.Tensor, ...],
+        slot_mapping_cpu: torch.Tensor,
+        num_actual_tokens: int,
+    ) -> tuple[int, ...]:
+        """Copy the current layer's shared NPU prefill cache into Full Host KV."""
+        if self.mode != "host":
+            raise RuntimeError(
+                "persist_prefill_blocks is only valid in sparse KV offload "
+                "host mode."
+            )
+        assert self.prefill_kv_cache is not None
+        return self._copy_updated_slots(
+            self.prefill_kv_cache,
+            (full_kv_cache[0], full_kv_cache[1]),
+            slot_mapping_cpu,
+            num_actual_tokens,
+        )
 
     def gather(
         self,
@@ -246,24 +428,24 @@ class SparseKVOffloadWorkspace:
             topk_indices = topk_indices.unsqueeze(1)
         if topk_indices.shape != (1, 1, self.index_topk):
             raise ValueError(
-                "sparse_kv_offload mirror mode expects Top-K shape "
+                f"sparse_kv_offload {self.mode} mode expects Top-K shape "
                 f"[1, 1, {self.index_topk}], got {tuple(topk_indices.shape)}."
             )
         if full_block_table.shape[0] != 1:
             raise ValueError(
-                "sparse_kv_offload mirror mode currently supports one request, "
+                f"sparse_kv_offload {self.mode} mode currently supports one "
+                "request, "
                 f"got block table shape {tuple(full_block_table.shape)}."
             )
 
-        self.reset_selection_state()
         selected_actual_seq_lengths = self.gather_op(
             selection_k_rope=self.selected_rope,
             selection_kv_cache=self.selected_nope,
             selection_kv_block_table=self.selection_block_table,
             selection_kv_block_status=self.selection_block_status,
             selection_topk_indices=topk_indices.to(torch.int32).contiguous(),
-            full_k_rope=self.full_rope_mirror.squeeze(2),
-            full_kv_cache=self.full_nope_mirror.squeeze(2),
+            full_k_rope=self.full_rope_source.squeeze(2),
+            full_kv_cache=self.full_nope_source.squeeze(2),
             full_kv_block_table=full_block_table.to(torch.int32).contiguous(),
             full_kv_actual_seq=full_actual_seq_lengths.to(torch.int32).contiguous(),
             full_q_actual_seq=full_query_actual_seq_lengths.to(torch.int32).contiguous(),

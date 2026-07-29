@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+import torch_npu
 
 from vllm_ascend.attention.sfa_v1 import AscendSFAImpl
 from vllm_ascend.attention.sparse_kv_offload import SparseKVOffloadWorkspace
@@ -107,6 +108,107 @@ def test_gather_reads_full_kv_from_swapped_memory(dtype):
     )
     torch.testing.assert_close(
         torch.sort(selected_rope.float()).values.cpu(),
+        torch.arange(256, dtype=torch.float32) + 4096,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_host_mode_persists_prefill_rows_and_gathers_from_framework_swapped_kv(
+    dtype,
+):
+    device = torch.device("npu")
+    full_nope = torch_npu.empty_with_swapped_memory(
+        (4, BLOCK_SIZE, 1, 2),
+        dtype=dtype,
+        device=device,
+    )
+    full_rope = torch_npu.empty_with_swapped_memory(
+        (4, BLOCK_SIZE, 1, 1),
+        dtype=dtype,
+        device=device,
+    )
+    full_nope.fill_(-1)
+    full_rope.fill_(-1)
+    prefill_nope = torch.zeros_like(full_nope)
+    prefill_rope = torch.zeros_like(full_rope)
+    logical_tokens = torch.arange(256, dtype=torch.float32, device=device).to(
+        dtype
+    )
+
+    prefill_nope[2, :, 0, 0] = logical_tokens[:BLOCK_SIZE]
+    prefill_nope[2, :, 0, 1] = logical_tokens[:BLOCK_SIZE] + 1
+    prefill_rope[2, :, 0, 0] = logical_tokens[:BLOCK_SIZE] + 4096
+    prefill_nope[1, :, 0, 0] = logical_tokens[BLOCK_SIZE:]
+    prefill_nope[1, :, 0, 1] = logical_tokens[BLOCK_SIZE:] + 1
+    prefill_rope[1, :, 0, 0] = logical_tokens[BLOCK_SIZE:] + 4096
+
+    workspace = SparseKVOffloadWorkspace(
+        (full_nope, full_rope),
+        index_topk=INDEX_TOPK,
+        block_size=BLOCK_SIZE,
+        mode="host",
+        prefill_kv_cache=(prefill_nope, prefill_rope),
+    )
+    physical_slots = torch.cat(
+        (
+            torch.arange(
+                2 * BLOCK_SIZE,
+                3 * BLOCK_SIZE,
+                dtype=torch.int64,
+            ),
+            torch.arange(
+                BLOCK_SIZE,
+                2 * BLOCK_SIZE,
+                dtype=torch.int64,
+            ),
+        )
+    )
+    updated_blocks = workspace.persist_prefill_blocks(
+        (full_nope, full_rope),
+        physical_slots,
+        num_actual_tokens=physical_slots.numel(),
+    )
+    assert updated_blocks == (1, 2)
+
+    topk_indices = torch.full(
+        (1, 1, INDEX_TOPK),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    topk_indices[0, 0, :256] = torch.arange(
+        256,
+        dtype=torch.int32,
+        device=device,
+    )
+    selection = workspace.gather(
+        topk_indices=topk_indices,
+        full_block_table=torch.tensor(
+            [[2, 1]],
+            dtype=torch.int32,
+            device=device,
+        ),
+        full_actual_seq_lengths=torch.tensor(
+            [256],
+            dtype=torch.int32,
+            device=device,
+        ),
+        full_query_actual_seq_lengths=torch.tensor(
+            [1],
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
+    torch.npu.synchronize()
+
+    selected_nope = selection.kv_cache[0].view(-1, 2)[:256, 0]
+    selected_rope = selection.kv_cache[1].view(-1, 1)[:256, 0]
+    torch.testing.assert_close(
+        selected_nope.float().cpu(),
+        torch.arange(256, dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        selected_rope.float().cpu(),
         torch.arange(256, dtype=torch.float32) + 4096,
     )
 

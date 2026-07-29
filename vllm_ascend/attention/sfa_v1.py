@@ -534,10 +534,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         self.sparse_kv_offload_workspace: SparseKVOffloadWorkspace | None = None
         self.sparse_kv_offload_gather_op: GatherSelectionOp | None = None
+        self.sparse_kv_offload_prefill_cache: tuple[torch.Tensor, torch.Tensor] | None = None
         if self.sparse_kv_offload_config.enabled:
             if get_ascend_device_type() != AscendDeviceType.A3:
                 raise RuntimeError(
-                    "sparse_kv_offload mirror mode currently requires an "
+                    f"sparse_kv_offload {self.sparse_kv_offload_config.mode} "
+                    "mode currently requires an "
                     f"Ascend A3 device, got {get_ascend_device_type().name}."
                 )
             self.sparse_kv_offload_gather_op = get_gather_selection_kv_cache_op()
@@ -731,6 +733,18 @@ class AscendSFAImpl(MLAAttentionImpl):
             if hasattr(self, "mlapo_is_quantized") and not self.mlapo_is_quantized:
                 self.c8_k_cache_dtype = act_dtype
                 self.c8_k_scale_cache_dtype = act_dtype
+
+        if (
+            self.sparse_kv_offload_config.enabled
+            and self.sparse_kv_offload_config.mode == "host"
+            and not self.enable_mlapo
+        ):
+            raise RuntimeError(
+                "sparse_kv_offload host mode requires the A3 "
+                "npu_mla_prolog_v3 path so decode can write new KV directly "
+                "to swapped Full KV. Enable MLAPO and use its supported W8A8 "
+                "DeepSeek-V3.2 checkpoint."
+            )
 
         if not self.enable_mlapo:
             # if mlapo, W_UK_T can't trans nz
@@ -1318,14 +1332,52 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_cache,
                 index_topk=hf_text_config.index_topk,
                 block_size=self.vllm_config.cache_config.block_size,
+                mode=self.sparse_kv_offload_config.mode,
+                prefill_kv_cache=self.sparse_kv_offload_prefill_cache,
                 gather_op=self.sparse_kv_offload_gather_op,
             )
             self.sparse_kv_offload_workspace = workspace
         return workspace
 
+    def set_sparse_kv_offload_prefill_cache(
+        self,
+        prefill_kv_cache: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        """Bind the model-runner-owned cross-layer prefill NPU workspace."""
+        if not self.sparse_kv_offload_config.enabled:
+            raise RuntimeError(
+                "Cannot bind a sparse KV offload prefill cache when the feature is disabled."
+            )
+        if self.sparse_kv_offload_config.mode != "host":
+            raise RuntimeError(
+                "The shared prefill cache is only used by sparse KV offload host mode."
+            )
+        self.sparse_kv_offload_prefill_cache = prefill_kv_cache
+
+    def initialize_sparse_kv_offload_workspace(
+        self,
+        full_kv_cache: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Allocate selected-KV state during KV-cache initialization."""
+        self._get_sparse_kv_offload_workspace(full_kv_cache)
+
+    def _get_sparse_kv_offload_forward_cache(
+        self,
+        full_kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: M,
+    ) -> tuple[torch.Tensor, ...]:
+        if not self.sparse_kv_offload_config.enabled:
+            return full_kv_cache
+        workspace = self._get_sparse_kv_offload_workspace(full_kv_cache)
+        return workspace.get_forward_kv_cache(
+            full_kv_cache,
+            is_decode=attn_metadata.attn_state == AscendAttentionState.DecodeOnly,
+        )
+
     def _prepare_sparse_kv_offload_attention(
         self,
-        kv_cache: tuple[torch.Tensor, ...],
+        full_kv_cache: tuple[torch.Tensor, ...],
+        forward_kv_cache: tuple[torch.Tensor, ...],
         topk_indices: torch.Tensor,
         attn_metadata: M,
         actual_seq_lengths_query: torch.Tensor,
@@ -1339,22 +1391,30 @@ class AscendSFAImpl(MLAAttentionImpl):
     ]:
         if not self.sparse_kv_offload_config.enabled:
             return (
-                kv_cache,
+                forward_kv_cache,
                 topk_indices,
                 attn_metadata,
                 actual_seq_lengths_query,
                 actual_seq_lengths_key,
             )
 
-        workspace = self._get_sparse_kv_offload_workspace(kv_cache)
-        workspace.sync_updated_blocks(
-            kv_cache,
-            attn_metadata.slot_mapping_cpu,
-            attn_metadata.num_actual_tokens,
-        )
+        workspace = self._get_sparse_kv_offload_workspace(full_kv_cache)
+        if self.sparse_kv_offload_config.mode == "mirror":
+            workspace.sync_updated_blocks(
+                full_kv_cache,
+                attn_metadata.slot_mapping_cpu,
+                attn_metadata.num_actual_tokens,
+            )
+        elif attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+            workspace.persist_prefill_blocks(
+                full_kv_cache,
+                attn_metadata.slot_mapping_cpu,
+                attn_metadata.num_actual_tokens,
+            )
         if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+            workspace.reset_selection_state()
             return (
-                kv_cache,
+                forward_kv_cache,
                 topk_indices,
                 attn_metadata,
                 actual_seq_lengths_query,
@@ -1427,6 +1487,26 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens
         output_padded = output
+        full_kv_cache = kv_cache
+        kv_cache = self._get_sparse_kv_offload_forward_cache(
+            full_kv_cache,
+            attn_metadata,
+        )
+        wait_for_layer_load_done = False
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if (
+            self.sparse_kv_offload_config.enabled
+            and self.sparse_kv_offload_config.mode == "host"
+            and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+            and kv_transfer_config is not None
+            and kv_transfer_config.is_kv_consumer
+        ):
+            # A layerwise connector may copy a whole partial prompt block.
+            # Complete that load before MLAPO writes the first decode token
+            # into the same Host-backed block, otherwise the late load could
+            # overwrite the newly generated row.
+            wait_for_kv_layer_from_connector(layer_name)
+            wait_for_layer_load_done = True
 
         # all-gather o_proj weight for prefill stage of PD mix node
         o_proj_full_handle = None
@@ -1461,7 +1541,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             else:
                 k_li, k_li_scale = None, None
-            wait_for_kv_layer_from_connector(layer_name)
+            if not wait_for_layer_load_done:
+                wait_for_kv_layer_from_connector(layer_name)
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
@@ -1490,7 +1571,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 k_li, k_li_scale = None, None
 
-            wait_for_kv_layer_from_connector(layer_name)
+            if not wait_for_layer_load_done:
+                wait_for_kv_layer_from_connector(layer_name)
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None
@@ -1731,6 +1813,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query,
             actual_seq_lengths_key,
         ) = self._prepare_sparse_kv_offload_attention(
+            full_kv_cache,
             kv_cache,
             topk_indices,
             attn_metadata,
@@ -1774,7 +1857,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         output[...] = self.o_proj(attn_output)[0]
 
-        maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+        maybe_save_kv_layer_to_connector(layer_name, list(full_kv_cache))
 
         return output_padded
 

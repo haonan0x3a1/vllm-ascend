@@ -438,11 +438,13 @@ class TestSparseKVOffloadConfig(TestBase):
                     model_type="deepseek_v32",
                 ),
                 enforce_eager=True,
+                max_model_len=4096,
             ),
             scheduler_config=SimpleNamespace(max_num_seqs=1),
             cache_config=SimpleNamespace(
                 block_size=128,
                 enable_prefix_caching=False,
+                num_gpu_blocks_override=None,
             ),
             speculative_config=None,
             kv_transfer_config=None,
@@ -464,13 +466,22 @@ class TestSparseKVOffloadConfig(TestBase):
             ),
             SparseKVOffloadConfig(enabled=True, mode="mirror"),
         )
+        self.assertEqual(
+            SparseKVOffloadConfig.from_dict(
+                {
+                    "enabled": True,
+                    "mode": "host",
+                }
+            ),
+            SparseKVOffloadConfig(enabled=True, mode="host"),
+        )
 
     def test_parse_rejects_invalid_values(self):
         invalid_configs = [
             (True, "must be a dict"),
             ({"enabled": 1}, "enabled must be a bool"),
             ({"mode": 1}, "mode must be a string"),
-            ({"mode": "host"}, "only supports 'mirror'"),
+            ({"mode": "unsupported"}, "must be one of"),
             ({"unknown": True}, "unsupported keys"),
         ]
         for raw_config, expected_error in invalid_configs:
@@ -480,6 +491,89 @@ class TestSparseKVOffloadConfig(TestBase):
     def test_validate_accepts_single_request_eager_mirror(self):
         config = SparseKVOffloadConfig(enabled=True)
         config.validate(self._make_vllm_config(), enable_sparse_c8=False)
+
+    def test_validate_host_sets_capacity_override(self):
+        vllm_config = self._make_vllm_config()
+        config = SparseKVOffloadConfig(enabled=True, mode="host")
+
+        config.validate(vllm_config, enable_sparse_c8=False)
+
+        self.assertEqual(vllm_config.cache_config.num_gpu_blocks_override, 33)
+
+    def test_validate_host_accepts_layerwise_memcache_pd(self):
+        vllm_config = self._make_vllm_config()
+        vllm_config.kv_transfer_config = SimpleNamespace(
+            kv_connector="AscendStoreConnector",
+            kv_connector_extra_config={
+                "backend": "memcache",
+                "use_layerwise": True,
+            },
+            kv_role="kv_producer",
+        )
+
+        SparseKVOffloadConfig(enabled=True, mode="host").validate(
+            vllm_config,
+            enable_sparse_c8=False,
+        )
+
+    def test_validate_host_rejects_unsupported_pd_and_capacity(self):
+        cases = [
+            (
+                SimpleNamespace(
+                    kv_connector="MooncakeLayerwiseConnector",
+                    kv_connector_extra_config={},
+                    kv_role="kv_producer",
+                ),
+                "requires AscendStoreConnector",
+            ),
+            (
+                SimpleNamespace(
+                    kv_connector="AscendStoreConnector",
+                    kv_connector_extra_config={
+                        "backend": "memcache",
+                        "use_layerwise": False,
+                    },
+                    kv_role="kv_producer",
+                ),
+                "use_layerwise=true",
+            ),
+            (
+                SimpleNamespace(
+                    kv_connector="AscendStoreConnector",
+                    kv_connector_extra_config={
+                        "backend": "mooncake",
+                        "use_layerwise": True,
+                    },
+                    kv_role="kv_producer",
+                ),
+                "backend='memcache'",
+            ),
+            (
+                SimpleNamespace(
+                    kv_connector="AscendStoreConnector",
+                    kv_connector_extra_config={
+                        "backend": "memcache",
+                        "use_layerwise": True,
+                    },
+                    kv_role="kv_both",
+                ),
+                "kv_producer/kv_consumer",
+            ),
+        ]
+        config = SparseKVOffloadConfig(enabled=True, mode="host")
+        for kv_transfer_config, expected_error in cases:
+            vllm_config = self._make_vllm_config()
+            vllm_config.kv_transfer_config = kv_transfer_config
+            with (
+                self.subTest(expected_error=expected_error),
+                self.assertRaisesRegex(ValueError, expected_error),
+            ):
+                config.validate(vllm_config, enable_sparse_c8=False)
+
+        vllm_config = self._make_vllm_config()
+        vllm_config.cache_config.num_gpu_blocks_override = 32
+        with self.assertRaisesRegex(ValueError, "required=33"):
+            config.validate(vllm_config, enable_sparse_c8=False)
 
     def test_validate_rejects_unsupported_runtime_combinations(self):
         cases = [

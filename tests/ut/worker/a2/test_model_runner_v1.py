@@ -86,6 +86,88 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
 
+    @patch(
+        "vllm_ascend.worker.model_runner_v1.torch_npu.empty_with_swapped_memory"
+    )
+    def test_allocate_swapped_cache_uses_torch_npu_allocator(
+        self,
+        mock_empty_with_swapped_memory,
+    ):
+        runner = self._build_runner()
+        mock_empty_with_swapped_memory.return_value = torch.empty(
+            1024,
+            dtype=torch.int8,
+        )
+
+        result = runner._allocate_swapped_int8_cache_tensor(1024)
+
+        self.assertEqual(result.numel(), 1024)
+        mock_empty_with_swapped_memory.assert_called_once_with(
+            (1024,),
+            dtype=torch.int8,
+            device=runner.device,
+        )
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_bind_host_mode_shares_one_prefill_cache_across_sparse_layers(
+        self,
+        mock_get_layers,
+    ):
+        runner = self._build_runner()
+        runner.ascend_config = SimpleNamespace(
+            sparse_kv_offload=SimpleNamespace(
+                enabled=True,
+                mode="host",
+            )
+        )
+
+        first_layer = MLAAttention.__new__(MLAAttention)
+        torch.nn.Module.__init__(first_layer)
+        first_layer.impl = MagicMock()
+        second_layer = MLAAttention.__new__(MLAAttention)
+        torch.nn.Module.__init__(second_layer)
+        second_layer.impl = MagicMock()
+        first_name = "model.layers.0.self_attn.attn"
+        second_name = "model.layers.1.self_attn.attn"
+        mock_get_layers.return_value = {
+            first_name: first_layer,
+            second_name: second_layer,
+        }
+        kv_caches = {
+            first_name: (
+                torch.empty(4, 128, 1, 2),
+                torch.empty(4, 128, 1, 1),
+                torch.empty(4, 128, 1, 4),
+            ),
+            second_name: (
+                torch.empty(4, 128, 1, 2),
+                torch.empty(4, 128, 1, 1),
+                torch.empty(4, 128, 1, 4),
+            ),
+        }
+
+        runner._bind_sparse_kv_offload_prefill_cache(kv_caches)
+
+        first_prefill = (
+            first_layer.impl.set_sparse_kv_offload_prefill_cache.call_args.args[
+                0
+            ]
+        )
+        second_prefill = (
+            second_layer.impl.set_sparse_kv_offload_prefill_cache.call_args.args[
+                0
+            ]
+        )
+        self.assertIs(first_prefill, second_prefill)
+        self.assertEqual(first_prefill[0].shape, kv_caches[first_name][0].shape)
+        self.assertEqual(first_prefill[1].shape, kv_caches[first_name][1].shape)
+        first_layer.impl.initialize_sparse_kv_offload_workspace.assert_called_once_with(
+            kv_caches[first_name]
+        )
+        second_layer.impl.initialize_sparse_kv_offload_workspace.assert_called_once_with(
+            kv_caches[second_name]
+        )
+
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
     def test_sparse_layer_without_indexer_allocates_only_mla_kv_cache(
