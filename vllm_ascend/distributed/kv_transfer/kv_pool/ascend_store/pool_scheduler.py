@@ -922,9 +922,9 @@ class KVPoolScheduler:
         if not force_skip_save:
             for i, req_id in enumerate(cached_reqs.req_ids):
                 new_block_ids = cached_reqs.new_block_ids[i]
-                if not new_block_ids:
-                    continue
                 if req_id in self._preempted_req_ids:
+                    if not new_block_ids:
+                        continue
                     req_meta = self._process_preempted_cached_request(
                         new_block_ids,
                         req_id,
@@ -934,6 +934,15 @@ class KVPoolScheduler:
                         force_skip_save,
                     )
                 else:
+                    # A later chunked-prefill step may continue writing rows
+                    # into an already allocated physical block, so vLLM does
+                    # not report any new block IDs. Layerwise saving still
+                    # needs metadata for that forward: it advances token_len
+                    # and republishes the request-scoped tail after every
+                    # layer. Non-layerwise mode retains the original
+                    # new-block-only behavior.
+                    if not new_block_ids and not self.use_layerwise:
+                        continue
                     req_meta = self._process_running_cached_request(
                         new_block_ids,
                         req_id,
