@@ -72,10 +72,13 @@ class TestGetZmqRpcPathLookup(unittest.TestCase):
 
 class TestKVPoolScheduler(unittest.TestCase):
     def _make_config(self, kv_role="kv_producer", extra_config=None, block_size=16):
+        extra_config = {} if extra_config is None else extra_config
         config = MagicMock()
         config.kv_transfer_config.kv_role = kv_role
-        config.kv_transfer_config.kv_connector_extra_config = extra_config or {}
-        config.kv_transfer_config.get_from_extra_config.return_value = True
+        config.kv_transfer_config.kv_connector_extra_config = extra_config
+        config.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: extra_config.get(
+            key, default
+        )
         config.parallel_config.data_parallel_rank = 0
         config.parallel_config.prefill_context_parallel_size = 1
         config.parallel_config.decode_context_parallel_size = 1
@@ -305,7 +308,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
         config = MagicMock()
         config.kv_transfer_config.kv_role = kv_role
         config.kv_transfer_config.kv_connector_extra_config = {}
-        config.kv_transfer_config.get_from_extra_config.return_value = True
+        config.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: default
         config.parallel_config.data_parallel_rank = 0
         config.parallel_config.prefill_context_parallel_size = 1
         config.parallel_config.decode_context_parallel_size = 1
@@ -335,6 +338,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
         request.prompt_token_ids = list(range(32))
         request.num_tokens = 32
         request.num_computed_tokens = 0
+        request.num_prompt_tokens = 32
         request.block_hashes = [b"h0", b"h1"]
         request.all_token_ids = list(range(32))
         blocks = MagicMock()
@@ -452,6 +456,7 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
         request.all_token_ids = list(range(32))
         request.num_tokens = 32
         request.num_computed_tokens = 0
+        request.num_prompt_tokens = 32
         request.block_hashes = [b"h0", b"h1"]
         blocks = MagicMock()
         blocks.get_block_ids.return_value = [[1]]

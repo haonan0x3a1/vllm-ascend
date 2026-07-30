@@ -1299,6 +1299,9 @@ class TestKVPoolWorkerStartLoadKVAsync(unittest.TestCase):
 class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
     """Test process_layer_data and related layerwise methods."""
 
+    def setUp(self):
+        self._patches = {}
+
     def _make_worker(self):
         patches = {
             "tp_rank": patch(

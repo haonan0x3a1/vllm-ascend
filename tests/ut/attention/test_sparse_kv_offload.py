@@ -242,9 +242,9 @@ def test_host_workspace_uses_shared_prefill_cache_and_persists_only_touched_slot
 
 def test_host_workspace_requires_matching_shared_prefill_cache():
     full_kv_cache = (
-        torch.empty(2, BLOCK_SIZE, 1, 2),
-        torch.empty(2, BLOCK_SIZE, 1, 1),
-        torch.empty(2, BLOCK_SIZE, 1, 4),
+        torch.empty(2, BLOCK_SIZE, 1, 2, dtype=torch.bfloat16),
+        torch.empty(2, BLOCK_SIZE, 1, 1, dtype=torch.bfloat16),
+        torch.empty(2, BLOCK_SIZE, 1, 4, dtype=torch.bfloat16),
     )
     with pytest.raises(ValueError, match="requires the shared prefill"):
         SparseKVOffloadWorkspace(
@@ -263,8 +263,8 @@ def test_host_workspace_requires_matching_shared_prefill_cache():
             block_size=BLOCK_SIZE,
             mode="host",
             prefill_kv_cache=(
-                torch.empty(1, BLOCK_SIZE, 1, 2),
-                torch.empty(2, BLOCK_SIZE, 1, 1),
+                torch.empty(1, BLOCK_SIZE, 1, 2, dtype=torch.bfloat16),
+                torch.empty(2, BLOCK_SIZE, 1, 1, dtype=torch.bfloat16),
             ),
             gather_op=_fake_gather_selection_kv_cache,
             validate_device=False,
