@@ -36,6 +36,9 @@ HBM budget.
 - A CANN and torch-npu version compatible with the vLLM Ascend environment.
 - The `custom_ops` wheel built from `cann-recipes-infer`, including
   `torch_npu.npu_gather_selection_kv_cache`.
+- Online P/D mode requires a matching `memcache_hybrid>=1.2.0` and
+  `memfabric_hybrid>=1.2.0` release pair. The layerwise GVA path requires
+  `batch_alloc`, `batch_copy`, and lease APIs that are absent from 1.1.x.
 - A DeepSeek-V3.2 DSA model with `index_topk=2048`.
 - Host mode requires the fused A3 MLAPO decode path and a supported W8A8
   checkpoint.
@@ -126,13 +129,16 @@ without model weights. Start the MemCache MetaService, export
 ```bash
 VLLM_ASCEND_RUN_MEMCACHE_INTEGRATION_TEST=1 \
 python -m pytest -sv \
+  --confcutdir=tests/e2e/nightly/single_node/ops/singlecard_ops \
   tests/e2e/nightly/single_node/ops/singlecard_ops/test_sparse_kv_offload_memcache.py
 ```
 
 The opt-in test saves and reloads one mixed cache tuple containing Host-backed
 MLA Full KV tensors from `empty_with_swapped_memory` and an NPU-resident
 Lightning Indexer tensor. It is skipped by default because a live MemCache
-deployment is an external prerequisite.
+deployment is an external prerequisite. The scoped `confcutdir` keeps this
+operator-only test independent from unrelated model-download dependencies in
+the broader E2E test configuration.
 
 The feature is disabled by default. When disabled, allocation and SFA execution
 remain unchanged.

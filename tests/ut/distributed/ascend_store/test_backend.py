@@ -561,6 +561,40 @@ class TestYuanrongBackendMethods(unittest.TestCase):
 # MemcacheBackend (mocked store)
 # =========================================================================
 class TestMemcacheBackendMethods(unittest.TestCase):
+    def test_gva_layerwise_api_validation_accepts_complete_store(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import (
+            GVA_LAYERWISE_REQUIRED_STORE_APIS,
+            _validate_gva_layerwise_store_api,
+        )
+
+        complete_store = type(
+            "CompleteStore",
+            (),
+            {name: lambda self: None for name in GVA_LAYERWISE_REQUIRED_STORE_APIS},
+        )
+
+        _validate_gva_layerwise_store_api(complete_store, "1.2.0", "1.2.0")
+
+    def test_gva_layerwise_api_validation_reports_old_store(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import (
+            _validate_gva_layerwise_store_api,
+        )
+
+        class OldStore:
+            def batch_get_key_info(self):
+                return None
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            (
+                r"memcache_hybrid>=1\.2\.0.*"
+                r"memfabric_hybrid>=1\.2\.0.*"
+                r"memcache_hybrid=1\.1\.2.*"
+                r"batch_alloc.*batch_copy.*batch_add_lease.*batch_remove_lease"
+            ),
+        ):
+            _validate_gva_layerwise_store_api(OldStore, "1.1.2", "1.1.2")
+
     def _make_backend(self):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import MemcacheBackend
 

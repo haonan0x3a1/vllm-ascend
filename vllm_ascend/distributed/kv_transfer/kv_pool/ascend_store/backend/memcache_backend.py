@@ -2,6 +2,7 @@
 import threading
 import time
 from enum import Enum
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
 import torch
@@ -13,6 +14,42 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend im
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 MEMCACHE_THREAD_START_WAIT_S = 0.1
+GVA_LAYERWISE_MIN_VERSION = "1.2.0"
+GVA_LAYERWISE_REQUIRED_STORE_APIS = (
+    "batch_alloc",
+    "batch_copy",
+    "batch_get_key_info",
+    "batch_add_lease",
+    "batch_remove_lease",
+)
+
+
+def _validate_gva_layerwise_store_api(
+    store_cls: type[Any],
+    memcache_version: str,
+    memfabric_version: str,
+) -> None:
+    missing_apis = [name for name in GVA_LAYERWISE_REQUIRED_STORE_APIS if not hasattr(store_cls, name)]
+    if not missing_apis:
+        return
+
+    raise RuntimeError(
+        "MemCache GVA layerwise transfer requires "
+        f"memcache_hybrid>={GVA_LAYERWISE_MIN_VERSION} and "
+        f"memfabric_hybrid>={GVA_LAYERWISE_MIN_VERSION}. "
+        f"Installed versions: memcache_hybrid={memcache_version}, "
+        f"memfabric_hybrid={memfabric_version}. "
+        f"DistributedObjectStore is missing required APIs: {', '.join(missing_apis)}. "
+        "Install a matching MemCache/MemFabric release pair before enabling "
+        'backend="memcache" with use_layerwise=true.'
+    )
+
+
+def _installed_package_version(distribution_name: str) -> str:
+    try:
+        return version(distribution_name)
+    except PackageNotFoundError:
+        return "unknown"
 
 
 class MmcDirect(Enum):
@@ -23,6 +60,23 @@ class MmcDirect(Enum):
 
 
 class MemcacheBackend(Backend):
+    @staticmethod
+    def validate_gva_layerwise_api() -> None:
+        try:
+            from memcache_hybrid import DistributedObjectStore  # type: ignore
+        except ImportError as e:
+            raise ImportError(
+                "Please install memcache by following the instructions at "
+                "https://gitee.com/ascend/memfabric_hybrid "
+                "to run vLLM with MemcacheConnector."
+            ) from e
+
+        _validate_gva_layerwise_store_api(
+            DistributedObjectStore,
+            _installed_package_version("memcache_hybrid"),
+            _installed_package_version("memfabric_hybrid"),
+        )
+
     def __init__(
         self,
         parallel_config: ParallelConfig,

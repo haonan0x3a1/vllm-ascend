@@ -246,6 +246,8 @@ class KVPoolWorker:
         real_backend = getattr(backend_module, backend_name)
 
         if self.backend.lower() == "memcache":
+            if self.use_gva_layerwise:
+                real_backend.validate_gva_layerwise_api()
             self.m_store = real_backend(  # type: ignore[misc]
                 parallel_config,
                 lazy_init=True,

@@ -34,9 +34,12 @@ than concentrated as a single blocking step.
 ## Prerequisites
 
 Layerwise mode currently requires the **memcache** backend
-(`backend: "memcache"`). Install and configure memcache_hybrid before
-proceeding — see the [KV Pool guide](kv_pool.md) for memcache installation,
-config files (`mmc-meta.conf` / `mmc-local.conf`), and MetaService startup.
+(`backend: "memcache"`), with `memcache_hybrid>=1.2.0` and
+`memfabric_hybrid>=1.2.0` installed as a matching release pair. Earlier
+releases do not expose the GVA allocation, copy, and lease APIs required by
+layerwise transfer. See the [KV Pool guide](kv_pool.md) for memcache
+installation, config files (`mmc-meta.conf` / `mmc-local.conf`), and
+MetaService startup.
 
 Additional setup:
 

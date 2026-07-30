@@ -100,6 +100,7 @@ def _make_transfer_arrays(
 
 def test_memcache_round_trip_mixed_swapped_and_npu_kv_cache():
     """Verify the exact mixed-memory tuple used by host sparse KV offload."""
+    MemcacheBackend.validate_gva_layerwise_api()
     torch.npu.set_device(0)
     source = _make_mixed_kv_cache()
     destination = _make_mixed_kv_cache()
