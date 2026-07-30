@@ -53,12 +53,13 @@ def _installed_package_version(distribution_name: str) -> str:
 
 
 class MmcDirect(Enum):
+    # Keep this list aligned with the copy directions accepted by the public
+    # DistributedObjectStore.batch_copy implementation. The lower MemFabric
+    # enum contains additional directions that MemCache does not dispatch.
     COPY_L2G = 0
     COPY_G2L = 1
     COPY_G2H = 2
     COPY_H2G = 3
-    COPY_L2GH = 4
-    COPY_GH2L = 5
 
 
 class MemcacheBackend(Backend):

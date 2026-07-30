@@ -86,6 +86,24 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
 
         self.assertEqual(cls._infer_num_host_caches_per_layer(config), 0)
 
+    def test_validate_sparse_host_layerwise_transport_fails_fast(self):
+        cls = self._make_worker_class()
+
+        with self.assertRaisesRegex(NotImplementedError, "does not have a verified public copy contract"):
+            cls._validate_sparse_host_layerwise_transport(
+                use_gva_layerwise=True,
+                num_host_caches_per_layer=2,
+            )
+
+        cls._validate_sparse_host_layerwise_transport(
+            use_gva_layerwise=True,
+            num_host_caches_per_layer=0,
+        )
+        cls._validate_sparse_host_layerwise_transport(
+            use_gva_layerwise=False,
+            num_host_caches_per_layer=2,
+        )
+
     def test_find_all_continuous_hit_positions_found(self):
         cls = self._make_worker_class()
         arr = [[1, 1, 0], [1, 0, 1]]

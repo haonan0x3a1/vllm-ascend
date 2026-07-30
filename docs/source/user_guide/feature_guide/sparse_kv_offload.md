@@ -36,9 +36,6 @@ HBM budget.
 - A CANN and torch-npu version compatible with the vLLM Ascend environment.
 - The `custom_ops` wheel built from `cann-recipes-infer`, including
   `torch_npu.npu_gather_selection_kv_cache`.
-- Online P/D mode requires a matching `memcache_hybrid>=1.2.0` and
-  `memfabric_hybrid>=1.2.0` release pair. The layerwise GVA path requires
-  `batch_alloc`, `batch_copy`, and lease APIs that are absent from 1.1.x.
 - A DeepSeek-V3.2 DSA model with `index_topk=2048`.
 - Host mode requires the fused A3 MLAPO decode path and a supported W8A8
   checkpoint.
@@ -90,57 +87,19 @@ with a KV Connector.
 
 ### Online P/D disaggregation
 
-Host mode supports the existing layerwise `AscendStoreConnector` with the
-memcache backend. Add the following connector configuration to both commands,
-using `kv_producer` for Prefill and `kv_consumer` for Decode:
+Online P/D is not yet supported for Host Full-KV mode. The public MemCache
+`DistributedObjectStore.batch_copy` implementation accepts `L2G`, `G2L`,
+`G2H`, and `H2G`. Host-backed tensors returned by
+`torch_npu.empty_with_swapped_memory` expose NPU/SVM `data_ptr` values, and
+there is no verified MemCache copy contract for moving those addresses to and
+from a DRAM GVA. The vLLM Ascend integration therefore fails before transfer
+instead of treating the swapped address as an ordinary Host pointer or relying
+on lower-layer MemFabric enum values that MemCache does not dispatch.
 
-```bash
---kv-transfer-config '{
-  "kv_connector": "AscendStoreConnector",
-  "kv_role": "kv_producer",
-  "kv_connector_extra_config": {
-    "backend": "memcache",
-    "mooncake_rpc_port": "0",
-    "use_layerwise": true,
-    "consumer_is_to_load": true
-  }
-}'
-```
-
-`consumer_is_to_load=true` is mandatory on the Decode consumer; without it,
-the Decode scheduler reports no external KV hit and recomputes the prompt.
-Using the same JSON on the producer is harmless.
-
-Use the dedicated layerwise proxy and memcache setup described in
-[Layerwise KV Pool](layerwise_kv_pool.md). The mixed cache tuple is transferred
-layer by layer: Full MLA KV targets swapped memory while the Indexer cache
-targets NPU memory. MemCache receives these entries in separate copy batches:
-Full MLA KV uses `L2GH`/`GH2L`, while the NPU-resident Indexer cache uses
-`L2G`/`G2L`.
-
-Layerwise memcache transfers request tails as request-scoped blocks in addition
-to hash-addressed full blocks. This covers prompts shorter than one block and
-non-block-aligned prompts. vLLM still recomputes the final prompt token before
-sampling; the consumer loads whichever full or request-tail block contains the
-preceding KV rows.
-
-Before starting a model, the exact mixed-memory transfer path can be verified
-without model weights. Start the MemCache MetaService, export
-`MMC_LOCAL_CONFIG_PATH`, and run:
-
-```bash
-VLLM_ASCEND_RUN_MEMCACHE_INTEGRATION_TEST=1 \
-python -m pytest -sv \
-  --confcutdir=tests/e2e/nightly/single_node/ops/singlecard_ops \
-  tests/e2e/nightly/single_node/ops/singlecard_ops/test_sparse_kv_offload_memcache.py
-```
-
-The opt-in test saves and reloads one mixed cache tuple containing Host-backed
-MLA Full KV tensors from `empty_with_swapped_memory` and an NPU-resident
-Lightning Indexer tensor. It is skipped by default because a live MemCache
-deployment is an external prerequisite. The scoped `confcutdir` keeps this
-operator-only test independent from unrelated model-download dependencies in
-the broader E2E test configuration.
+The NPU-resident Lightning Indexer cache can still use the supported
+`L2G`/`G2L` directions. Completing Online P/D requires either a MemCache API
+that explicitly supports swapped/SVM addresses, another transport with that
+contract, or an explicit staging copy.
 
 The feature is disabled by default. When disabled, allocation and SFA execution
 remain unchanged.
@@ -158,7 +117,8 @@ and memory allocation only; it is not an accuracy result.
 - No speculative decoding or MTP.
 - No prefix caching.
 - No DSA context parallelism, PCP, or DCP.
-- P/D currently supports only layerwise `AscendStoreConnector` with memcache.
+- Online P/D for Host Full-KV mode is blocked on a transport contract for
+  swapped/SVM Full-KV addresses.
 - Selected KV state is reused across decode steps and reset at Prefill/request
   boundaries. The current device buffer holds one Top-K working set rather than
   a larger configurable LRU pool.

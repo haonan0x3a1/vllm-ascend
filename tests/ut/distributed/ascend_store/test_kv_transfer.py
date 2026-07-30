@@ -186,7 +186,7 @@ class TestKVTransferThread(unittest.TestCase):
         )
         return t, store
 
-    def test_batch_copy_mixed_memory_uses_host_and_device_directions(self):
+    def test_batch_copy_mixed_memory_rejects_swapped_host_entries(self):
         client = MagicMock()
         client.batch_copy.return_value = 0
         thread = KVTransferThread.__new__(KVTransferThread)
@@ -196,6 +196,31 @@ class TestKVTransferThread(unittest.TestCase):
         addrs = np.asarray([200, 201, 202, 203, 204, 205], dtype=np.int64)
         sizes = np.asarray([10, 20, 30, 10, 20, 30], dtype=np.int64)
         host_array = np.asarray([True, True, False, True, True, False])
+
+        for is_save in (True, False):
+            with self.assertRaisesRegex(NotImplementedError, "does not have a verified public copy direction"):
+                thread._batch_copy_mixed_memory_with_limits(
+                    gvas,
+                    addrs,
+                    sizes,
+                    host_array,
+                    is_save=is_save,
+                    max_transfer_blocks=1,
+                    max_transfer_bytes=0,
+                    caches_per_layer=3,
+                )
+        client.batch_copy.assert_not_called()
+
+    def test_batch_copy_mixed_memory_keeps_npu_directions(self):
+        client = MagicMock()
+        client.batch_copy.return_value = 0
+        thread = KVTransferThread.__new__(KVTransferThread)
+        thread.m_store = MagicMock(store=client)
+        thread.num_addrs_per_block = 3
+        gvas = np.asarray([100, 101, 102, 103, 104, 105], dtype=np.int64)
+        addrs = np.asarray([200, 201, 202, 203, 204, 205], dtype=np.int64)
+        sizes = np.asarray([10, 20, 30, 10, 20, 30], dtype=np.int64)
+        host_array = np.zeros(6, dtype=np.bool_)
 
         result = thread._batch_copy_mixed_memory_with_limits(
             gvas,
@@ -211,17 +236,8 @@ class TestKVTransferThread(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(
             [call.args[3] for call in client.batch_copy.call_args_list],
-            [
-                MmcDirect.COPY_L2GH.value,
-                MmcDirect.COPY_L2GH.value,
-                MmcDirect.COPY_L2G.value,
-                MmcDirect.COPY_L2G.value,
-            ],
+            [MmcDirect.COPY_L2G.value, MmcDirect.COPY_L2G.value],
         )
-        self.assertEqual(client.batch_copy.call_args_list[0].args[0], [100, 101])
-        self.assertEqual(client.batch_copy.call_args_list[1].args[0], [103, 104])
-        self.assertEqual(client.batch_copy.call_args_list[2].args[0], [102])
-        self.assertEqual(client.batch_copy.call_args_list[3].args[0], [105])
 
         client.reset_mock()
         result = thread._batch_copy_mixed_memory_with_limits(
@@ -238,10 +254,7 @@ class TestKVTransferThread(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(
             [call.args[3] for call in client.batch_copy.call_args_list],
-            [
-                MmcDirect.COPY_GH2L.value,
-                MmcDirect.COPY_G2L.value,
-            ],
+            [MmcDirect.COPY_G2L.value],
         )
 
     def test_batch_copy_mixed_memory_rejects_non_repeating_host_pattern(self):

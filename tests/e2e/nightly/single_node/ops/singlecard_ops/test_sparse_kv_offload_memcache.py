@@ -13,18 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 import os
 import uuid
 
 import numpy as np
 import pytest
 import torch
-import torch_npu
+import torch_npu  # noqa: F401  # registers the NPU backend
 from vllm.config import ParallelConfig
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import (
     MemcacheBackend,
+    MmcDirect,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import KVTransferThread
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
@@ -53,27 +53,14 @@ def _tensor_nbytes(tensor: torch.Tensor) -> int:
     return tensor.numel() * tensor.element_size()
 
 
-def _make_swapped_cache(shape: tuple[int, ...]) -> torch.Tensor:
-    dtype = torch.bfloat16
-    dtype_size = torch.empty((), dtype=dtype).element_size()
-    raw_storage = torch_npu.empty_with_swapped_memory(
-        (math.prod(shape) * dtype_size,),
-        dtype=torch.int8,
-        device="npu",
+def _make_npu_indexer_cache() -> tuple[torch.Tensor, ...]:
+    return (
+        torch.empty(
+            (1, BLOCK_SIZE, 4),
+            dtype=torch.bfloat16,
+            device="npu",
+        ),
     )
-    return raw_storage.view(dtype).view(shape)
-
-
-def _make_mixed_kv_cache() -> tuple[torch.Tensor, ...]:
-    device = torch.device("npu")
-    full_nope = _make_swapped_cache((1, BLOCK_SIZE, 1, 2))
-    full_rope = _make_swapped_cache((1, BLOCK_SIZE, 1, 1))
-    indexer = torch.empty(
-        (1, BLOCK_SIZE, 4),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    return full_nope, full_rope, indexer
 
 
 def _make_transfer_arrays(
@@ -98,7 +85,7 @@ def _make_transfer_arrays(
     return gvas, local_addrs, sizes
 
 
-def _copy_mixed_cache(
+def _copy_npu_cache(
     backend: MemcacheBackend,
     gvas: np.ndarray,
     addrs: np.ndarray,
@@ -109,25 +96,23 @@ def _copy_mixed_cache(
     transfer = KVTransferThread.__new__(KVTransferThread)
     transfer.m_store = backend
     transfer.num_addrs_per_block = len(gvas)
-    host_array = np.asarray([True, True, False], dtype=np.bool_)
-    return transfer._batch_copy_mixed_memory_with_limits(
+    direction = MmcDirect.COPY_L2G.value if is_save else MmcDirect.COPY_G2L.value
+    return transfer._batch_copy_with_limits(
         gvas,
         addrs,
         sizes,
-        host_array,
-        is_save=is_save,
+        direction,
         max_transfer_blocks=0,
         max_transfer_bytes=0,
-        caches_per_layer=len(host_array),
     )
 
 
-def test_memcache_round_trip_mixed_swapped_and_npu_kv_cache():
-    """Verify the exact mixed-memory tuple used by host sparse KV offload."""
+def test_memcache_round_trip_npu_resident_indexer_cache():
+    """Verify the supported MemCache path used by the Indexer cache."""
     MemcacheBackend.validate_gva_layerwise_api()
     torch.npu.set_device(0)
-    source = _make_mixed_kv_cache()
-    destination = _make_mixed_kv_cache()
+    source = _make_npu_indexer_cache()
+    destination = _make_npu_indexer_cache()
 
     source[0].copy_(
         torch.arange(
@@ -135,22 +120,6 @@ def test_memcache_round_trip_mixed_swapped_and_npu_kv_cache():
             dtype=torch.float32,
             device="npu",
         ).reshape(source[0].shape)
-    )
-    source[1].copy_(
-        torch.arange(
-            source[1].numel(),
-            dtype=torch.float32,
-            device="npu",
-        ).reshape(source[1].shape)
-        + 4096
-    )
-    source[2].copy_(
-        torch.arange(
-            source[2].numel(),
-            dtype=torch.float32,
-            device="npu",
-        ).reshape(source[2].shape)
-        + 8192
     )
     for tensor in destination:
         tensor.fill_(-1)
@@ -167,7 +136,7 @@ def test_memcache_round_trip_mixed_swapped_and_npu_kv_cache():
         [_tensor_nbytes(tensor) for tensor in all_tensors],
     )
 
-    key = f"vllm-ascend-sparse-offload-mixed-memory-smoke-{uuid.uuid4().hex}"
+    key = f"vllm-ascend-sparse-offload-indexer-smoke-{uuid.uuid4().hex}"
     total_bytes = sum(_tensor_nbytes(tensor) for tensor in source)
     allocated_gvas = backend.batch_alloc([key], [total_bytes])
     assert len(allocated_gvas) == 1
@@ -179,7 +148,7 @@ def test_memcache_round_trip_mixed_swapped_and_npu_kv_cache():
             allocated_gvas[0],
             source,
         )
-        save_result = _copy_mixed_cache(
+        save_result = _copy_npu_cache(
             backend,
             source_gvas,
             source_addrs,
@@ -201,7 +170,7 @@ def test_memcache_round_trip_mixed_swapped_and_npu_kv_cache():
             load_gva_list[0],
             destination,
         )
-        load_result = _copy_mixed_cache(
+        load_result = _copy_npu_cache(
             backend,
             destination_gvas,
             destination_addrs,

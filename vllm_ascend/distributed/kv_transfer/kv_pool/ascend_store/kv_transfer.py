@@ -396,8 +396,6 @@ class KVTransferThread(threading.Thread):
             MmcDirect.COPY_G2L.value: "load(G2L)",
             MmcDirect.COPY_G2H.value: "load(G2H)",
             MmcDirect.COPY_H2G.value: "save(H2G)",
-            MmcDirect.COPY_L2GH.value: "save(L2GH)",
-            MmcDirect.COPY_GH2L.value: "load(GH2L)",
         }
         dir_name = direction_names.get(direction, f"dir{direction}")
         logger.debug(
@@ -474,14 +472,17 @@ class KVTransferThread(threading.Thread):
         if not np.array_equal(host_array, expected_host):
             raise ValueError("Mixed-memory batch_copy host metadata must repeat the same pattern for every block.")
 
+        if np.any(host_array):
+            raise NotImplementedError(
+                "MemCache batch_copy does not have a verified public copy "
+                "direction for torch_npu.empty_with_swapped_memory tensors. "
+                "These Host-backed tensors expose NPU/SVM data_ptr values and "
+                "must not be passed as ordinary H2G/G2H host buffers. Use a "
+                "transport with an explicit swapped-memory contract or a "
+                "staging copy."
+            )
+
         transfer_groups = (
-            (
-                True,
-                # Swapped tensors are Host-backed but expose an NPU/SVM
-                # data_ptr, so their local endpoint is Device while the
-                # MemCache allocation remains Global Host DRAM.
-                MmcDirect.COPY_L2GH.value if is_save else MmcDirect.COPY_GH2L.value,
-            ),
             (
                 False,
                 MmcDirect.COPY_L2G.value if is_save else MmcDirect.COPY_G2L.value,

@@ -161,6 +161,10 @@ class KVPoolWorker:
         self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))
         self.layerwise_max_transfer_bytes = int(extra_config.get("layerwise_max_transfer_bytes", 0))
         self.num_host_caches_per_layer = self._infer_num_host_caches_per_layer(vllm_config)
+        self._validate_sparse_host_layerwise_transport(
+            self.use_gva_layerwise,
+            self.num_host_caches_per_layer,
+        )
 
         logger.info(
             "use_hybrid: %s, use_mamba: %s, num_kv_cache_groups: %s, hash_block_size: %s, lcm_block_size: %s",
@@ -182,6 +186,20 @@ class KVPoolWorker:
         if sparse_offload_config.get("enabled") is True and sparse_offload_config.get("mode") == "host":
             return SPARSE_HOST_FULL_KV_CACHES_PER_LAYER
         return 0
+
+    @staticmethod
+    def _validate_sparse_host_layerwise_transport(
+        use_gva_layerwise: bool,
+        num_host_caches_per_layer: int,
+    ) -> None:
+        if use_gva_layerwise and num_host_caches_per_layer > 0:
+            raise NotImplementedError(
+                "MemCache layerwise transfer does not have a verified public "
+                "copy contract for sparse KV offload tensors allocated by "
+                "torch_npu.empty_with_swapped_memory. Use single-instance "
+                "host mode, a transport with explicit swapped-memory support, "
+                "or an explicit staging copy."
+            )
 
     def _init_key_head_config(self, model_config, parallel_config) -> None:
         self.current_layer = 0
