@@ -50,6 +50,13 @@ MIXED_BUFFER_SPECS = (
     ("full_rope", "swapped", 0x22),
     ("indexer", "npu", 0x33),
 )
+STAGED_BUFFER_SPECS = (
+    ("full_nope", "pinned", 0x11),
+    ("full_rope", "pinned", 0x22),
+    ("indexer", "npu", 0x33),
+)
+FULL_KV_BUFFER_NAMES = ("full_nope", "full_rope")
+INDEXER_BUFFER_NAME = "indexer"
 MIN_MOONCAKE_VERSION = Version("0.3.12.post1")
 PROCESS_TIMEOUT_SECONDS = 60
 READY_MARKER = "MOONCAKE_NPU_SMOKE_READY="
@@ -167,6 +174,55 @@ def _allocate_mixed_buffer(
         raise ValueError(f"Unknown memory kind: {memory_kind!r}")
     buffer.fill_(fill_value)
     return owner, buffer
+
+
+def _allocate_pinned_host_buffer(
+    torch_module,
+    *,
+    fill_value: int,
+):
+    buffer = torch_module.empty(
+        BUFFER_BYTES,
+        dtype=torch_module.int8,
+        device="cpu",
+        pin_memory=True,
+    )
+    assert buffer.is_pinned(), (
+        "Mooncake Host staging buffer must use torch pinned CPU memory."
+    )
+    buffer.fill_(fill_value)
+    return buffer
+
+
+def _register_buffer(
+    engine,
+    buffer,
+    *,
+    memory_kind: str,
+    device_index: int,
+) -> None:
+    if memory_kind == "pinned":
+        assert buffer.is_pinned(), (
+            "Mooncake Host staging buffer lost its pinned-memory property."
+        )
+        location = "cpu"
+    elif memory_kind == "npu":
+        location = f"npu:{device_index}"
+    elif memory_kind == "swapped":
+        location = "cpu"
+    else:
+        raise ValueError(f"Unknown memory kind: {memory_kind!r}")
+
+    result = engine.register_memory(
+        buffer.data_ptr(),
+        BUFFER_BYTES,
+        location,
+    )
+    if result != 0:
+        raise RuntimeError(
+            "Mooncake memory registration failed: "
+            f"memory_kind={memory_kind}, location={location!r}, result={result}"
+        )
 
 
 def _initialize_engine(device_index: int):
@@ -394,6 +450,161 @@ def _run_mixed_receiver() -> int:
             raise RuntimeError(f"Mixed receiver memory unregistration failed: {unregister_failures}")
 
 
+def _run_staged_receiver() -> int:
+    """Receive Full KV into pinned Host staging, then copy it into swapped KV."""
+    import torch_npu
+
+    torch, engine, host = _initialize_engine(device_index=1)
+    owners = []
+    staging_buffers: dict[str, Any] = {}
+    final_buffers: dict[str, Any] = {}
+    registered_pointers: list[int] = []
+    unregister_failures: list[tuple[int, int]] = []
+    try:
+        metadata = []
+        for name, memory_kind, _ in STAGED_BUFFER_SPECS:
+            if memory_kind == "pinned":
+                buffer = _allocate_pinned_host_buffer(
+                    torch,
+                    fill_value=MIXED_DESTINATION_SENTINEL,
+                )
+                owner = buffer
+            elif memory_kind == "npu":
+                owner, buffer = _allocate_aligned_buffer(
+                    torch,
+                    device_index=1,
+                    fill_value=MIXED_DESTINATION_SENTINEL,
+                )
+            else:
+                raise ValueError(f"Unsupported staged receiver memory kind: {memory_kind!r}")
+
+            owners.append(owner)
+            staging_buffers[name] = buffer
+            _register_buffer(
+                engine,
+                buffer,
+                memory_kind=memory_kind,
+                device_index=1,
+            )
+            registered_pointers.append(buffer.data_ptr())
+            metadata.append(
+                {
+                    "name": name,
+                    "memory_kind": memory_kind,
+                    "base_address": buffer.data_ptr(),
+                    "target_address": (buffer.data_ptr() + MIXED_TRANSFER_OFFSET_BYTES),
+                    "registration_size": BUFFER_BYTES,
+                    "transfer_size": MIXED_TRANSFER_BYTES,
+                    "base_alignment_mod": (buffer.data_ptr() % ALIGNMENT_BYTES),
+                    "is_pinned": bool(buffer.is_pinned()) if memory_kind == "pinned" else False,
+                }
+            )
+
+        for name in FULL_KV_BUFFER_NAMES:
+            owner, final_buffer = _allocate_mixed_buffer(
+                torch,
+                torch_npu,
+                memory_kind="swapped",
+                device_index=1,
+                fill_value=MIXED_DESTINATION_SENTINEL,
+            )
+            owners.append(owner)
+            final_buffers[name] = final_buffer
+
+        torch.npu.synchronize()
+        print(
+            READY_MARKER
+            + json.dumps(
+                {
+                    "host": host,
+                    "port": engine.get_rpc_port(),
+                    "buffers": metadata,
+                }
+            ),
+            flush=True,
+        )
+
+        command = sys.stdin.readline().strip()
+        if command != "VERIFY":
+            raise RuntimeError(f"Staged receiver expected VERIFY command, got {command!r}.")
+
+        torch.npu.synchronize()
+        staging_verification = {}
+        for name, memory_kind, expected_value in STAGED_BUFFER_SPECS:
+            staging_verification[name] = _verify_mixed_buffer(
+                torch,
+                staging_buffers[name],
+                memory_kind=memory_kind,
+                device_index=1,
+                expected_value=expected_value,
+            )
+
+        window_end = MIXED_TRANSFER_OFFSET_BYTES + MIXED_TRANSFER_BYTES
+        for name in FULL_KV_BUFFER_NAMES:
+            final_buffers[name][MIXED_TRANSFER_OFFSET_BYTES:window_end].copy_(
+                staging_buffers[name][MIXED_TRANSFER_OFFSET_BYTES:window_end],
+            )
+        torch.npu.synchronize()
+
+        final_verification = {
+            name: _verify_mixed_buffer(
+                torch,
+                final_buffers[name],
+                memory_kind="swapped",
+                device_index=1,
+                expected_value=next(
+                    expected_value
+                    for spec_name, _, expected_value in STAGED_BUFFER_SPECS
+                    if spec_name == name
+                ),
+            )
+            for name in FULL_KV_BUFFER_NAMES
+        }
+        final_verification[INDEXER_BUFFER_NAME] = staging_verification[INDEXER_BUFFER_NAME]
+
+        verification_keys = (
+            "prefix_matches",
+            "payload_matches",
+            "suffix_matches",
+        )
+        staging_matches = all(
+            all(result[key] for key in verification_keys)
+            for result in staging_verification.values()
+        )
+        final_matches = all(
+            all(result[key] for key in verification_keys)
+            for result in final_verification.values()
+        )
+        matches = staging_matches and final_matches
+        print(
+            RESULT_MARKER
+            + json.dumps(
+                {
+                    "matches": matches,
+                    "staging_buffers": staging_verification,
+                    "final_buffers": final_verification,
+                }
+            ),
+            flush=True,
+        )
+        if not matches:
+            raise RuntimeError("Staged sparse-offload destination buffers failed verification.")
+        return 0
+    finally:
+        torch.npu.synchronize()
+        unregister_failures = _unregister_buffers(
+            engine,
+            registered_pointers,
+        )
+        del engine
+        staging_buffers.clear()
+        final_buffers.clear()
+        owners.clear()
+        gc.collect()
+        if unregister_failures:
+            raise RuntimeError(f"Staged receiver memory unregistration failed: {unregister_failures}")
+
+
 def _run_sender(
     *,
     target_host: str,
@@ -538,6 +749,154 @@ def _run_mixed_sender(
             raise RuntimeError(f"Mixed sender memory unregistration failed: {unregister_failures}")
 
 
+def _run_staged_sender(
+    *,
+    target_host: str,
+    target_port: int,
+    target_metadata: list[dict[str, Any]],
+) -> int:
+    """Send Full KV to pinned Host staging and Indexer KV to NPU separately."""
+    torch, engine, _ = _initialize_engine(device_index=0)
+    owners = []
+    buffers: dict[str, Any] = {}
+    registered_pointers: list[int] = []
+    unregister_failures: list[tuple[int, int]] = []
+    try:
+        for name, _, payload_value in STAGED_BUFFER_SPECS:
+            owner, buffer = _allocate_aligned_buffer(
+                torch,
+                device_index=0,
+                fill_value=0,
+            )
+            buffer[MIXED_TRANSFER_OFFSET_BYTES : (MIXED_TRANSFER_OFFSET_BYTES + MIXED_TRANSFER_BYTES)].fill_(
+                payload_value
+            )
+            owners.append(owner)
+            buffers[name] = buffer
+            _register_buffer(
+                engine,
+                buffer,
+                memory_kind="npu",
+                device_index=0,
+            )
+            registered_pointers.append(buffer.data_ptr())
+        torch.npu.synchronize()
+
+        target_by_name = {str(metadata["name"]): metadata for metadata in target_metadata}
+        expected_names = {name for name, _, _ in STAGED_BUFFER_SPECS}
+        if set(target_by_name) != expected_names:
+            raise RuntimeError(
+                "Staged target metadata names do not match the source tuple: "
+                f"expected={sorted(expected_names)}, "
+                f"actual={sorted(target_by_name)}"
+            )
+        for name in FULL_KV_BUFFER_NAMES:
+            metadata = target_by_name[name]
+            if metadata["memory_kind"] != "pinned" or not metadata["is_pinned"]:
+                raise RuntimeError(
+                    "Staged Full-KV destination must be pinned Host memory: "
+                    f"name={name!r}, metadata={metadata}"
+                )
+            if int(metadata["transfer_size"]) != MIXED_TRANSFER_BYTES:
+                raise RuntimeError(
+                    "Staged Full-KV transfer size does not match the test "
+                    f"contract: name={name!r}, metadata={metadata}"
+                )
+
+        indexer_metadata = target_by_name[INDEXER_BUFFER_NAME]
+        if indexer_metadata["memory_kind"] != "npu":
+            raise RuntimeError(
+                "Staged Indexer destination must be NPU memory: "
+                f"metadata={indexer_metadata}"
+            )
+        if int(indexer_metadata["transfer_size"]) != MIXED_TRANSFER_BYTES:
+            raise RuntimeError(
+                "Staged Indexer transfer size does not match the test "
+                f"contract: metadata={indexer_metadata}"
+            )
+
+        session = f"{target_host}:{target_port}"
+        # Keep transfer directions homogeneous per call. HIXL intermediate
+        # mode requires this, and the production path can preserve the same
+        # split even when direct D2H/D2D transfer is available.
+        full_result = engine.batch_transfer_sync_write(
+            session,
+            [
+                buffers[name].data_ptr() + MIXED_TRANSFER_OFFSET_BYTES
+                for name in FULL_KV_BUFFER_NAMES
+            ],
+            [
+                int(target_by_name[name]["target_address"])
+                for name in FULL_KV_BUFFER_NAMES
+            ],
+            [MIXED_TRANSFER_BYTES] * len(FULL_KV_BUFFER_NAMES),
+        )
+        if full_result < 0:
+            raise RuntimeError(
+                "Mooncake staged Full-KV NPU-to-Host transfer failed: "
+                f"session={session}, result={full_result}"
+            )
+
+        indexer_result = engine.batch_transfer_sync_write(
+            session,
+            [
+                buffers[INDEXER_BUFFER_NAME].data_ptr()
+                + MIXED_TRANSFER_OFFSET_BYTES
+            ],
+            [
+                int(
+                    target_by_name[INDEXER_BUFFER_NAME]["target_address"]
+                )
+            ],
+            [MIXED_TRANSFER_BYTES],
+        )
+        if indexer_result < 0:
+            raise RuntimeError(
+                "Mooncake staged Indexer NPU-to-NPU transfer failed: "
+                f"session={session}, result={indexer_result}"
+            )
+
+        print(
+            RESULT_MARKER
+            + json.dumps(
+                {
+                    "full_transfer_result": full_result,
+                    "indexer_transfer_result": indexer_result,
+                    "full_source_addresses": [
+                        buffers[name].data_ptr() + MIXED_TRANSFER_OFFSET_BYTES
+                        for name in FULL_KV_BUFFER_NAMES
+                    ],
+                    "full_target_addresses": [
+                        int(target_by_name[name]["target_address"])
+                        for name in FULL_KV_BUFFER_NAMES
+                    ],
+                    "indexer_source_address": (
+                        buffers[INDEXER_BUFFER_NAME].data_ptr()
+                        + MIXED_TRANSFER_OFFSET_BYTES
+                    ),
+                    "indexer_target_address": int(
+                        target_by_name[INDEXER_BUFFER_NAME]["target_address"]
+                    ),
+                    "transfer_size": MIXED_TRANSFER_BYTES,
+                }
+            ),
+            flush=True,
+        )
+        return 0
+    finally:
+        torch.npu.synchronize()
+        unregister_failures = _unregister_buffers(
+            engine,
+            registered_pointers,
+        )
+        del engine
+        buffers.clear()
+        owners.clear()
+        gc.collect()
+        if unregister_failures:
+            raise RuntimeError(f"Staged sender memory unregistration failed: {unregister_failures}")
+
+
 def _require_native_mooncake() -> None:
     try:
         installed_version = Version(version("mooncake-transfer-engine-npu"))
@@ -614,8 +973,94 @@ def test_mooncake_npu_to_npu_transfer():
             receiver_output.join()
 
 
+def test_mooncake_sparse_offload_staged_memory_transfer():
+    """Verify NPU-to-pinned-Host Full KV plus NPU-to-NPU Indexer transfer."""
+    _require_native_mooncake()
+    command = [sys.executable, str(Path(__file__).resolve())]
+    receiver = subprocess.Popen(
+        [*command, "--role", "staged_receiver"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    if receiver.stdin is None or receiver.stdout is None:
+        receiver.terminate()
+        receiver.wait(timeout=5)
+        raise RuntimeError("Failed to create staged receiver control pipes.")
+
+    receiver_output = _ProcessOutput(receiver.stdout)
+    try:
+        ready = receiver_output.wait_for_marker(
+            READY_MARKER,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        sender = subprocess.run(
+            [
+                *command,
+                "--role",
+                "staged_sender",
+                "--target-host",
+                str(ready["host"]),
+                "--target-port",
+                str(ready["port"]),
+                "--target-metadata",
+                json.dumps(ready["buffers"], separators=(",", ":")),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        assert sender.returncode == 0, (
+            f"Mooncake staged sender failed.\nstdout:\n{sender.stdout}\nstderr:\n{sender.stderr}"
+        )
+
+        receiver.stdin.write("VERIFY\n")
+        receiver.stdin.flush()
+        result = receiver_output.wait_for_marker(
+            RESULT_MARKER,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        receiver.wait(timeout=PROCESS_TIMEOUT_SECONDS)
+        receiver_output.join()
+        assert receiver.returncode == 0, (
+            "Mooncake staged receiver failed.\n"
+            f"output:\n{receiver_output.output}"
+        )
+        assert result["matches"], (
+            "Mooncake staged receiver observed corrupted data.\n"
+            f"result={result}\noutput:\n{receiver_output.output}"
+        )
+        print(
+            "Mooncake sparse-offload staged path verified: "
+            + json.dumps(
+                {
+                    "receiver_layout": ready["buffers"],
+                    "staging_verification": result["staging_buffers"],
+                    "final_verification": result["final_buffers"],
+                },
+                sort_keys=True,
+            )
+        )
+    finally:
+        if receiver.poll() is None:
+            _stop_process(receiver, receiver_output)
+        else:
+            receiver_output.join()
+
+
+@pytest.mark.xfail(
+    reason=(
+        "Diagnostic only: swapped tensor.data_ptr() exposes an SVM alias, not "
+        "the original aclrtMallocHost address required by Mooncake/HIXL "
+        "registration. Run this exact test with --runxfail only when "
+        "re-checking a new CANN/Mooncake runtime."
+    ),
+    run=False,
+)
 def test_mooncake_sparse_offload_mixed_memory_transfer():
-    """Transfer the production Host/Host/NPU sparse cache tuple in one batch."""
+    """Diagnose direct swapped-Host/NPU transfer on a candidate runtime."""
     _require_native_mooncake()
     command = [sys.executable, str(Path(__file__).resolve())]
     receiver = subprocess.Popen(
@@ -695,6 +1140,8 @@ def _parse_args() -> argparse.Namespace:
             "sender",
             "mixed_receiver",
             "mixed_sender",
+            "staged_receiver",
+            "staged_sender",
         ),
         required=True,
     )
@@ -711,11 +1158,23 @@ if __name__ == "__main__":
         raise SystemExit(_run_receiver())
     if args.role == "mixed_receiver":
         raise SystemExit(_run_mixed_receiver())
+    if args.role == "staged_receiver":
+        raise SystemExit(_run_staged_receiver())
     if args.role == "mixed_sender":
         if args.target_host is None or args.target_port is None or args.target_metadata is None:
             raise SystemExit("mixed sender requires --target-host, --target-port, and --target-metadata")
         raise SystemExit(
             _run_mixed_sender(
+                target_host=args.target_host,
+                target_port=args.target_port,
+                target_metadata=json.loads(args.target_metadata),
+            )
+        )
+    if args.role == "staged_sender":
+        if args.target_host is None or args.target_port is None or args.target_metadata is None:
+            raise SystemExit("staged sender requires --target-host, --target-port, and --target-metadata")
+        raise SystemExit(
+            _run_staged_sender(
                 target_host=args.target_host,
                 target_port=args.target_port,
                 target_metadata=json.loads(args.target_metadata),
