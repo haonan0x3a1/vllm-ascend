@@ -51,14 +51,15 @@ def test_gather_reads_full_kv_from_swapped_memory(dtype):
     full_nope = torch.zeros(4, BLOCK_SIZE, 1, 2, dtype=dtype, device=device)
     full_rope = torch.zeros(4, BLOCK_SIZE, 1, 1, dtype=dtype, device=device)
     logical_tokens = torch.arange(256, dtype=torch.float32, device=device).to(dtype)
+    rope_values = logical_tokens + 4096
 
     # Use a non-identity logical-to-physical block mapping.
     full_nope[2, :, 0, 0] = logical_tokens[:BLOCK_SIZE]
     full_nope[2, :, 0, 1] = logical_tokens[:BLOCK_SIZE] + 1
-    full_rope[2, :, 0, 0] = logical_tokens[:BLOCK_SIZE] + 4096
+    full_rope[2, :, 0, 0] = rope_values[:BLOCK_SIZE]
     full_nope[1, :, 0, 0] = logical_tokens[BLOCK_SIZE:]
     full_nope[1, :, 0, 1] = logical_tokens[BLOCK_SIZE:] + 1
-    full_rope[1, :, 0, 0] = logical_tokens[BLOCK_SIZE:] + 4096
+    full_rope[1, :, 0, 0] = rope_values[BLOCK_SIZE:]
 
     workspace = SparseKVOffloadWorkspace(
         (full_nope, full_rope),
@@ -123,7 +124,7 @@ def test_gather_reads_full_kv_from_swapped_memory(dtype):
     )
     torch.testing.assert_close(
         torch.sort(selected_rope.float()).values.cpu(),
-        torch.arange(256, dtype=torch.float32) + 4096,
+        torch.sort(rope_values.float()).values.cpu(),
     )
 
 
@@ -147,13 +148,14 @@ def test_host_mode_persists_prefill_rows_and_gathers_from_framework_swapped_kv(
     prefill_nope = torch.zeros_like(full_nope)
     prefill_rope = torch.zeros_like(full_rope)
     logical_tokens = torch.arange(256, dtype=torch.float32, device=device).to(dtype)
+    rope_values = logical_tokens + 4096
 
     prefill_nope[2, :, 0, 0] = logical_tokens[:BLOCK_SIZE]
     prefill_nope[2, :, 0, 1] = logical_tokens[:BLOCK_SIZE] + 1
-    prefill_rope[2, :, 0, 0] = logical_tokens[:BLOCK_SIZE] + 4096
+    prefill_rope[2, :, 0, 0] = rope_values[:BLOCK_SIZE]
     prefill_nope[1, :, 0, 0] = logical_tokens[BLOCK_SIZE:]
     prefill_nope[1, :, 0, 1] = logical_tokens[BLOCK_SIZE:] + 1
-    prefill_rope[1, :, 0, 0] = logical_tokens[BLOCK_SIZE:] + 4096
+    prefill_rope[1, :, 0, 0] = rope_values[BLOCK_SIZE:]
 
     workspace = SparseKVOffloadWorkspace(
         (full_nope, full_rope),
@@ -222,7 +224,7 @@ def test_host_mode_persists_prefill_rows_and_gathers_from_framework_swapped_kv(
     )
     torch.testing.assert_close(
         selected_rope.float().cpu(),
-        torch.arange(256, dtype=torch.float32) + 4096,
+        rope_values.float().cpu(),
     )
 
 
