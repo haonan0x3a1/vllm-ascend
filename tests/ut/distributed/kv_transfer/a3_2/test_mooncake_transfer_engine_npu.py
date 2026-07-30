@@ -42,6 +42,14 @@ from packaging.version import Version
 ALIGNMENT_BYTES = 2 * 1024 * 1024
 BUFFER_BYTES = 2 * 1024 * 1024
 BUFFER_PATTERN = 0x5A
+MIXED_TRANSFER_OFFSET_BYTES = 4096
+MIXED_TRANSFER_BYTES = 256 * 1024
+MIXED_DESTINATION_SENTINEL = -1
+MIXED_BUFFER_SPECS = (
+    ("full_nope", "swapped", 0x11),
+    ("full_rope", "swapped", 0x22),
+    ("indexer", "npu", 0x33),
+)
 MIN_MOONCAKE_VERSION = Version("0.3.12.post1")
 PROCESS_TIMEOUT_SECONDS = 60
 READY_MARKER = "MOONCAKE_NPU_SMOKE_READY="
@@ -133,6 +141,34 @@ def _allocate_aligned_buffer(
     return raw, buffer
 
 
+def _allocate_mixed_buffer(
+    torch_module,
+    torch_npu_module,
+    *,
+    memory_kind: str,
+    device_index: int,
+    fill_value: int,
+):
+    """Match the production allocator for one sparse-offload cache tensor."""
+    if memory_kind == "swapped":
+        buffer = torch_npu_module.empty_with_swapped_memory(
+            (BUFFER_BYTES,),
+            dtype=torch_module.int8,
+            device=torch_module.device(f"npu:{device_index}"),
+        )
+        owner = buffer
+    elif memory_kind == "npu":
+        owner, buffer = _allocate_aligned_buffer(
+            torch_module,
+            device_index=device_index,
+            fill_value=fill_value,
+        )
+    else:
+        raise ValueError(f"Unknown memory kind: {memory_kind!r}")
+    buffer.fill_(fill_value)
+    return owner, buffer
+
+
 def _initialize_engine(device_index: int):
     import torch
     import torch_npu  # noqa: F401
@@ -148,6 +184,52 @@ def _initialize_engine(device_index: int):
     if result != 0:
         raise RuntimeError(f"TransferEngine initialization failed on NPU {device_index}: result={result}")
     return torch, engine, host
+
+
+def _unregister_buffers(
+    engine,
+    registered_pointers: list[int],
+) -> list[tuple[int, int]]:
+    failures: list[tuple[int, int]] = []
+    for pointer in reversed(registered_pointers):
+        result = engine.unregister_memory(pointer)
+        if result != 0:
+            failures.append((pointer, result))
+    return failures
+
+
+def _verify_mixed_buffer(
+    torch_module,
+    buffer,
+    *,
+    memory_kind: str,
+    device_index: int,
+    expected_value: int,
+) -> dict[str, Any]:
+    """Verify the transfer window and untouched guards for one cache tensor."""
+    if memory_kind == "swapped":
+        npu_copy = torch_module.empty(
+            buffer.shape,
+            dtype=buffer.dtype,
+            device=f"npu:{device_index}",
+        )
+        npu_copy.copy_(buffer)
+        torch_module.npu.synchronize()
+        received = npu_copy.cpu()
+    else:
+        received = buffer.cpu()
+
+    window_end = MIXED_TRANSFER_OFFSET_BYTES + MIXED_TRANSFER_BYTES
+    prefix_matches = bool(torch_module.all(received[:MIXED_TRANSFER_OFFSET_BYTES] == MIXED_DESTINATION_SENTINEL).item())
+    payload_matches = bool(torch_module.all(received[MIXED_TRANSFER_OFFSET_BYTES:window_end] == expected_value).item())
+    suffix_matches = bool(torch_module.all(received[window_end:] == MIXED_DESTINATION_SENTINEL).item())
+    return {
+        "prefix_matches": prefix_matches,
+        "payload_matches": payload_matches,
+        "suffix_matches": suffix_matches,
+        "first_payload_byte": int(received[MIXED_TRANSFER_OFFSET_BYTES].item()),
+        "last_payload_byte": int(received[window_end - 1].item()),
+    }
 
 
 def _run_receiver() -> int:
@@ -212,6 +294,106 @@ def _run_receiver() -> int:
             raise RuntimeError(f"Receiver memory unregistration failed: result={unregister_result}")
 
 
+def _run_mixed_receiver() -> int:
+    import torch_npu
+
+    torch, engine, host = _initialize_engine(device_index=1)
+    owners = []
+    buffers: dict[str, Any] = {}
+    registered_pointers: list[int] = []
+    unregister_failures: list[tuple[int, int]] = []
+    try:
+        metadata = []
+        for name, memory_kind, _ in MIXED_BUFFER_SPECS:
+            owner, buffer = _allocate_mixed_buffer(
+                torch,
+                torch_npu,
+                memory_kind=memory_kind,
+                device_index=1,
+                fill_value=MIXED_DESTINATION_SENTINEL,
+            )
+            owners.append(owner)
+            buffers[name] = buffer
+            result = engine.register_memory(buffer.data_ptr(), BUFFER_BYTES)
+            if result != 0:
+                raise RuntimeError(f"Receiver {name} registration failed: result={result}")
+            registered_pointers.append(buffer.data_ptr())
+            metadata.append(
+                {
+                    "name": name,
+                    "memory_kind": memory_kind,
+                    "base_address": buffer.data_ptr(),
+                    "target_address": (buffer.data_ptr() + MIXED_TRANSFER_OFFSET_BYTES),
+                    "registration_size": BUFFER_BYTES,
+                    "transfer_size": MIXED_TRANSFER_BYTES,
+                    "base_alignment_mod": (buffer.data_ptr() % ALIGNMENT_BYTES),
+                }
+            )
+        torch.npu.synchronize()
+        print(
+            READY_MARKER
+            + json.dumps(
+                {
+                    "host": host,
+                    "port": engine.get_rpc_port(),
+                    "buffers": metadata,
+                }
+            ),
+            flush=True,
+        )
+
+        command = sys.stdin.readline().strip()
+        if command != "VERIFY":
+            raise RuntimeError(f"Mixed receiver expected VERIFY command, got {command!r}.")
+
+        torch.npu.synchronize()
+        verification = {}
+        for name, memory_kind, expected_value in MIXED_BUFFER_SPECS:
+            verification[name] = _verify_mixed_buffer(
+                torch,
+                buffers[name],
+                memory_kind=memory_kind,
+                device_index=1,
+                expected_value=expected_value,
+            )
+        matches = all(
+            all(
+                result[key]
+                for key in (
+                    "prefix_matches",
+                    "payload_matches",
+                    "suffix_matches",
+                )
+            )
+            for result in verification.values()
+        )
+        print(
+            RESULT_MARKER
+            + json.dumps(
+                {
+                    "matches": matches,
+                    "buffers": verification,
+                }
+            ),
+            flush=True,
+        )
+        if not matches:
+            raise RuntimeError("Mixed sparse-offload destination buffers failed verification.")
+        return 0
+    finally:
+        torch.npu.synchronize()
+        unregister_failures = _unregister_buffers(
+            engine,
+            registered_pointers,
+        )
+        del engine
+        buffers.clear()
+        owners.clear()
+        gc.collect()
+        if unregister_failures:
+            raise RuntimeError(f"Mixed receiver memory unregistration failed: {unregister_failures}")
+
+
 def _run_sender(
     *,
     target_host: str,
@@ -265,6 +447,95 @@ def _run_sender(
         gc.collect()
         if unregister_result != 0:
             raise RuntimeError(f"Sender memory unregistration failed: result={unregister_result}")
+
+
+def _run_mixed_sender(
+    *,
+    target_host: str,
+    target_port: int,
+    target_metadata: list[dict[str, Any]],
+) -> int:
+    import torch_npu
+
+    torch, engine, _ = _initialize_engine(device_index=0)
+    owners = []
+    buffers: dict[str, Any] = {}
+    registered_pointers: list[int] = []
+    unregister_failures: list[tuple[int, int]] = []
+    try:
+        for name, memory_kind, payload_value in MIXED_BUFFER_SPECS:
+            owner, buffer = _allocate_mixed_buffer(
+                torch,
+                torch_npu,
+                memory_kind=memory_kind,
+                device_index=0,
+                fill_value=0,
+            )
+            buffer[MIXED_TRANSFER_OFFSET_BYTES : (MIXED_TRANSFER_OFFSET_BYTES + MIXED_TRANSFER_BYTES)].fill_(
+                payload_value
+            )
+            owners.append(owner)
+            buffers[name] = buffer
+            result = engine.register_memory(buffer.data_ptr(), BUFFER_BYTES)
+            if result != 0:
+                raise RuntimeError(f"Sender {name} registration failed: result={result}")
+            registered_pointers.append(buffer.data_ptr())
+        torch.npu.synchronize()
+
+        target_by_name = {str(metadata["name"]): metadata for metadata in target_metadata}
+        expected_names = {name for name, _, _ in MIXED_BUFFER_SPECS}
+        if set(target_by_name) != expected_names:
+            raise RuntimeError(
+                "Mixed target metadata names do not match the source tuple: "
+                f"expected={sorted(expected_names)}, "
+                f"actual={sorted(target_by_name)}"
+            )
+
+        source_addresses = []
+        target_addresses = []
+        lengths = []
+        for name, _, _ in MIXED_BUFFER_SPECS:
+            target = target_by_name[name]
+            if int(target["transfer_size"]) != MIXED_TRANSFER_BYTES:
+                raise RuntimeError(f"Unexpected transfer size for {name}: {target['transfer_size']}")
+            source_addresses.append(buffers[name].data_ptr() + MIXED_TRANSFER_OFFSET_BYTES)
+            target_addresses.append(int(target["target_address"]))
+            lengths.append(MIXED_TRANSFER_BYTES)
+
+        session = f"{target_host}:{target_port}"
+        result = engine.batch_transfer_sync_write(
+            session,
+            source_addresses,
+            target_addresses,
+            lengths,
+        )
+        if result < 0:
+            raise RuntimeError(f"Mooncake mixed sparse-offload transfer failed: session={session}, result={result}")
+        print(
+            RESULT_MARKER
+            + json.dumps(
+                {
+                    "transfer_result": result,
+                    "source_addresses": source_addresses,
+                    "target_addresses": target_addresses,
+                    "lengths": lengths,
+                }
+            ),
+            flush=True,
+        )
+        return 0
+    finally:
+        torch.npu.synchronize()
+        unregister_failures = _unregister_buffers(
+            engine,
+            registered_pointers,
+        )
+        del engine
+        buffers.clear()
+        owners.clear()
+        gc.collect()
+        if unregister_failures:
+            raise RuntimeError(f"Mixed sender memory unregistration failed: {unregister_failures}")
 
 
 def _require_native_mooncake() -> None:
@@ -343,16 +614,94 @@ def test_mooncake_npu_to_npu_transfer():
             receiver_output.join()
 
 
+def test_mooncake_sparse_offload_mixed_memory_transfer():
+    """Transfer the production Host/Host/NPU sparse cache tuple in one batch."""
+    _require_native_mooncake()
+    command = [sys.executable, str(Path(__file__).resolve())]
+    receiver = subprocess.Popen(
+        [*command, "--role", "mixed_receiver"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    if receiver.stdin is None or receiver.stdout is None:
+        receiver.terminate()
+        receiver.wait(timeout=5)
+        raise RuntimeError("Failed to create mixed receiver control pipes.")
+
+    receiver_output = _ProcessOutput(receiver.stdout)
+    try:
+        ready = receiver_output.wait_for_marker(
+            READY_MARKER,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        sender = subprocess.run(
+            [
+                *command,
+                "--role",
+                "mixed_sender",
+                "--target-host",
+                str(ready["host"]),
+                "--target-port",
+                str(ready["port"]),
+                "--target-metadata",
+                json.dumps(ready["buffers"], separators=(",", ":")),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        assert sender.returncode == 0, (
+            f"Mooncake mixed sender failed.\nstdout:\n{sender.stdout}\nstderr:\n{sender.stderr}"
+        )
+
+        receiver.stdin.write("VERIFY\n")
+        receiver.stdin.flush()
+        result = receiver_output.wait_for_marker(
+            RESULT_MARKER,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        receiver.wait(timeout=PROCESS_TIMEOUT_SECONDS)
+        receiver_output.join()
+        assert receiver.returncode == 0, f"Mooncake mixed receiver failed.\noutput:\n{receiver_output.output}"
+        assert result["matches"], (
+            f"Mooncake mixed receiver observed corrupted data.\nresult={result}\noutput:\n{receiver_output.output}"
+        )
+        print(
+            "Mooncake sparse-offload mixed batch verified: "
+            + json.dumps(
+                {
+                    "receiver_layout": ready["buffers"],
+                    "verification": result["buffers"],
+                },
+                sort_keys=True,
+            )
+        )
+    finally:
+        if receiver.poll() is None:
+            _stop_process(receiver, receiver_output)
+        else:
+            receiver_output.join()
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--role",
-        choices=("receiver", "sender"),
+        choices=(
+            "receiver",
+            "sender",
+            "mixed_receiver",
+            "mixed_sender",
+        ),
         required=True,
     )
     parser.add_argument("--target-host")
     parser.add_argument("--target-port", type=int)
     parser.add_argument("--target-address", type=int)
+    parser.add_argument("--target-metadata")
     return parser.parse_args()
 
 
@@ -360,6 +709,18 @@ if __name__ == "__main__":
     args = _parse_args()
     if args.role == "receiver":
         raise SystemExit(_run_receiver())
+    if args.role == "mixed_receiver":
+        raise SystemExit(_run_mixed_receiver())
+    if args.role == "mixed_sender":
+        if args.target_host is None or args.target_port is None or args.target_metadata is None:
+            raise SystemExit("mixed sender requires --target-host, --target-port, and --target-metadata")
+        raise SystemExit(
+            _run_mixed_sender(
+                target_host=args.target_host,
+                target_port=args.target_port,
+                target_metadata=json.loads(args.target_metadata),
+            )
+        )
     if args.target_host is None or args.target_port is None or args.target_address is None:
         raise SystemExit("sender requires --target-host, --target-port, and --target-address")
     raise SystemExit(
