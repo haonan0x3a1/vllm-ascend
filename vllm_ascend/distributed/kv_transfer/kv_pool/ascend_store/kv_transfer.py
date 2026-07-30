@@ -396,6 +396,8 @@ class KVTransferThread(threading.Thread):
             MmcDirect.COPY_G2L.value: "load(G2L)",
             MmcDirect.COPY_G2H.value: "load(G2H)",
             MmcDirect.COPY_H2G.value: "save(H2G)",
+            MmcDirect.COPY_L2GH.value: "save(L2GH)",
+            MmcDirect.COPY_GH2L.value: "load(GH2L)",
         }
         dir_name = direction_names.get(direction, f"dir{direction}")
         logger.debug(
@@ -475,7 +477,10 @@ class KVTransferThread(threading.Thread):
         transfer_groups = (
             (
                 True,
-                MmcDirect.COPY_H2G.value if is_save else MmcDirect.COPY_G2H.value,
+                # Swapped tensors are Host-backed but expose an NPU/SVM
+                # data_ptr, so their local endpoint is Device while the
+                # MemCache allocation remains Global Host DRAM.
+                MmcDirect.COPY_L2GH.value if is_save else MmcDirect.COPY_GH2L.value,
             ),
             (
                 False,

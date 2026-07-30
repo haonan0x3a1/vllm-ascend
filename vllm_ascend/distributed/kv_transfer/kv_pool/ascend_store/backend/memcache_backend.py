@@ -57,6 +57,8 @@ class MmcDirect(Enum):
     COPY_G2L = 1
     COPY_G2H = 2
     COPY_H2G = 3
+    COPY_L2GH = 4
+    COPY_GH2L = 5
 
 
 class MemcacheBackend(Backend):

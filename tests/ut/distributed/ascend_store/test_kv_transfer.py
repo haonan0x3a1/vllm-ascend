@@ -212,8 +212,8 @@ class TestKVTransferThread(unittest.TestCase):
         self.assertEqual(
             [call.args[3] for call in client.batch_copy.call_args_list],
             [
-                MmcDirect.COPY_H2G.value,
-                MmcDirect.COPY_H2G.value,
+                MmcDirect.COPY_L2GH.value,
+                MmcDirect.COPY_L2GH.value,
                 MmcDirect.COPY_L2G.value,
                 MmcDirect.COPY_L2G.value,
             ],
@@ -239,7 +239,7 @@ class TestKVTransferThread(unittest.TestCase):
         self.assertEqual(
             [call.args[3] for call in client.batch_copy.call_args_list],
             [
-                MmcDirect.COPY_G2H.value,
+                MmcDirect.COPY_GH2L.value,
                 MmcDirect.COPY_G2L.value,
             ],
         )
