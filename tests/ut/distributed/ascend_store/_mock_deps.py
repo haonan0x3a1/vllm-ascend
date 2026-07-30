@@ -387,6 +387,15 @@ _distributed_utils.get_decode_context_model_parallel_rank = MagicMock(  # type: 
 _distributed_utils.get_decode_context_model_parallel_world_size = MagicMock(  # type: ignore[attr-defined]
     return_value=1
 )
+
+
+def _all_gather_async(input, group, output=None, async_op=True):
+    """Mirror the single-rank contract used by attention imports in shared UT runs."""
+    del group, async_op
+    return (input if output is None else output), None
+
+
+_distributed_utils.all_gather_async = _all_gather_async  # type: ignore[attr-defined]
 sys.modules["vllm_ascend.distributed.utils"] = _distributed_utils
 
 _kv_transfer_init = _make_pkg("vllm_ascend.distributed.kv_transfer")

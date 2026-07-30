@@ -27,6 +27,17 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 )
 
 
+class TestAscendStoreMockDependencies(unittest.TestCase):
+    def test_distributed_utils_mock_covers_attention_import_contract(self):
+        from vllm_ascend.distributed.utils import all_gather_async
+
+        input_tensor = object()
+        gathered, handle = all_gather_async(input_tensor, MagicMock())
+
+        self.assertIs(gathered, input_tensor)
+        self.assertIsNone(handle)
+
+
 class TestKVPoolWorkerHelpers(unittest.TestCase):
     """Test the pure helper methods on KVPoolWorker without full init."""
 
