@@ -19,6 +19,8 @@ import threading
 import unittest
 from unittest.mock import MagicMock
 
+import numpy as np
+
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm.distributed.kv_events import BlockStored
@@ -30,15 +32,20 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     LoadSpec,
     PoolKey,
     ReqMeta,
+    SharedBlockData,
 )
 
 # isort: on
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import (
+    MmcDirect,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
     KVCacheStoreLayerRecvingThread,
     KVCacheStoreLayerSendingThread,
     KVCacheStoreRecvingThread,
     KVCacheStoreSendingThread,
     KVTransferThread,
+    LayerBatchBuilder,
 )
 
 
@@ -67,6 +74,53 @@ class FakeKey:
 
     def to_string(self):
         return self._val
+
+
+class TestLayerBatchBuilder(unittest.TestCase):
+    def test_build_addrs_marks_host_and_npu_caches_per_block(self):
+        token_database = MagicMock()
+        token_database.group_block_len = {
+            0: [10, 20, 30, 10, 20, 30],
+        }
+        token_database.group_kv_caches_base_addr = {
+            0: [1000, 2000, 3000, 4000, 5000, 6000],
+        }
+        token_database.group_block_stride = {
+            0: [100, 200, 300, 100, 200, 300],
+        }
+        builder = LayerBatchBuilder(
+            token_database,
+            my_key_index=0,
+            num_ranks_per_layer=1,
+            page_size_bytes=60,
+            num_layers=2,
+            num_host_caches_per_layer=2,
+        )
+        shared = SharedBlockData(
+            block_ids_arr=np.asarray([1, 2], dtype=np.int64),
+            block_gvas_arr=np.asarray([10000, 20000], dtype=np.int64),
+            req_ids=["r1"],
+            is_last_chunks=[True],
+        )
+
+        result = builder.build_addrs(shared, layer_id=1)
+
+        np.testing.assert_array_equal(
+            result.addr_array,
+            np.asarray([4100, 5200, 6300, 4200, 5400, 6600]),
+        )
+        np.testing.assert_array_equal(
+            result.size_array,
+            np.asarray([10, 20, 30, 10, 20, 30]),
+        )
+        np.testing.assert_array_equal(
+            result.gvas_array,
+            np.asarray([10060, 10070, 10090, 20060, 20070, 20090]),
+        )
+        np.testing.assert_array_equal(
+            result.host_array,
+            np.asarray([True, True, False, True, True, False]),
+        )
 
 
 class FakeTokenDatabase:
@@ -131,6 +185,83 @@ class TestKVTransferThread(unittest.TestCase):
             name="test",
         )
         return t, store
+
+    def test_batch_copy_mixed_memory_uses_host_and_device_directions(self):
+        client = MagicMock()
+        client.batch_copy.return_value = 0
+        thread = KVTransferThread.__new__(KVTransferThread)
+        thread.m_store = MagicMock(store=client)
+        thread.num_addrs_per_block = 3
+        gvas = np.asarray([100, 101, 102, 103, 104, 105], dtype=np.int64)
+        addrs = np.asarray([200, 201, 202, 203, 204, 205], dtype=np.int64)
+        sizes = np.asarray([10, 20, 30, 10, 20, 30], dtype=np.int64)
+        host_array = np.asarray([True, True, False, True, True, False])
+
+        result = thread._batch_copy_mixed_memory_with_limits(
+            gvas,
+            addrs,
+            sizes,
+            host_array,
+            is_save=True,
+            max_transfer_blocks=1,
+            max_transfer_bytes=0,
+            caches_per_layer=3,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [call.args[3] for call in client.batch_copy.call_args_list],
+            [
+                MmcDirect.COPY_H2G.value,
+                MmcDirect.COPY_H2G.value,
+                MmcDirect.COPY_L2G.value,
+                MmcDirect.COPY_L2G.value,
+            ],
+        )
+        self.assertEqual(client.batch_copy.call_args_list[0].args[0], [100, 101])
+        self.assertEqual(client.batch_copy.call_args_list[1].args[0], [103, 104])
+        self.assertEqual(client.batch_copy.call_args_list[2].args[0], [102])
+        self.assertEqual(client.batch_copy.call_args_list[3].args[0], [105])
+
+        client.reset_mock()
+        result = thread._batch_copy_mixed_memory_with_limits(
+            gvas,
+            addrs,
+            sizes,
+            host_array,
+            is_save=False,
+            max_transfer_blocks=0,
+            max_transfer_bytes=0,
+            caches_per_layer=3,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [call.args[3] for call in client.batch_copy.call_args_list],
+            [
+                MmcDirect.COPY_G2H.value,
+                MmcDirect.COPY_G2L.value,
+            ],
+        )
+
+    def test_batch_copy_mixed_memory_rejects_non_repeating_host_pattern(self):
+        thread = KVTransferThread.__new__(KVTransferThread)
+        thread.m_store = MagicMock(store=MagicMock())
+        thread.num_addrs_per_block = 3
+        values = np.arange(6, dtype=np.int64)
+        host_array = np.asarray([True, True, False, True, False, False])
+
+        with self.assertRaisesRegex(ValueError, "repeat the same pattern"):
+            thread._batch_copy_mixed_memory_with_limits(
+                values,
+                values,
+                values,
+                host_array,
+                is_save=True,
+                max_transfer_blocks=0,
+                max_transfer_bytes=0,
+                caches_per_layer=3,
+            )
 
     def test_add_request(self):
         t, _ = self._make_thread()

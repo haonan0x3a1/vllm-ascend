@@ -114,7 +114,9 @@ Using the same JSON on the producer is harmless.
 Use the dedicated layerwise proxy and memcache setup described in
 [Layerwise KV Pool](layerwise_kv_pool.md). The mixed cache tuple is transferred
 layer by layer: Full MLA KV targets swapped memory while the Indexer cache
-targets NPU memory.
+targets NPU memory. MemCache receives these entries in separate copy batches:
+Full MLA KV uses `H2G`/`G2H`, while the NPU-resident Indexer cache uses
+`L2G`/`G2L`.
 
 Layerwise memcache transfers request tails as request-scoped blocks in addition
 to hash-addressed full blocks. This covers prompts shorter than one block and

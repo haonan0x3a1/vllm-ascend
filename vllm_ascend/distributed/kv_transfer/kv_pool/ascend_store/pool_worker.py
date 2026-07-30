@@ -71,6 +71,7 @@ from vllm_ascend.memcache_comm_fence import (
 # read lease before batch_copy(G2L); the lease must cover the asynchronous
 # multi-layer load time.
 LAYERWISE_READ_LEASE_TTL_MS = 5 * 60 * 1000
+SPARSE_HOST_FULL_KV_CACHES_PER_LAYER = 2
 
 
 class KVPoolWorker:
@@ -159,6 +160,7 @@ class KVPoolWorker:
         self.h2d_stagger_us = int(extra_config.get("h2d_stagger_us", 0))
         self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))
         self.layerwise_max_transfer_bytes = int(extra_config.get("layerwise_max_transfer_bytes", 0))
+        self.num_host_caches_per_layer = self._infer_num_host_caches_per_layer(vllm_config)
 
         logger.info(
             "use_hybrid: %s, use_mamba: %s, num_kv_cache_groups: %s, hash_block_size: %s, lcm_block_size: %s",
@@ -168,6 +170,18 @@ class KVPoolWorker:
             self.hash_block_size,
             self.lcm_block_size,
         )
+
+    @staticmethod
+    def _infer_num_host_caches_per_layer(vllm_config: VllmConfig) -> int:
+        additional_config = vllm_config.additional_config
+        if not isinstance(additional_config, dict):
+            return 0
+        sparse_offload_config = additional_config.get("sparse_kv_offload")
+        if not isinstance(sparse_offload_config, dict):
+            return 0
+        if sparse_offload_config.get("enabled") is True and sparse_offload_config.get("mode") == "host":
+            return SPARSE_HOST_FULL_KV_CACHES_PER_LAYER
+        return 0
 
     def _init_key_head_config(self, model_config, parallel_config) -> None:
         self.current_layer = 0
@@ -319,6 +333,7 @@ class KVPoolWorker:
                     self.sync_save_events,
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
+                    self.num_host_caches_per_layer,
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
@@ -359,6 +374,7 @@ class KVPoolWorker:
                     self.h2d_stagger_us,
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
+                    self.num_host_caches_per_layer,
                 )
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
@@ -568,6 +584,23 @@ class KVPoolWorker:
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache_tuple = self._as_cache_tuple(first_kv_cache_tuple)
         first_kv_cache = first_kv_cache_tuple[0]
+        if len(first_kv_cache_tuple) < self.num_host_caches_per_layer:
+            raise RuntimeError(
+                "Sparse KV offload host mode expects the MLA latent and RoPE "
+                "Full-KV caches to be the first two entries in every layer's "
+                f"cache tuple, got {len(first_kv_cache_tuple)} entries."
+            )
+        if self.use_gva_layerwise:
+            expected_caches_per_layer = len(first_kv_cache_tuple)
+            for layer_name, cache_or_caches in kv_caches.items():
+                caches_per_layer = len(self._as_cache_tuple(cache_or_caches))
+                if caches_per_layer != expected_caches_per_layer:
+                    raise RuntimeError(
+                        "Layerwise GVA transfer requires the same cache tuple "
+                        f"layout for every layer; {layer_name} has "
+                        f"{caches_per_layer} entries, expected "
+                        f"{expected_caches_per_layer}."
+                    )
 
         self.num_blocks = (
             self.kv_cache_config.num_blocks if self.kv_cache_config is not None else first_kv_cache.shape[0]

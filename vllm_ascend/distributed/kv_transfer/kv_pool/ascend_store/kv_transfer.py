@@ -14,6 +14,9 @@ from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import (
+    MmcDirect,
+)
 
 # isort: off
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
@@ -44,6 +47,7 @@ class LayerBatchBuilder:
         num_ranks_per_layer: int,
         page_size_bytes: int,
         num_layers: int,
+        num_host_caches_per_layer: int = 0,
     ) -> None:
         self.my_key_index = my_key_index
         self.num_ranks_per_layer = num_ranks_per_layer
@@ -61,8 +65,20 @@ class LayerBatchBuilder:
         # total length divided by the number of layers (mirrors
         # ChunkedTokenDatabase caches_per_layer computation).
         self._caches_per_layer = max(1, self._block_len_np.shape[0] // max(1, num_layers))
+        if not 0 <= num_host_caches_per_layer <= self._caches_per_layer:
+            raise ValueError(
+                "num_host_caches_per_layer must be between 0 and the number "
+                f"of caches per layer ({self._caches_per_layer}), got "
+                f"{num_host_caches_per_layer}."
+            )
+        self._cache_is_host_per_layer = np.zeros(self._caches_per_layer, dtype=np.bool_)
+        self._cache_is_host_per_layer[:num_host_caches_per_layer] = True
         self._block_ids_buf: np.ndarray | None = None
         self._block_gvas_buf: np.ndarray | None = None
+
+    @property
+    def caches_per_layer(self) -> int:
+        return self._caches_per_layer
 
     def _ensure_buf(self, capacity: int) -> tuple[np.ndarray, np.ndarray]:
         if self._block_ids_buf is None or len(self._block_ids_buf) < capacity:
@@ -98,7 +114,7 @@ class LayerBatchBuilder:
         block_ids_arr: np.ndarray,
         base_gvas_arr: np.ndarray,
         layer_id: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         caches_per_layer = self._caches_per_layer
         # group_* arrays are laid out flat as [layer0_caches..., layer1_caches...];
         # slice the per-layer window for ``layer_id``. Using the full length as the
@@ -129,11 +145,13 @@ class LayerBatchBuilder:
         addr_arr = layer_base_addrs[None, :] + block_ids_arr[:, None] * layer_block_stride[None, :]
         size_arr = np.broadcast_to(layer_block_len, addr_arr.shape)
         gvas_arr = base_gvas_arr[:, None] + rank_layer_offset + layer_inner_offsets[None, :]
+        host_arr = np.broadcast_to(self._cache_is_host_per_layer, addr_arr.shape)
 
         return (
             addr_arr.ravel(),
             size_arr.ravel(),
             gvas_arr.ravel(),
+            host_arr.ravel(),
         )
 
     @staticmethod
@@ -220,7 +238,7 @@ class LayerBatchBuilder:
         layer_id: int,
     ) -> LayerBatchReqMeta:
         """Compute per-layer addresses from pre-computed shared block data."""
-        addr_array, size_array, gvas_array = self._build_transfer_arrays(
+        addr_array, size_array, gvas_array, host_array = self._build_transfer_arrays(
             shared.block_ids_arr, shared.block_gvas_arr, layer_id
         )
 
@@ -231,6 +249,7 @@ class LayerBatchBuilder:
             addr_array=addr_array,
             size_array=size_array,
             gvas_array=gvas_array,
+            host_array=host_array,
             load_keys=shared.load_keys,
         )
 
@@ -367,12 +386,18 @@ class KVTransferThread(threading.Thread):
         direction: int,
         max_transfer_blocks: int,
         max_transfer_bytes: int,
+        num_addrs_per_block: int | None = None,
     ) -> int:
         if len(gvas) == 0:
             return 0
 
-        # direction: 0/SMEMB_COPY_L2G = save (write), 1/SMEMB_COPY_G2L = load (read)
-        dir_name = "save(L2G)" if direction == 0 else "load(G2L)" if direction == 1 else f"dir{direction}"
+        direction_names = {
+            MmcDirect.COPY_L2G.value: "save(L2G)",
+            MmcDirect.COPY_G2L.value: "load(G2L)",
+            MmcDirect.COPY_G2H.value: "load(G2H)",
+            MmcDirect.COPY_H2G.value: "save(H2G)",
+        }
+        dir_name = direction_names.get(direction, f"dir{direction}")
         logger.debug(
             "[KVPOOL] batch_copy %s gvas=%d total_bytes=%d",
             dir_name,
@@ -382,7 +407,8 @@ class KVTransferThread(threading.Thread):
 
         max_transfer_addrs = 0
         if max_transfer_blocks > 0:
-            max_transfer_addrs = max_transfer_blocks * self.num_addrs_per_block
+            addrs_per_block = self.num_addrs_per_block if num_addrs_per_block is None else num_addrs_per_block
+            max_transfer_addrs = max_transfer_blocks * addrs_per_block
         if max_transfer_addrs <= 0:
             max_transfer_addrs = len(gvas)
 
@@ -409,6 +435,68 @@ class KVTransferThread(threading.Thread):
             )
             if res != 0:
                 logger.error("[KVPOOL] batch_copy %s FAILED res=%d", dir_name, res)
+                return res
+        return 0
+
+    def _batch_copy_mixed_memory_with_limits(
+        self,
+        gvas: np.ndarray,
+        addrs: np.ndarray,
+        sizes: np.ndarray,
+        host_array: np.ndarray,
+        *,
+        is_save: bool,
+        max_transfer_blocks: int,
+        max_transfer_bytes: int,
+        caches_per_layer: int,
+    ) -> int:
+        if not (gvas.shape == addrs.shape == sizes.shape == host_array.shape):
+            raise ValueError(
+                "Mixed-memory batch_copy metadata must have identical shapes, "
+                f"got gvas={gvas.shape}, addrs={addrs.shape}, "
+                f"sizes={sizes.shape}, host={host_array.shape}."
+            )
+        if host_array.dtype != np.bool_:
+            raise TypeError(f"Mixed-memory batch_copy host metadata must be boolean, got {host_array.dtype}.")
+        if len(gvas) == 0:
+            return 0
+        if caches_per_layer <= 0 or len(gvas) % caches_per_layer != 0:
+            raise ValueError(
+                "Mixed-memory batch_copy requires a positive caches_per_layer "
+                f"that divides the transfer length, got caches_per_layer="
+                f"{caches_per_layer}, entries={len(gvas)}."
+            )
+
+        first_block_host = host_array[:caches_per_layer]
+        expected_host = np.tile(first_block_host, len(gvas) // caches_per_layer)
+        if not np.array_equal(host_array, expected_host):
+            raise ValueError("Mixed-memory batch_copy host metadata must repeat the same pattern for every block.")
+
+        transfer_groups = (
+            (
+                True,
+                MmcDirect.COPY_H2G.value if is_save else MmcDirect.COPY_G2H.value,
+            ),
+            (
+                False,
+                MmcDirect.COPY_L2G.value if is_save else MmcDirect.COPY_G2L.value,
+            ),
+        )
+        for is_host, direction in transfer_groups:
+            mask = host_array if is_host else ~host_array
+            addrs_per_block = int(np.count_nonzero(mask[:caches_per_layer]))
+            if addrs_per_block == 0:
+                continue
+            res = self._batch_copy_with_limits(
+                gvas[mask],
+                addrs[mask],
+                sizes[mask],
+                direction,
+                max_transfer_blocks,
+                max_transfer_bytes,
+                num_addrs_per_block=addrs_per_block,
+            )
+            if res != 0:
                 return res
         return 0
 
@@ -1207,6 +1295,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         sync_save_events: list[torch.npu.Event],
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
+        num_host_caches_per_layer: int = 0,
     ):
         super().__init__(
             m_store,
@@ -1232,6 +1321,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             num_ranks_per_layer,
             page_size_bytes,
             num_layers,
+            num_host_caches_per_layer,
         )
         self._layer_errors: dict[int, str] = {}
         self._layer_errors_lock = threading.Lock()
@@ -1321,13 +1411,15 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             size_array.tolist(),
         )
         self.sync_save_events[layer_id].synchronize()
-        res = self._batch_copy_with_limits(
+        res = self._batch_copy_mixed_memory_with_limits(
             gvas_array,
             addr_array,
             size_array,
-            0,
-            self.max_transfer_blocks,
-            self.max_transfer_bytes,
+            req_meta.host_array,
+            is_save=True,
+            max_transfer_blocks=self.max_transfer_blocks,
+            max_transfer_bytes=self.max_transfer_bytes,
+            caches_per_layer=self.layer_batch_builder.caches_per_layer,
         )
         if res != 0:
             error_message = f"Layerwise KV save batch_copy failed for layer {layer_id} with return code {res}."
@@ -1367,6 +1459,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         h2d_stagger_us: int = 0,
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
+        num_host_caches_per_layer: int = 0,
     ):
         super().__init__(
             m_store,
@@ -1391,6 +1484,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             num_ranks_per_layer,
             page_size_bytes,
             num_layers,
+            num_host_caches_per_layer,
         )
         self._layer_errors: dict[int, str] = {}
         self._layer_errors_lock = threading.Lock()
@@ -1497,13 +1591,15 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         addr_array = req_meta.addr_array
         size_array = req_meta.size_array
         self._stagger_h2d_submit(layer_id)
-        res = self._batch_copy_with_limits(
+        res = self._batch_copy_mixed_memory_with_limits(
             gvas_array,
             addr_array,
             size_array,
-            1,
-            self.max_transfer_blocks,
-            self.max_transfer_bytes,
+            req_meta.host_array,
+            is_save=False,
+            max_transfer_blocks=self.max_transfer_blocks,
+            max_transfer_bytes=self.max_transfer_bytes,
+            caches_per_layer=self.layer_batch_builder.caches_per_layer,
         )
         if res != 0:
             error_message = f"Layerwise KV load batch_copy failed for layer {layer_id} with return code {res}."

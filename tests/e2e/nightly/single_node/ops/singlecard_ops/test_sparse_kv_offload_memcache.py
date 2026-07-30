@@ -25,8 +25,8 @@ from vllm.config import ParallelConfig
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import (
     MemcacheBackend,
-    MmcDirect,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import KVTransferThread
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 RUN_MEMCACHE_INTEGRATION_TEST = os.getenv("VLLM_ASCEND_RUN_MEMCACHE_INTEGRATION_TEST") == "1"
@@ -98,6 +98,30 @@ def _make_transfer_arrays(
     return gvas, local_addrs, sizes
 
 
+def _copy_mixed_cache(
+    backend: MemcacheBackend,
+    gvas: np.ndarray,
+    addrs: np.ndarray,
+    sizes: np.ndarray,
+    *,
+    is_save: bool,
+) -> int:
+    transfer = KVTransferThread.__new__(KVTransferThread)
+    transfer.m_store = backend
+    transfer.num_addrs_per_block = len(gvas)
+    host_array = np.asarray([True, True, False], dtype=np.bool_)
+    return transfer._batch_copy_mixed_memory_with_limits(
+        gvas,
+        addrs,
+        sizes,
+        host_array,
+        is_save=is_save,
+        max_transfer_blocks=0,
+        max_transfer_bytes=0,
+        caches_per_layer=len(host_array),
+    )
+
+
 def test_memcache_round_trip_mixed_swapped_and_npu_kv_cache():
     """Verify the exact mixed-memory tuple used by host sparse KV offload."""
     MemcacheBackend.validate_gva_layerwise_api()
@@ -149,37 +173,40 @@ def test_memcache_round_trip_mixed_swapped_and_npu_kv_cache():
     assert len(allocated_gvas) == 1
     assert allocated_gvas[0] > 0
     assert backend.store is not None
-
-    source_gvas, source_addrs, source_sizes = _make_transfer_arrays(
-        allocated_gvas[0],
-        source,
-    )
-    save_result = backend.store.batch_copy(
-        source_gvas,
-        source_addrs,
-        source_sizes,
-        MmcDirect.COPY_L2G.value,
-    )
-    assert save_result == 0
-
-    key_info = backend.batch_get_key_info([key])
-    assert len(key_info) == 1
-    assert key_info[0].size() > 0
-    lease_result = backend.batch_add_lease([key])
-    assert all(result == 0 for result in lease_result)
-
+    lease_acquired = False
     try:
+        source_gvas, source_addrs, source_sizes = _make_transfer_arrays(
+            allocated_gvas[0],
+            source,
+        )
+        save_result = _copy_mixed_cache(
+            backend,
+            source_gvas,
+            source_addrs,
+            source_sizes,
+            is_save=True,
+        )
+        assert save_result == 0
+
+        key_info = backend.batch_get_key_info([key])
+        assert len(key_info) == 1
+        assert key_info[0].size() > 0
+        lease_result = backend.batch_add_lease([key])
+        assert all(result == 0 for result in lease_result)
+        lease_acquired = True
+
         load_gva_list = key_info[0].gva_list()
         assert load_gva_list
         destination_gvas, destination_addrs, destination_sizes = _make_transfer_arrays(
             load_gva_list[0],
             destination,
         )
-        load_result = backend.store.batch_copy(
+        load_result = _copy_mixed_cache(
+            backend,
             destination_gvas,
             destination_addrs,
             destination_sizes,
-            MmcDirect.COPY_G2L.value,
+            is_save=False,
         )
         assert load_result == 0
         torch.npu.synchronize()
@@ -187,4 +214,6 @@ def test_memcache_round_trip_mixed_swapped_and_npu_kv_cache():
         for expected, actual in zip(source, destination):
             torch.testing.assert_close(actual.cpu(), expected.cpu())
     finally:
-        backend.batch_remove_lease([key])
+        if lease_acquired:
+            backend.batch_remove_lease([key])
+        backend.store.remove(key)

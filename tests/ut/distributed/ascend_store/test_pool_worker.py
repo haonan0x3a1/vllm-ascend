@@ -62,6 +62,30 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         result = cls.check_all_layers_exists(None, [0, 0, 0], 3)
         self.assertEqual(result, [0])
 
+    def test_infer_num_host_caches_per_layer_for_sparse_host_mode(self):
+        cls = self._make_worker_class()
+        config = MagicMock()
+        config.additional_config = {
+            "sparse_kv_offload": {
+                "enabled": True,
+                "mode": "host",
+            }
+        }
+
+        self.assertEqual(cls._infer_num_host_caches_per_layer(config), 2)
+
+    def test_infer_num_host_caches_per_layer_ignores_mirror_mode(self):
+        cls = self._make_worker_class()
+        config = MagicMock()
+        config.additional_config = {
+            "sparse_kv_offload": {
+                "enabled": True,
+                "mode": "mirror",
+            }
+        }
+
+        self.assertEqual(cls._infer_num_host_caches_per_layer(config), 0)
+
     def test_find_all_continuous_hit_positions_found(self):
         cls = self._make_worker_class()
         arr = [[1, 1, 0], [1, 0, 1]]
