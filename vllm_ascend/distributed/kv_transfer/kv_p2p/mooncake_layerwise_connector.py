@@ -605,20 +605,23 @@ class KVCacheRecvingLayerThread(threading.Thread):
             return
 
         final_kv = self.sparse_host_final_kv_caches[layer_name]
-        block_ids = torch.tensor(
-            sorted(set(remote_block_ids)),
-            dtype=torch.int64,
-            device=self.sparse_host_staging_kv[0].device,
-        )
-        for staging, final in zip(
-            self.sparse_host_staging_kv[:SPARSE_HOST_CACHE_TENSOR_COUNT],
-            final_kv[:SPARSE_HOST_CACHE_TENSOR_COUNT],
-        ):
-            final.index_copy_(
-                0,
-                block_ids,
-                staging.index_select(0, block_ids),
-            )
+        staging_kv = self.sparse_host_staging_kv[:SPARSE_HOST_CACHE_TENSOR_COUNT]
+        final_full_kv = final_kv[:SPARSE_HOST_CACHE_TENSOR_COUNT]
+        num_blocks = staging_kv[0].shape[0]
+        block_ids = sorted(set(remote_block_ids))
+        for block_id in block_ids:
+            if block_id < 0 or block_id >= num_blocks:
+                raise ValueError(
+                    f"Remote block id {block_id} is outside sparse Host staging capacity [0, {num_blocks})."
+                )
+            for staging, final in zip(staging_kv, final_full_kv):
+                # Use the same basic-slice copy path already exercised by the
+                # sparse-offload NPU tests. Block-level index_copy_ is not a
+                # supported NPU-to-swapped-memory primitive on all runtimes.
+                final[block_id].copy_(
+                    staging[block_id],
+                    non_blocking=False,
+                )
         torch.npu.synchronize()
 
     def get_and_clear_done_requests(self) -> set[str]:

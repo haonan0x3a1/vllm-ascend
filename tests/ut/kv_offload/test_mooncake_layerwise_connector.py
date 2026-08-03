@@ -521,6 +521,32 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "without registered"):
             th.persist_staged_layer("layer0", [0])
 
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.torch.npu.synchronize")
+    def test_persist_staged_layer_rejects_out_of_range_block(self, mock_sync):
+        staging = (
+            torch.zeros((4, 4), dtype=torch.float32),
+            torch.zeros((4, 4), dtype=torch.float32),
+        )
+        final = (
+            torch.zeros((4, 4), dtype=torch.float32),
+            torch.zeros((4, 4), dtype=torch.float32),
+        )
+        th = KVCacheRecvingLayerThread(
+            tp_rank=0,
+            side_channel_port=5555,
+            tp_size=1,
+            pd_head_ratio=1,
+            local_engine_id="engineA",
+            metadata=self.meta,
+            ready_event=self.ready_event,
+            sparse_host_final_kv_caches={"layer0": final},
+            sparse_host_staging_kv=staging,
+        )
+
+        with self.assertRaisesRegex(ValueError, "outside sparse Host staging capacity"):
+            th.persist_staged_layer("layer0", [4])
+        mock_sync.assert_not_called()
+
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.logger")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_ip", return_value="127.0.0.1")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.make_zmq_socket")

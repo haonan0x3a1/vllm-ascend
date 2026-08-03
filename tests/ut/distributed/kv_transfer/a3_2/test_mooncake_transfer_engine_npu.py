@@ -890,14 +890,20 @@ def _run_connector_persist() -> int:
         sparse_host_staging_kv=staging,
     )
     receiver.persist_staged_layer("layer0", [1, 3])
+    verification = {
+        "full_nope_block_1": torch.equal(final[0][1].cpu(), staging[0][1].cpu()),
+        "full_nope_block_3": torch.equal(final[0][3].cpu(), staging[0][3].cpu()),
+        "full_rope_block_1": torch.equal(final[1][1].cpu(), staging[1][1].cpu()),
+        "full_rope_block_3": torch.equal(final[1][3].cpu(), staging[1][3].cpu()),
+        "full_nope_block_0_untouched": bool(torch.all(final[0][0].cpu() == -1)),
+        "full_nope_block_2_untouched": bool(torch.all(final[0][2].cpu() == -1)),
+        "full_rope_block_0_untouched": bool(torch.all(final[1][0].cpu() == -1)),
+        "full_rope_block_2_untouched": bool(torch.all(final[1][2].cpu() == -1)),
+    }
     result = {
-        "matches": bool(
-            torch.equal(final[0][[1, 3]].cpu(), staging[0][[1, 3]].cpu())
-            and torch.equal(final[1][[1, 3]].cpu(), staging[1][[1, 3]].cpu())
-            and torch.all(final[0][[0, 2]].cpu() == -1)
-            and torch.all(final[1][[0, 2]].cpu() == -1)
-        ),
+        "matches": all(verification.values()),
         "staging_base_alignment_mod": staging[0].data_ptr() % ALIGNMENT_BYTES,
+        "verification": verification,
     }
     print(RESULT_MARKER + json.dumps(result, sort_keys=True), flush=True)
     del receiver, final, staging, combined_staging, raw
