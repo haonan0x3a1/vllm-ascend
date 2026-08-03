@@ -28,6 +28,7 @@ import argparse
 import gc
 import json
 import queue
+import socket
 import subprocess
 import sys
 import threading
@@ -57,6 +58,10 @@ STAGED_BUFFER_SPECS = (
 )
 FULL_KV_BUFFER_NAMES = ("full_nope", "full_rope")
 INDEXER_BUFFER_NAME = "indexer"
+CONNECTOR_BLOCK_VALUES = (
+    (-1, 0x11, -1, 0x33),
+    (-1, 0x22, -1, 0x44),
+)
 MIN_MOONCAKE_VERSION = Version("0.3.12.post1")
 PROCESS_TIMEOUT_SECONDS = 60
 READY_MARKER = "MOONCAKE_NPU_SMOKE_READY="
@@ -146,6 +151,79 @@ def _allocate_aligned_buffer(
         raise RuntimeError(f"Buffer address {buffer.data_ptr():#x} is not 2 MiB aligned.")
     buffer.fill_(fill_value)
     return raw, buffer
+
+
+def _allocate_connector_staging(
+    torch_module,
+    *,
+    device_index: int,
+    fill_value: int,
+):
+    raw, combined = _allocate_aligned_buffer(
+        torch_module,
+        device_index=device_index,
+        fill_value=fill_value,
+    )
+    staging = (
+        combined[: BUFFER_BYTES // 2].view(4, -1),
+        combined[BUFFER_BYTES // 2 :].view(4, -1),
+    )
+    return raw, combined, staging
+
+
+def _fill_connector_payload(staging) -> None:
+    for tensor, expected_blocks in zip(staging, CONNECTOR_BLOCK_VALUES):
+        for block_id, value in enumerate(expected_blocks):
+            tensor[block_id].fill_(value)
+
+
+def _verify_connector_staging_and_final(torch_module, staging, final) -> dict[str, Any]:
+    """Read swapped Full KV through NPU and verify every physical block."""
+    final_npu_copy = tuple(torch_module.empty_like(tensor) for tensor in staging)
+    for npu_copy, swapped_tensor in zip(final_npu_copy, final):
+        # Reading a framework swapped tensor directly with .cpu() can enter
+        # devmm_h2h_copy and segfault on the validated CANN runtime. Mirror the
+        # production Gather direction by restoring it to NPU first.
+        npu_copy.copy_(swapped_tensor, non_blocking=False)
+    torch_module.npu.synchronize()
+
+    verification: dict[str, bool] = {}
+    for tensor_name, staging_tensor, final_tensor, expected_blocks in zip(
+        FULL_KV_BUFFER_NAMES,
+        staging,
+        final_npu_copy,
+        CONNECTOR_BLOCK_VALUES,
+    ):
+        staging_cpu = staging_tensor.cpu()
+        final_cpu = final_tensor.cpu()
+        for block_id, expected_value in enumerate(expected_blocks):
+            verification[f"{tensor_name}_staging_block_{block_id}"] = bool(
+                torch_module.all(staging_cpu[block_id] == expected_value)
+            )
+            verification[f"{tensor_name}_final_block_{block_id}"] = bool(
+                torch_module.all(final_cpu[block_id] == expected_value)
+            )
+    return verification
+
+
+def _allocate_connector_final(torch_module, torch_npu_module, staging, *, device_index: int):
+    final = tuple(
+        torch_npu_module.empty_with_swapped_memory(
+            tensor.shape,
+            dtype=tensor.dtype,
+            device=torch_module.device(f"npu:{device_index}"),
+        )
+        for tensor in staging
+    )
+    for tensor in final:
+        tensor.fill_(-1)
+    return final
+
+
+def _find_free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        return int(sock.getsockname()[1])
 
 
 def _allocate_mixed_buffer(
@@ -839,33 +917,18 @@ def _run_connector_persist() -> int:
     )
 
     torch.npu.set_device(0)
-    raw, combined_staging = _allocate_aligned_buffer(
+    raw, combined_staging, staging = _allocate_connector_staging(
         torch,
         device_index=0,
         fill_value=0,
     )
-    staging = (
-        combined_staging[: BUFFER_BYTES // 2].view(4, -1),
-        combined_staging[BUFFER_BYTES // 2 :].view(4, -1),
+    _fill_connector_payload(staging)
+    final = _allocate_connector_final(
+        torch,
+        torch_npu,
+        staging,
+        device_index=0,
     )
-    staging[0][1].fill_(0x11)
-    staging[1][1].fill_(0x22)
-    staging[0][3].fill_(0x33)
-    staging[1][3].fill_(0x44)
-    final = (
-        torch_npu.empty_with_swapped_memory(
-            staging[0].shape,
-            dtype=torch.int8,
-            device=torch.device("npu:0"),
-        ),
-        torch_npu.empty_with_swapped_memory(
-            staging[1].shape,
-            dtype=torch.int8,
-            device=torch.device("npu:0"),
-        ),
-    )
-    for tensor in final:
-        tensor.fill_(-1)
 
     metadata = MooncakeAgentMetadata(
         te_rpc_port=0,
@@ -890,33 +953,230 @@ def _run_connector_persist() -> int:
         sparse_host_staging_kv=staging,
     )
     receiver.persist_staged_layer("layer0", [1, 3])
-    final_npu_copy = tuple(torch.empty_like(tensor) for tensor in staging)
-    for npu_copy, swapped_tensor in zip(final_npu_copy, final):
-        # Reading a framework swapped tensor directly with .cpu() can enter
-        # devmm_h2h_copy and segfault on the validated CANN runtime. Mirror the
-        # production Gather direction by restoring it to NPU first.
-        npu_copy.copy_(swapped_tensor, non_blocking=False)
-    torch.npu.synchronize()
-    verification = {
-        "full_nope_block_1": torch.equal(final_npu_copy[0][1].cpu(), staging[0][1].cpu()),
-        "full_nope_block_3": torch.equal(final_npu_copy[0][3].cpu(), staging[0][3].cpu()),
-        "full_rope_block_1": torch.equal(final_npu_copy[1][1].cpu(), staging[1][1].cpu()),
-        "full_rope_block_3": torch.equal(final_npu_copy[1][3].cpu(), staging[1][3].cpu()),
-        "full_nope_block_0_untouched": bool(torch.all(final_npu_copy[0][0].cpu() == -1)),
-        "full_nope_block_2_untouched": bool(torch.all(final_npu_copy[0][2].cpu() == -1)),
-        "full_rope_block_0_untouched": bool(torch.all(final_npu_copy[1][0].cpu() == -1)),
-        "full_rope_block_2_untouched": bool(torch.all(final_npu_copy[1][2].cpu() == -1)),
-    }
+    verification = _verify_connector_staging_and_final(torch, staging, final)
     result = {
         "matches": all(verification.values()),
         "staging_base_alignment_mod": staging[0].data_ptr() % ALIGNMENT_BYTES,
         "verification": verification,
     }
     print(RESULT_MARKER + json.dumps(result, sort_keys=True), flush=True)
-    del receiver, final_npu_copy, final, staging, combined_staging, raw
+    del receiver, final, staging, combined_staging, raw
     gc.collect()
     torch.npu.synchronize()
     return 0 if result["matches"] else 1
+
+
+def _run_connector_protocol_receiver() -> int:
+    """Run the production layer receiver and persist its staged Full KV."""
+    import gc
+    from types import SimpleNamespace
+
+    import torch_npu
+
+    import vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector as connector_module
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+        KVCacheRecvingLayerThread,
+        LayerMetadata,
+        MooncakeAgentMetadata,
+    )
+
+    torch, engine, host = _initialize_engine(device_index=1)
+    raw, combined_staging, staging = _allocate_connector_staging(
+        torch,
+        device_index=1,
+        fill_value=-1,
+    )
+    final = _allocate_connector_final(
+        torch,
+        torch_npu,
+        staging,
+        device_index=1,
+    )
+    registered = False
+    unregister_result = 0
+    receiver = None
+    try:
+        _register_buffer(
+            engine,
+            combined_staging,
+            memory_kind="npu",
+            device_index=1,
+        )
+        registered = True
+        layer_metadata = LayerMetadata(
+            tensor_group_idx=[0, 0],
+            kv_caches_base_addr=[tensor.data_ptr() for tensor in staging],
+            block_len=[tensor[0].nbytes for tensor in staging],
+            block_size_scale=[1, 1],
+        )
+        side_channel_port = _find_free_tcp_port()
+        ready_event = threading.Event()
+        connector_module.get_world_group = lambda: SimpleNamespace(local_rank=1)
+        receiver = KVCacheRecvingLayerThread(
+            tp_rank=0,
+            side_channel_port=side_channel_port,
+            tp_size=1,
+            pd_head_ratio=1,
+            local_engine_id="connector-protocol-receiver",
+            metadata=MooncakeAgentMetadata(
+                te_rpc_port=engine.get_rpc_port(),
+                layer_metadata={"layer0": layer_metadata},
+            ),
+            ready_event=ready_event,
+            sparse_host_final_kv_caches={"layer0": final},
+            sparse_host_staging_kv=staging,
+        )
+        receiver.start()
+        if not ready_event.wait(timeout=5):
+            raise TimeoutError("Mooncake connector receiver side channel did not become ready.")
+        print(
+            READY_MARKER
+            + json.dumps(
+                {
+                    "host": host,
+                    "side_channel_port": side_channel_port,
+                    "te_rpc_port": engine.get_rpc_port(),
+                    "layer_metadata": {
+                        "tensor_group_idx": layer_metadata.tensor_group_idx,
+                        "kv_caches_base_addr": layer_metadata.kv_caches_base_addr,
+                        "block_len": layer_metadata.block_len,
+                        "block_size_scale": layer_metadata.block_size_scale,
+                    },
+                }
+            ),
+            flush=True,
+        )
+
+        command = sys.stdin.readline().strip()
+        if command != "VERIFY":
+            raise RuntimeError(f"Connector protocol receiver expected VERIFY, got {command!r}.")
+        verification = _verify_connector_staging_and_final(torch, staging, final)
+        result = {
+            "matches": all(verification.values()),
+            "verification": verification,
+        }
+        print(RESULT_MARKER + json.dumps(result, sort_keys=True), flush=True)
+        return 0 if result["matches"] else 1
+    finally:
+        torch.npu.synchronize()
+        if registered:
+            unregister_result = engine.unregister_memory(combined_staging.data_ptr())
+        del receiver, engine, final, staging, combined_staging, raw
+        gc.collect()
+        if unregister_result != 0:
+            raise RuntimeError(f"Connector receiver memory unregistration failed: result={unregister_result}")
+
+
+def _run_connector_protocol_sender(
+    *,
+    target_host: str,
+    target_side_channel_port: int,
+    target_te_rpc_port: int,
+    target_metadata: dict[str, Any],
+) -> int:
+    """Run the production layer sender through transfer, signal, and ACK."""
+    import gc
+    from types import SimpleNamespace
+
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+        KVCacheSendingLayerThread,
+        LayerMetadata,
+        MooncakeLayerwiseConnectorWorker,
+        ReqMeta,
+        SendTask,
+    )
+
+    torch, engine, _ = _initialize_engine(device_index=0)
+    raw, combined_staging, staging = _allocate_connector_staging(
+        torch,
+        device_index=0,
+        fill_value=-1,
+    )
+    _fill_connector_payload(staging)
+    registered = False
+    unregister_result = 0
+    try:
+        _register_buffer(
+            engine,
+            combined_staging,
+            memory_kind="npu",
+            device_index=0,
+        )
+        registered = True
+        local_layer_metadata = LayerMetadata(
+            tensor_group_idx=[0, 0],
+            kv_caches_base_addr=[tensor.data_ptr() for tensor in staging],
+            block_len=[tensor[0].nbytes for tensor in staging],
+            block_size_scale=[1, 1],
+        )
+        remote_layer_metadata = LayerMetadata(**target_metadata)
+        signal_worker = object.__new__(MooncakeLayerwiseConnectorWorker)
+        signal_worker.layer_ack_timeout = 10.0
+        sender = KVCacheSendingLayerThread(
+            engine=engine,
+            vllm_config=SimpleNamespace(
+                cache_config=SimpleNamespace(mamba_cache_mode=None),
+                speculative_config=None,
+            ),
+            kv_cache_config=SimpleNamespace(),
+            kv_cache_specs=[object()],
+            attn_resharding_group_idx=set(),
+            total_layers=1,
+            ready_event=threading.Event(),
+            tp_size=1,
+            tp_rank=0,
+            pd_head_ratio=1,
+            num_head_replica=1,
+            layer_metadata={"layer0": local_layer_metadata},
+            use_mla=True,
+            use_attn_mamba_hybrid=False,
+            k_buffer=None,
+            v_buffer=None,
+            enable_kv_quant=False,
+            enable_c8_quant=False,
+            resharding_stream=None,
+            layer_callback_func=signal_worker.send_layer_staged_signal,
+        )
+        req_meta = ReqMeta(
+            local_block_ids=[[1, 3]],
+            token_ids=None,
+            remote_block_ids=[[1, 3]],
+            remote_block_size=[[4]],
+            remote_engine_id="connector-protocol-receiver",
+            remote_host=target_host,
+            remote_port=target_side_channel_port,
+            remote_te_rpc_port=target_te_rpc_port,
+            remote_layer_metadata={"layer0": remote_layer_metadata},
+            metaserver=None,
+            remote_tp_size=1,
+            remote_pcp_size=1,
+            remote_dcp_size=1,
+        )
+        completion_event = threading.Event()
+        send_task = SendTask(
+            send_request={"connector-protocol123456789": req_meta},
+            wait_event=SimpleNamespace(synchronize=torch.npu.synchronize),
+            layer_idx=0,
+            layer_name="layer0",
+            group_rearrange_block_ids=[[]],
+            completion_event=completion_event,
+        )
+        sender._handle_request(send_task)
+        result = {
+            "acknowledged": completion_event.is_set(),
+            "error": None if send_task.error is None else str(send_task.error),
+            "source_alignment_mod": staging[0].data_ptr() % ALIGNMENT_BYTES,
+        }
+        print(RESULT_MARKER + json.dumps(result, sort_keys=True), flush=True)
+        return 0 if result["acknowledged"] and result["error"] is None else 1
+    finally:
+        torch.npu.synchronize()
+        if registered:
+            unregister_result = engine.unregister_memory(combined_staging.data_ptr())
+        del engine, staging, combined_staging, raw
+        gc.collect()
+        if unregister_result != 0:
+            raise RuntimeError(f"Connector sender memory unregistration failed: result={unregister_result}")
 
 
 def _require_native_mooncake() -> None:
@@ -1091,6 +1351,88 @@ def test_mooncake_connector_persists_staging_into_swapped_full_kv():
     assert payload["staging_base_alignment_mod"] == 0
 
 
+def test_mooncake_layerwise_connector_protocol_persists_before_ack():
+    """Verify production send/receive threads transfer, persist, then ACK."""
+    _require_native_mooncake()
+    command = [sys.executable, str(Path(__file__).resolve())]
+    receiver = subprocess.Popen(
+        [*command, "--role", "connector_protocol_receiver"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    if receiver.stdin is None or receiver.stdout is None:
+        receiver.terminate()
+        receiver.wait(timeout=5)
+        raise RuntimeError("Failed to create connector protocol receiver control pipes.")
+
+    receiver_output = _ProcessOutput(receiver.stdout)
+    try:
+        ready = receiver_output.wait_for_marker(
+            READY_MARKER,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        sender = subprocess.run(
+            [
+                *command,
+                "--role",
+                "connector_protocol_sender",
+                "--target-host",
+                str(ready["host"]),
+                "--target-side-channel-port",
+                str(ready["side_channel_port"]),
+                "--target-te-port",
+                str(ready["te_rpc_port"]),
+                "--target-metadata",
+                json.dumps(ready["layer_metadata"], separators=(",", ":")),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        assert sender.returncode == 0, (
+            f"Mooncake connector protocol sender failed.\nstdout:\n{sender.stdout}\nstderr:\n{sender.stderr}"
+        )
+        sender_marker = next(line for line in sender.stdout.splitlines() if line.startswith(RESULT_MARKER))
+        sender_result = json.loads(sender_marker.removeprefix(RESULT_MARKER))
+        assert sender_result["acknowledged"]
+        assert sender_result["error"] is None
+        assert sender_result["source_alignment_mod"] == 0
+
+        receiver.stdin.write("VERIFY\n")
+        receiver.stdin.flush()
+        receiver_result = receiver_output.wait_for_marker(
+            RESULT_MARKER,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        receiver.wait(timeout=PROCESS_TIMEOUT_SECONDS)
+        receiver_output.join()
+        assert receiver.returncode == 0, (
+            f"Mooncake connector protocol receiver failed.\noutput:\n{receiver_output.output}"
+        )
+        assert receiver_result["matches"], (
+            "Mooncake connector ACK arrived without correct Full-KV "
+            f"persistence.\nresult={receiver_result}\noutput:\n{receiver_output.output}"
+        )
+        print(
+            "Mooncake layerwise connector protocol verified: "
+            + json.dumps(
+                {
+                    "sender": sender_result,
+                    "receiver": receiver_result,
+                },
+                sort_keys=True,
+            )
+        )
+    finally:
+        if receiver.poll() is None:
+            _stop_process(receiver, receiver_output)
+        else:
+            receiver_output.join()
+
+
 @pytest.mark.xfail(
     reason=(
         "Diagnostic only: swapped tensor.data_ptr() exposes an SVM alias, not "
@@ -1184,6 +1526,8 @@ def _parse_args() -> argparse.Namespace:
             "staged_receiver",
             "staged_sender",
             "connector_persist",
+            "connector_protocol_receiver",
+            "connector_protocol_sender",
         ),
         required=True,
     )
@@ -1191,6 +1535,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--target-port", type=int)
     parser.add_argument("--target-address", type=int)
     parser.add_argument("--target-metadata")
+    parser.add_argument("--target-side-channel-port", type=int)
+    parser.add_argument("--target-te-port", type=int)
     return parser.parse_args()
 
 
@@ -1204,6 +1550,27 @@ if __name__ == "__main__":
         raise SystemExit(_run_staged_receiver())
     if args.role == "connector_persist":
         raise SystemExit(_run_connector_persist())
+    if args.role == "connector_protocol_receiver":
+        raise SystemExit(_run_connector_protocol_receiver())
+    if args.role == "connector_protocol_sender":
+        if (
+            args.target_host is None
+            or args.target_side_channel_port is None
+            or args.target_te_port is None
+            or args.target_metadata is None
+        ):
+            raise SystemExit(
+                "connector protocol sender requires --target-host, "
+                "--target-side-channel-port, --target-te-port, and --target-metadata"
+            )
+        raise SystemExit(
+            _run_connector_protocol_sender(
+                target_host=args.target_host,
+                target_side_channel_port=args.target_side_channel_port,
+                target_te_rpc_port=args.target_te_port,
+                target_metadata=json.loads(args.target_metadata),
+            )
+        )
     if args.role == "mixed_sender":
         if args.target_host is None or args.target_port is None or args.target_metadata is None:
             raise SystemExit("mixed sender requires --target-host, --target-port, and --target-metadata")
