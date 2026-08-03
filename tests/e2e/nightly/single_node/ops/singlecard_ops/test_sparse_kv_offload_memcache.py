@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 import uuid
 
@@ -60,6 +61,37 @@ def _make_npu_indexer_cache() -> tuple[torch.Tensor, ...]:
             dtype=torch.bfloat16,
             device="npu",
         ),
+    )
+
+
+def _make_swapped_cache(shape: tuple[int, ...]) -> torch.Tensor:
+    dtype = torch.bfloat16
+    dtype_size = torch.empty((), dtype=dtype).element_size()
+    raw_storage = torch_npu.empty_with_swapped_memory(
+        (math.prod(shape) * dtype_size,),
+        dtype=torch.int8,
+        device="npu",
+    )
+    return raw_storage.view(dtype).view(shape)
+
+
+def _make_sparse_offload_cache() -> tuple[torch.Tensor, ...]:
+    return (
+        _make_swapped_cache((1, BLOCK_SIZE, 1, 2)),
+        _make_swapped_cache((1, BLOCK_SIZE, 1, 1)),
+        torch.empty(
+            (1, BLOCK_SIZE, 4),
+            dtype=torch.bfloat16,
+            device="npu",
+        ),
+    )
+
+
+def _make_sparse_offload_staging(cache: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    return (
+        torch.empty_like(cache[0], device="npu"),
+        torch.empty_like(cache[1], device="npu"),
+        cache[2],
     )
 
 
@@ -178,6 +210,103 @@ def test_memcache_round_trip_npu_resident_indexer_cache():
             is_save=False,
         )
         assert load_result == 0
+        torch.npu.synchronize()
+
+        for expected, actual in zip(source, destination):
+            torch.testing.assert_close(actual.cpu(), expected.cpu())
+    finally:
+        if lease_acquired:
+            backend.batch_remove_lease([key])
+        backend.store.remove(key)
+
+
+def test_memcache_round_trip_sparse_offload_through_npu_staging():
+    """Verify swapped Full KV through NPU staging using public L2G/G2L."""
+    MemcacheBackend.validate_gva_layerwise_api()
+    torch.npu.set_device(0)
+
+    source = _make_sparse_offload_cache()
+    destination = _make_sparse_offload_cache()
+    source_staging = _make_sparse_offload_staging(source)
+    destination_staging = _make_sparse_offload_staging(destination)
+
+    for offset, tensor in zip((0, 4096, 8192), source):
+        tensor.copy_(
+            torch.arange(
+                tensor.numel(),
+                dtype=torch.float32,
+                device="npu",
+            ).reshape(tensor.shape)
+            + offset
+        )
+    for tensor in destination:
+        tensor.fill_(-1)
+
+    # Producer-side staging: Full KV originates in swapped Host memory while
+    # the Indexer cache is already NPU-resident.
+    source_staging[0].copy_(source[0])
+    source_staging[1].copy_(source[1])
+    torch.npu.synchronize()
+
+    backend = MemcacheBackend(
+        ParallelConfig(),
+        local_rank=0,
+        init_bm=True,
+    )
+    staged_tensors = (*source_staging, *destination_staging)
+    backend.register_buffer(
+        [tensor.data_ptr() for tensor in staged_tensors],
+        [_tensor_nbytes(tensor) for tensor in staged_tensors],
+    )
+
+    key = f"vllm-ascend-sparse-offload-staging-smoke-{uuid.uuid4().hex}"
+    total_bytes = sum(_tensor_nbytes(tensor) for tensor in source_staging)
+    allocated_gvas = backend.batch_alloc([key], [total_bytes])
+    assert len(allocated_gvas) == 1
+    assert allocated_gvas[0] > 0
+    assert backend.store is not None
+    lease_acquired = False
+    try:
+        source_gvas, source_addrs, source_sizes = _make_transfer_arrays(
+            allocated_gvas[0],
+            source_staging,
+        )
+        save_result = _copy_npu_cache(
+            backend,
+            source_gvas,
+            source_addrs,
+            source_sizes,
+            is_save=True,
+        )
+        assert save_result == 0
+
+        key_info = backend.batch_get_key_info([key])
+        assert len(key_info) == 1
+        assert key_info[0].size() > 0
+        lease_result = backend.batch_add_lease([key])
+        assert all(result == 0 for result in lease_result)
+        lease_acquired = True
+
+        load_gva_list = key_info[0].gva_list()
+        assert load_gva_list
+        destination_gvas, destination_addrs, destination_sizes = _make_transfer_arrays(
+            load_gva_list[0],
+            destination_staging,
+        )
+        load_result = _copy_npu_cache(
+            backend,
+            destination_gvas,
+            destination_addrs,
+            destination_sizes,
+            is_save=False,
+        )
+        assert load_result == 0
+        torch.npu.synchronize()
+
+        # Consumer-side staging: Full KV lands in NPU memory first, then moves
+        # into swapped Host memory. The Indexer destination is already final.
+        destination[0].copy_(destination_staging[0])
+        destination[1].copy_(destination_staging[1])
         torch.npu.synchronize()
 
         for expected, actual in zip(source, destination):
