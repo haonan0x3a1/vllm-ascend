@@ -80,6 +80,7 @@ class SparseKVOffloadMemoryPlan:
     indexer_cache_bytes: int
     indexer_alignment_bytes: int
     shared_prefill_bytes: int
+    shared_prefill_alignment_bytes: int
     selected_cache_bytes: int
     selection_metadata_bytes: int
 
@@ -89,6 +90,7 @@ class SparseKVOffloadMemoryPlan:
             self.indexer_cache_bytes
             + self.indexer_alignment_bytes
             + self.shared_prefill_bytes
+            + self.shared_prefill_alignment_bytes
             + self.selected_cache_bytes
             + self.selection_metadata_bytes
         )
@@ -105,6 +107,7 @@ def make_sparse_kv_offload_memory_plan(
     num_sparse_layers: int,
     num_indexer_layers: int,
     indexer_alignment_bytes_per_layer: int = 0,
+    shared_prefill_alignment_bytes: int = 0,
 ) -> SparseKVOffloadMemoryPlan:
     """Plan Host-mode persistent NPU allocations before creating tensors."""
     positive_values = {
@@ -127,6 +130,8 @@ def make_sparse_kv_offload_memory_plan(
         raise ValueError(
             f"indexer_alignment_bytes_per_layer must be non-negative, got {indexer_alignment_bytes_per_layer}."
         )
+    if shared_prefill_alignment_bytes < 0:
+        raise ValueError(f"shared_prefill_alignment_bytes must be non-negative, got {shared_prefill_alignment_bytes}.")
 
     full_tokens = num_blocks * block_size
     selection_num_blocks = (index_topk + block_size - 1) // block_size
@@ -145,6 +150,7 @@ def make_sparse_kv_offload_memory_plan(
         indexer_cache_bytes=indexer_cache_bytes,
         indexer_alignment_bytes=(num_indexer_layers * indexer_alignment_bytes_per_layer),
         shared_prefill_bytes=shared_prefill_bytes,
+        shared_prefill_alignment_bytes=shared_prefill_alignment_bytes,
         selected_cache_bytes=selected_cache_bytes,
         selection_metadata_bytes=selection_metadata_bytes,
     )

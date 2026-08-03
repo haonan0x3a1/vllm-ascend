@@ -36,6 +36,8 @@ HBM budget.
 - A CANN and torch-npu version compatible with the vLLM Ascend environment.
 - The `custom_ops` wheel built from `cann-recipes-infer`, including
   `torch_npu.npu_gather_selection_kv_cache`.
+- Online P/D staging requires the Ascend Mooncake TransferEngine package
+  `mooncake-transfer-engine-npu>=0.3.12.post1`.
 - A DeepSeek-V3.2 DSA model with `index_topk=2048`.
 - Host mode requires the fused A3 MLAPO decode path and a supported W8A8
   checkpoint.
@@ -87,19 +89,41 @@ with a KV Connector.
 
 ### Online P/D disaggregation
 
-Online P/D is not yet supported for Host Full-KV mode. The public MemCache
-`DistributedObjectStore.batch_copy` implementation accepts `L2G`, `G2L`,
-`G2H`, and `H2G`. Host-backed tensors returned by
-`torch_npu.empty_with_swapped_memory` expose NPU/SVM `data_ptr` values, and
-there is no verified MemCache copy contract for moving those addresses to and
-from a DRAM GVA. The vLLM Ascend integration therefore fails before transfer
-instead of treating the swapped address as an ordinary Host pointer or relying
-on lower-layer MemFabric enum values that MemCache does not dispatch.
+Host Full-KV mode supports an experimental Online P/D path through
+`MooncakeLayerwiseConnector`. Mooncake does not register the swapped/SVM Full-KV
+addresses directly. Instead, both workers register the existing aligned,
+cross-layer NPU Prefill workspace as a one-layer transfer staging cache:
 
-The NPU-resident Lightning Indexer cache can still use the supported
-`L2G`/`G2L` directions. Completing Online P/D requires either a MemCache API
-that explicitly supports swapped/SVM addresses, another transport with that
-contract, or an explicit staging copy.
+1. Prefill computes one layer into the shared NPU staging cache.
+2. Mooncake transfers that layer into the Decode worker's NPU staging cache.
+3. Decode synchronously persists the received physical blocks into that
+   layer's swapped Full KV and acknowledges the layer.
+4. Only after the ACK may Prefill and Decode reuse their staging cache for the
+   next layer. The NPU-resident Lightning Indexer cache is transferred directly.
+
+This first correctness path intentionally serializes layer reuse. It does not
+claim transfer/compute overlap. It also requires the same MLA tensor-parallel
+layout on Prefill and Decode workers.
+
+Both workers must enable Host mode and configure the layerwise connector. Use
+`kv_producer` on Prefill and `kv_consumer` on Decode; the metaserver/proxy and
+per-role topology fields follow the standard Mooncake layerwise P/D guide:
+
+```text
+--additional-config \
+  '{"enable_mlapo":true,"sparse_kv_offload":{"enabled":true,"mode":"host"}}' \
+--kv-transfer-config \
+  '{"kv_connector":"MooncakeLayerwiseConnector",
+    "kv_role":"kv_producer",
+    "kv_port":"30000",
+    "kv_connector_extra_config":{
+      "prefill":{"dp_size":1,"tp_size":1},
+      "decode":{"dp_size":1,"tp_size":1}}}'
+```
+
+Change only `kv_role` to `kv_consumer` for the Decode worker and use the actual
+matching topology. The current sparse Host validation still requires
+`--max-num-seqs 1`, `--block-size 128`, eager mode, and prefix caching disabled.
 
 The feature is disabled by default. When disabled, allocation and SFA execution
 remain unchanged.
@@ -117,8 +141,13 @@ and memory allocation only; it is not an accuracy result.
 - No speculative decoding or MTP.
 - No prefix caching.
 - No DSA context parallelism, PCP, or DCP.
-- Online P/D for Host Full-KV mode is blocked on a transport contract for
-  swapped/SVM Full-KV addresses.
+- Online P/D Host mode currently requires `MooncakeLayerwiseConnector` and NPU
+  staging; direct swapped/SVM registration is unsupported.
+- The staged Online P/D path is correctness-first: one request, equal P/D MLA
+  tensor-parallel layouts, and synchronous per-layer ACK before staging reuse.
+- The current NPU integration test covers a same-node staged transfer. A
+  cross-node model-serving result is still required before claiming end-to-end
+  Online P/D support in a deployment.
 - Selected KV state is reused across decode steps and reset at Prefill/request
   boundaries. The current device buffer holds one Top-K working set rather than
   a larger configurable LRU pool.

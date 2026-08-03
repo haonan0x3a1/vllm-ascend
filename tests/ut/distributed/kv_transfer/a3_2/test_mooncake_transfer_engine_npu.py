@@ -827,6 +827,85 @@ def _run_staged_sender(
             raise RuntimeError(f"Staged sender memory unregistration failed: {unregister_failures}")
 
 
+def _run_connector_persist() -> int:
+    """Exercise the connector's NPU staging -> swapped Full-KV copy."""
+    import torch
+    import torch_npu
+
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+        KVCacheRecvingLayerThread,
+        LayerMetadata,
+        MooncakeAgentMetadata,
+    )
+
+    torch.npu.set_device(0)
+    raw, combined_staging = _allocate_aligned_buffer(
+        torch,
+        device_index=0,
+        fill_value=0,
+    )
+    staging = (
+        combined_staging[: BUFFER_BYTES // 2].view(4, -1),
+        combined_staging[BUFFER_BYTES // 2 :].view(4, -1),
+    )
+    staging[0][1].fill_(0x11)
+    staging[1][1].fill_(0x22)
+    staging[0][3].fill_(0x33)
+    staging[1][3].fill_(0x44)
+    final = (
+        torch_npu.empty_with_swapped_memory(
+            staging[0].shape,
+            dtype=torch.int8,
+            device=torch.device("npu:0"),
+        ),
+        torch_npu.empty_with_swapped_memory(
+            staging[1].shape,
+            dtype=torch.int8,
+            device=torch.device("npu:0"),
+        ),
+    )
+    for tensor in final:
+        tensor.fill_(-1)
+
+    metadata = MooncakeAgentMetadata(
+        te_rpc_port=0,
+        layer_metadata={
+            "layer0": LayerMetadata(
+                tensor_group_idx=[0, 0],
+                kv_caches_base_addr=[tensor.data_ptr() for tensor in staging],
+                block_len=[tensor[0].nbytes for tensor in staging],
+                block_size_scale=[1, 1],
+            )
+        },
+    )
+    receiver = KVCacheRecvingLayerThread(
+        tp_rank=0,
+        side_channel_port=0,
+        tp_size=1,
+        pd_head_ratio=1,
+        local_engine_id="connector-persist-smoke",
+        metadata=metadata,
+        ready_event=threading.Event(),
+        sparse_host_final_kv_caches={"layer0": final},
+        sparse_host_staging_kv=staging,
+    )
+    receiver.persist_staged_layer("layer0", [1, 3])
+    result = {
+        "matches": bool(
+            torch.equal(final[0][[1, 3]].cpu(), staging[0][[1, 3]].cpu())
+            and torch.equal(final[1][[1, 3]].cpu(), staging[1][[1, 3]].cpu())
+            and torch.all(final[0][[0, 2]].cpu() == -1)
+            and torch.all(final[1][[0, 2]].cpu() == -1)
+        ),
+        "staging_base_alignment_mod": staging[0].data_ptr() % ALIGNMENT_BYTES,
+    }
+    print(RESULT_MARKER + json.dumps(result, sort_keys=True), flush=True)
+    del receiver, final, staging, combined_staging, raw
+    gc.collect()
+    torch.npu.synchronize()
+    return 0 if result["matches"] else 1
+
+
 def _require_native_mooncake() -> None:
     try:
         installed_version = Version(version("mooncake-transfer-engine-npu"))
@@ -976,6 +1055,29 @@ def test_mooncake_sparse_offload_staged_memory_transfer():
             receiver_output.join()
 
 
+def test_mooncake_connector_persists_staging_into_swapped_full_kv():
+    """Verify the production connector's staged block persistence on NPU."""
+    _require_native_mooncake()
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--role",
+            "connector_persist",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=PROCESS_TIMEOUT_SECONDS,
+    )
+    assert result.returncode == 0, (
+        f"Mooncake connector staging persistence failed.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    marker_line = next(line for line in result.stdout.splitlines() if line.startswith(RESULT_MARKER))
+    payload = json.loads(marker_line.removeprefix(RESULT_MARKER))
+    assert payload["matches"]
+    assert payload["staging_base_alignment_mod"] == 0
+
+
 @pytest.mark.xfail(
     reason=(
         "Diagnostic only: swapped tensor.data_ptr() exposes an SVM alias, not "
@@ -1068,6 +1170,7 @@ def _parse_args() -> argparse.Namespace:
             "mixed_sender",
             "staged_receiver",
             "staged_sender",
+            "connector_persist",
         ),
         required=True,
     )
@@ -1086,6 +1189,8 @@ if __name__ == "__main__":
         raise SystemExit(_run_mixed_receiver())
     if args.role == "staged_receiver":
         raise SystemExit(_run_staged_receiver())
+    if args.role == "connector_persist":
+        raise SystemExit(_run_connector_persist())
     if args.role == "mixed_sender":
         if args.target_host is None or args.target_port is None or args.target_metadata is None:
             raise SystemExit("mixed sender requires --target-host, --target-port, and --target-metadata")

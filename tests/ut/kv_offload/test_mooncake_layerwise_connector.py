@@ -46,6 +46,7 @@ for _m in _to_remove:
     _saved_modules[_m] = sys.modules.pop(_m)
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (  # noqa: E402
+    LAYER_STAGED_MSG,
     KVCacheRecvingLayerThread,
     KVCacheSendingLayerThread,
     KVConnectorRole,
@@ -351,6 +352,34 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
 
         self.thread.callback_func.assert_called_once()
 
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.group_concurrent_contiguous",
+        side_effect=group_concurrent_contiguous,
+    )
+    def test_sparse_host_layer_callback_waits_after_transfer(self, _mock_group):
+        layer_callback = MagicMock()
+        self.thread.layer_callback_func = layer_callback
+        req_meta = self.req_meta_base
+        req_meta.local_block_ids = [[5, 6]]
+        req_meta.remote_block_ids = [[10, 11]]
+
+        send_task = SendTask(
+            send_request={"req-staged": req_meta},
+            wait_event=MagicMock(),
+            layer_idx=0,
+            layer_name="layer0",
+            group_rearrange_block_ids=[[]],
+        )
+        self.thread._transfer_kv_cache(send_task)
+
+        self.engine.batch_transfer_sync_write.assert_called_once()
+        layer_callback.assert_called_once_with(
+            "req-staged",
+            req_meta,
+            "layer0",
+            0,
+        )
+
 
 class TestKVCacheRecvingLayerThread(unittest.TestCase):
     def setUp(self):
@@ -441,6 +470,56 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
         with th.lock:
             self.assertNotIn("reqX", th.task_tracker)
             self.assertIn("reqX", th.done_requests)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.torch.npu.synchronize")
+    def test_persist_staged_layer_copies_only_remote_blocks(self, mock_sync):
+        staging = (
+            torch.arange(16, dtype=torch.float32).view(4, 4),
+            torch.arange(16, 32, dtype=torch.float32).view(4, 4),
+        )
+        final = (
+            torch.full((4, 4), -1, dtype=torch.float32),
+            torch.full((4, 4), -2, dtype=torch.float32),
+            torch.zeros((4, 4), dtype=torch.float32),
+        )
+        th = KVCacheRecvingLayerThread(
+            tp_rank=0,
+            side_channel_port=5555,
+            tp_size=1,
+            pd_head_ratio=1,
+            local_engine_id="engineA",
+            metadata=self.meta,
+            ready_event=self.ready_event,
+            sparse_host_final_kv_caches={"layer0": final},
+            sparse_host_staging_kv=staging,
+        )
+
+        th.persist_staged_layer("layer0", [3, 1, 1])
+
+        torch.testing.assert_close(final[0][[1, 3]], staging[0][[1, 3]])
+        torch.testing.assert_close(final[1][[1, 3]], staging[1][[1, 3]])
+        torch.testing.assert_close(
+            final[0][[0, 2]],
+            torch.full((2, 4), -1, dtype=torch.float32),
+        )
+        torch.testing.assert_close(
+            final[1][[0, 2]],
+            torch.full((2, 4), -2, dtype=torch.float32),
+        )
+        mock_sync.assert_called_once()
+
+    def test_persist_staged_layer_requires_registered_staging(self):
+        th = KVCacheRecvingLayerThread(
+            tp_rank=0,
+            side_channel_port=5555,
+            tp_size=1,
+            pd_head_ratio=1,
+            local_engine_id="engineA",
+            metadata=self.meta,
+            ready_event=self.ready_event,
+        )
+        with self.assertRaisesRegex(RuntimeError, "without registered"):
+            th.persist_staged_layer("layer0", [0])
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.logger")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_ip", return_value="127.0.0.1")
@@ -562,6 +641,50 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
             th.run()
         finished = th.get_and_clear_done_requests()
         self.assertIn("reqB", finished)
+
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_ip",
+        return_value="127.0.0.1",
+    )
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.msgspec.msgpack.Decoder")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.msgspec.msgpack.Encoder")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.zmq_ctx")
+    def test_run_loop_persists_staged_layer_before_ack(
+        self,
+        mock_zmq_ctx,
+        mock_encoder,
+        mock_decoder,
+        _mock_get_ip,
+    ):
+        mock_encoder.return_value.encode.return_value = b"ENC"
+        mock_decoder.return_value.decode.return_value = (
+            LAYER_STAGED_MSG,
+            "req-staged",
+            "layer0",
+            [3, 4],
+        )
+        sock = MagicMock()
+        sock.recv_multipart.side_effect = [
+            [b"ID", b"PAYLOAD"],
+            SystemExit,
+        ]
+        mock_zmq_ctx.return_value.__enter__.return_value = sock
+        th = KVCacheRecvingLayerThread(
+            tp_rank=0,
+            side_channel_port=5555,
+            tp_size=1,
+            pd_head_ratio=1,
+            local_engine_id="engineA",
+            metadata=self.meta,
+            ready_event=self.ready_event,
+        )
+        th.persist_staged_layer = MagicMock()
+
+        with self.assertRaises(SystemExit):
+            th.run()
+
+        th.persist_staged_layer.assert_called_once_with("layer0", [3, 4])
+        sock.send_multipart.assert_called_once_with((b"ID", b"", b"ACK"))
 
 
 class MockVllmConfig:
@@ -1170,3 +1293,49 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         worker.register_kv_caches(mla_caches)
         self.assertTrue(worker.use_mla)
         self.assertEqual(len(worker.layer_metadata["encoder.layer.0"].block_len), 2)
+
+    def test_sparse_host_transfer_cache_replaces_only_full_kv(self):
+        worker = MooncakeLayerwiseConnectorWorker(
+            self.vllm_config,
+            self.kv_cache_config,
+            self.engine_id,
+        )
+        staging = (
+            torch.zeros((2, 4), dtype=torch.float32),
+            torch.zeros((2, 2), dtype=torch.float32),
+        )
+        final = (
+            torch.ones((2, 4), dtype=torch.float32),
+            torch.ones((2, 2), dtype=torch.float32),
+            torch.ones((2, 8), dtype=torch.float32),
+        )
+        worker.sparse_host_staging_kv = staging
+
+        transfer = worker._build_sparse_host_transfer_caches({"encoder.layer.0": final})
+
+        self.assertIs(transfer["encoder.layer.0"][0], staging[0])
+        self.assertIs(transfer["encoder.layer.0"][1], staging[1])
+        self.assertIs(transfer["encoder.layer.0"][2], final[2])
+        assert worker.sparse_host_final_kv_caches is not None
+        self.assertIs(
+            worker.sparse_host_final_kv_caches["encoder.layer.0"][0],
+            final[0],
+        )
+
+    def test_sparse_host_transfer_cache_rejects_layout_mismatch(self):
+        worker = MooncakeLayerwiseConnectorWorker(
+            self.vllm_config,
+            self.kv_cache_config,
+            self.engine_id,
+        )
+        worker.sparse_host_staging_kv = (
+            torch.zeros((2, 4), dtype=torch.float32),
+            torch.zeros((2, 2), dtype=torch.float32),
+        )
+        mismatched = (
+            torch.zeros((3, 4), dtype=torch.float32),
+            torch.zeros((2, 2), dtype=torch.float32),
+        )
+
+        with self.assertRaisesRegex(ValueError, "layout does not match"):
+            worker._build_sparse_host_transfer_caches({"encoder.layer.0": mismatched})

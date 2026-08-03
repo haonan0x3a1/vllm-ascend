@@ -82,6 +82,8 @@ if TYPE_CHECKING:
 
 DONE_SENDING_MSG = b"done_sending_msg"
 FAILED_SENDING_MSG = b"failed_sending_msg"
+LAYER_STAGED_MSG = b"layer_staged_msg"
+SPARSE_HOST_CACHE_TENSOR_COUNT = 2
 
 
 @dataclass
@@ -142,6 +144,8 @@ class SendTask:
     group_block_table: list[torch.Tensor | None] | None = None
     group_block_len_tensor: list[torch.Tensor | None] | None = None
     group_seq_start_tensor: list[torch.Tensor | None] | None = None
+    completion_event: threading.Event | None = None
+    error: Exception | None = None
 
 
 @dataclass
@@ -224,6 +228,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         enable_c8_quant: bool,
         resharding_stream: torch.npu.Stream,
         callback_func: Callable[..., None] = lambda x: None,
+        layer_callback_func: Callable[..., None] | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheSendingLayerThread")
         self.engine = engine
@@ -262,6 +267,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.enable_c8_quant = enable_c8_quant
         self.ready_event = ready_event
         self.callback_func = callback_func
+        self.layer_callback_func = layer_callback_func
 
     def run(self):
         local_rank = get_world_group().local_rank
@@ -276,11 +282,15 @@ class KVCacheSendingLayerThread(threading.Thread):
         try:
             self._transfer_kv_cache(send_task)
         except Exception as e:
+            send_task.error = e
             logger.error(
                 "Failed to transfer KV cache. layer_idx=%s, error=%s. Check transfer engine and memory state.",
                 send_task.layer_idx,
                 e,
             )
+        finally:
+            if send_task.completion_event is not None:
+                send_task.completion_event.set()
 
     def get_transfer_meta(self, send_task: SendTask, req_id: str, req_meta: ReqMeta, layer_group_idx: int):
         src_list: list[int] = []
@@ -504,7 +514,12 @@ class KVCacheSendingLayerThread(threading.Thread):
                         session_id,
                         ret,
                     )
-                    self.failed_reqs.add(req_id)
+                    self.failed_reqs.update(transfer_meta.req_ids)
+                    if self.layer_callback_func is not None:
+                        raise RuntimeError(
+                            "Mooncake sparse KV staging transfer failed for "
+                            f"requests {transfer_meta.req_ids}: ret={ret}."
+                        )
                 else:
                     req_end_time = time.perf_counter()
                     total_transfer_size = sum(transfer_meta.length) / 1024
@@ -516,6 +531,14 @@ class KVCacheSendingLayerThread(threading.Thread):
                         session_id,
                         req_transfer_elapsed,
                     )
+                    if self.layer_callback_func is not None:
+                        for req_id in transfer_meta.req_ids:
+                            self.layer_callback_func(
+                                req_id,
+                                send_task.send_request[req_id],
+                                send_task.layer_name,
+                                layer_group_idx,
+                            )
                 if send_task.layer_idx == (self.total_layers - 1):
                     for req_id in transfer_meta.req_ids:
                         req_meta = send_task.send_request[req_id]
@@ -537,6 +560,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
         local_engine_id: str,
         metadata: MooncakeAgentMetadata,
         ready_event: threading.Event,
+        sparse_host_final_kv_caches: dict[str, tuple[torch.Tensor, ...]] | None = None,
+        sparse_host_staging_kv: tuple[torch.Tensor, ...] | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingLayerThread")
         self.tp_rank = tp_rank
@@ -551,6 +576,50 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.task_tracker = dict[str, int]()
         self.ready_event = ready_event
         self.metadata = metadata
+        self.sparse_host_final_kv_caches = sparse_host_final_kv_caches
+        self.sparse_host_staging_kv = sparse_host_staging_kv
+
+    @property
+    def uses_sparse_host_staging(self) -> bool:
+        return self.sparse_host_final_kv_caches is not None and self.sparse_host_staging_kv is not None
+
+    def persist_staged_layer(
+        self,
+        layer_name: str,
+        remote_block_ids: list[int],
+    ) -> None:
+        """Persist one received NPU staging layer into swapped Full KV.
+
+        The ACK for ``LAYER_STAGED_MSG`` is sent only after this synchronous
+        copy completes. The producer can therefore reuse its cross-layer
+        staging cache, and Mooncake can safely overwrite the consumer staging
+        cache for the next layer.
+        """
+        if not self.uses_sparse_host_staging:
+            raise RuntimeError("Received a sparse Host staging message without registered staging and final KV caches.")
+        assert self.sparse_host_final_kv_caches is not None
+        assert self.sparse_host_staging_kv is not None
+        if layer_name not in self.sparse_host_final_kv_caches:
+            raise KeyError(f"Unknown sparse Host KV layer: {layer_name}")
+        if not remote_block_ids:
+            return
+
+        final_kv = self.sparse_host_final_kv_caches[layer_name]
+        block_ids = torch.tensor(
+            sorted(set(remote_block_ids)),
+            dtype=torch.int64,
+            device=self.sparse_host_staging_kv[0].device,
+        )
+        for staging, final in zip(
+            self.sparse_host_staging_kv[:SPARSE_HOST_CACHE_TENSOR_COUNT],
+            final_kv[:SPARSE_HOST_CACHE_TENSOR_COUNT],
+        ):
+            final.index_copy_(
+                0,
+                block_ids,
+                staging.index_select(0, block_ids),
+            )
+        torch.npu.synchronize()
 
     def get_and_clear_done_requests(self) -> set[str]:
         """
@@ -602,6 +671,9 @@ class KVCacheRecvingLayerThread(threading.Thread):
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
+        if self.uses_sparse_host_staging:
+            local_rank = get_world_group().local_rank
+            torch.npu.set_device(torch.device(f"npu:{local_rank}"))
         handshake_port = self.side_channel_port + self.tp_rank
         path = make_zmq_path("tcp", self.side_channel_host, handshake_port)
         logger.info("KVCacheRecvingLayerThread listening on %s, tp_rank=%d", path, self.tp_rank)
@@ -636,6 +708,21 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         side_channel_path = msg[3]
                         self.update_done_task(request_id, trans_count, side_channel_path)
                         sock.send_multipart((identity, b"", b"ACK"))
+                    elif msg[0] == LAYER_STAGED_MSG:
+                        layer_name = msg[2]
+                        remote_block_ids = list(msg[3])
+                        try:
+                            self.persist_staged_layer(layer_name, remote_block_ids)
+                        except Exception as e:
+                            logger.error(
+                                "Failed to persist sparse Host KV staging. request_id=%s, layer=%s, error=%s.",
+                                msg[1],
+                                layer_name,
+                                e,
+                            )
+                            sock.send_multipart((identity, b"", b"NACK"))
+                        else:
+                            sock.send_multipart((identity, b"", b"ACK"))
                     elif msg[0] == FAILED_SENDING_MSG:
                         request_id = msg[1]
                         logger.error("Got FAILED_SENDING_MSG for request. request_id=%s. ", msg[1])
@@ -643,7 +730,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         sock.send_multipart((identity, b"", b"ACK"))
                     else:
                         logger.error(
-                            "Unexpected message type: %s. expected GET_META_MSG or DONE_RECVING_MSG. msg=%s",
+                            "Unexpected message type: %s. expected GET_META_MSG, "
+                            "LAYER_STAGED_MSG, or DONE_RECVING_MSG. msg=%s",
                             msg[0] if msg else "empty",
                             msg,
                         )
@@ -752,6 +840,14 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
+
+    def register_sparse_kv_offload_staging(
+        self,
+        staging_kv: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Register the cross-layer NPU staging cache before final KV caches."""
+        assert self.connector_worker is not None
+        self.connector_worker.register_sparse_kv_offload_staging(staging_kv)
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
@@ -1208,11 +1304,66 @@ class MooncakeLayerwiseConnectorWorker:
         )
         self.remote_poller = zmq.Poller()  # type: ignore
         self.timeout = 1.0  # seconds
+        self.layer_ack_timeout = float(get_transfer_timeout_value())
         self.k_buffer: torch.Tensor | None = None
         self.v_buffer: torch.Tensor | None = None
         self.virtual_request: set[str] = set()
         self._invalid_block_ids: set[int] = set()
         self._recving_metadata: dict[str, ReqMeta] = {}
+        self.sparse_host_staging_kv: tuple[torch.Tensor, ...] | None = None
+        self.sparse_host_final_kv_caches: dict[str, tuple[torch.Tensor, ...]] | None = None
+
+    def register_sparse_kv_offload_staging(
+        self,
+        staging_kv: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Select one shared NPU layer as the sparse Host transfer staging."""
+        if len(staging_kv) != SPARSE_HOST_CACHE_TENSOR_COUNT:
+            raise ValueError(f"sparse KV offload staging expects exactly two Full-KV tensors, got {len(staging_kv)}.")
+        if staging_kv[0].data_ptr() % (2 * 1024 * 1024) != 0:
+            raise ValueError("sparse KV offload Mooncake staging must start at a 2 MiB aligned NPU address.")
+        self.sparse_host_staging_kv = staging_kv
+
+    def _build_sparse_host_transfer_caches(
+        self,
+        kv_caches: dict[str, Any],
+    ) -> dict[str, tuple[torch.Tensor, ...]]:
+        assert self.sparse_host_staging_kv is not None
+        transfer_caches: dict[str, tuple[torch.Tensor, ...]] = {}
+        final_caches: dict[str, tuple[torch.Tensor, ...]] = {}
+
+        for layer_name, cache in kv_caches.items():
+            if not isinstance(cache, (tuple, list)):
+                raise TypeError(
+                    "sparse KV offload Mooncake staging requires tuple/list "
+                    f"KV caches, got {type(cache).__name__} for {layer_name}."
+                )
+            final_cache = tuple(cache)
+            if len(final_cache) < SPARSE_HOST_CACHE_TENSOR_COUNT:
+                raise ValueError(
+                    f"sparse KV offload Mooncake staging requires at least two Full-KV tensors for {layer_name}."
+                )
+            for cache_idx, (staging, final) in enumerate(
+                zip(
+                    self.sparse_host_staging_kv,
+                    final_cache[:SPARSE_HOST_CACHE_TENSOR_COUNT],
+                )
+            ):
+                if staging.shape != final.shape or staging.dtype != final.dtype:
+                    raise ValueError(
+                        "sparse KV offload staging layout does not match final "
+                        f"KV for {layer_name} tensor {cache_idx}: "
+                        f"staging={tuple(staging.shape)}/{staging.dtype}, "
+                        f"final={tuple(final.shape)}/{final.dtype}."
+                    )
+            final_caches[layer_name] = final_cache
+            transfer_caches[layer_name] = (
+                *self.sparse_host_staging_kv,
+                *final_cache[SPARSE_HOST_CACHE_TENSOR_COUNT:],
+            )
+
+        self.sparse_host_final_kv_caches = final_caches
+        return transfer_caches
 
     def create_kv_buffer(self, first_kv_cache_tuple):
         alignment = 2 * 1024 * 1024
@@ -1246,6 +1397,15 @@ class MooncakeLayerwiseConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data."""
+        self.kv_caches = kv_caches
+        transfer_kv_caches: dict[str, Any] = kv_caches
+        if self.sparse_host_staging_kv is not None:
+            if self.pd_head_ratio != 1:
+                raise ValueError(
+                    "sparse KV offload Mooncake staging currently requires "
+                    "equal Prefill and Decode MLA tensor parallel layouts."
+                )
+            transfer_kv_caches = self._build_sparse_host_transfer_caches(kv_caches)
         layer2group_ids: dict[str, int] = {}
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
         for i, kv_cache_group_spec in enumerate(kv_cache_groups):
@@ -1273,7 +1433,7 @@ class MooncakeLayerwiseConnectorWorker:
         lengths = []
         use_kv_buffer = False
         kv_buffer = None
-        for layer_name, kv_cache_tuple in kv_caches.items():
+        for layer_name, kv_cache_tuple in transfer_kv_caches.items():
             if isinstance(kv_cache_tuple, (list, tuple)) is False:
                 kv_cache_tuple = [kv_cache_tuple]
             layer_kv_group_id = layer2group_ids[layer_name]
@@ -1328,7 +1488,7 @@ class MooncakeLayerwiseConnectorWorker:
         else:
             # For normal attention / sparse-c8 KV cache, register merged memory
             # ranges while keeping layer metadata at logical tensor addresses.
-            register_regions = collect_storage_merged_register_regions(kv_caches)
+            register_regions = collect_storage_merged_register_regions(transfer_kv_caches)
 
         validate_register_region_count(register_regions)
         global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
@@ -1379,6 +1539,9 @@ class MooncakeLayerwiseConnectorWorker:
                 enable_c8_quant=self.enable_c8_quant,
                 resharding_stream=self.resharding_stream,
                 callback_func=self.send_done_send_signal,
+                layer_callback_func=(
+                    self.send_layer_staged_signal if self.sparse_host_staging_kv is not None else None
+                ),
             )
             self.kv_send_layer_thread.start()
             ready_event.wait()
@@ -1393,6 +1556,8 @@ class MooncakeLayerwiseConnectorWorker:
                 self.engine_id,
                 metadata,
                 ready_event,
+                sparse_host_final_kv_caches=self.sparse_host_final_kv_caches,
+                sparse_host_staging_kv=self.sparse_host_staging_kv,
             )
             self.kv_recv_layer_thread.start()
             ready_event.wait()
@@ -1816,6 +1981,7 @@ class MooncakeLayerwiseConnectorWorker:
                 layer_idx=self.current_layer,
                 layer_name=layer_name,
                 group_rearrange_block_ids=send_task.group_rearrange_block_ids,
+                completion_event=(threading.Event() if self.sparse_host_staging_kv is not None else None),
             )
             for req_id, req_meta in connector_metadata.requests.items():
                 if len(req_meta.local_block_ids[layer_group_idx]) == 0:
@@ -1823,6 +1989,10 @@ class MooncakeLayerwiseConnectorWorker:
                 try:
                     req_meta_update = self.update_decoder_info(req_id, req_meta)
                 except Exception as e:
+                    if self.sparse_host_staging_kv is not None:
+                        raise RuntimeError(
+                            f"Failed to resolve Decode staging metadata for request {req_id}, layer {layer_name}: {e}"
+                        ) from e
                     logger.warning(
                         "MooncakeLayerwiseConnector transfer fail. req_id=%s, layer_idx=%s, error=%s. ",
                         req_id,
@@ -1833,8 +2003,25 @@ class MooncakeLayerwiseConnectorWorker:
                 logger.debug("Add request %s to kv send layer thread. req_meta_update=%r", req_id, req_meta_update)
                 layer_send_task.send_request[req_id] = req_meta_update
 
+            if (
+                self.sparse_host_staging_kv is not None
+                and connector_metadata.requests
+                and not layer_send_task.send_request
+            ):
+                raise RuntimeError(f"Sparse Host KV staging has no transferable request blocks for layer {layer_name}.")
+
             self.kv_send_layer_thread.send_queue.put(layer_send_task)
             self.current_layer += 1
+            if layer_send_task.completion_event is not None:
+                completed = layer_send_task.completion_event.wait(timeout=self.layer_ack_timeout)
+                if not completed:
+                    raise TimeoutError(
+                        f"Timed out waiting for sparse Host KV layer transfer and staging persistence: {layer_name}."
+                    )
+                if layer_send_task.error is not None:
+                    raise RuntimeError(
+                        f"Sparse Host KV layer transfer failed for {layer_name}: {layer_send_task.error}"
+                    ) from layer_send_task.error
 
     # NOTE: Due to the FIA operator constraints, the expected kv cache is ND format, NZ shape,
     # while the npu_format_cast method only modifies the memory layout, we manually convert it to NZ shape here
@@ -1934,35 +2121,15 @@ class MooncakeLayerwiseConnectorWorker:
             encoded_data = msg_encoder.encode(
                 (send_msg_type, external_req_id, req_meta.trans_count[group_idx], side_channel_path)
             )
-            max_retries = 3
-            for attempt in range(1, max_retries + 1):
-                try:
-                    with zmq_ctx(zmq.REQ, path) as sock:  # type: ignore
-                        sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
-                        ensure_zmq_send(sock, encoded_data, f"{req_meta.remote_host}:{req_meta.remote_port}")
-                        if not sock.poll(int(self.timeout * 1000), zmq.POLLIN):  # type: ignore[attr-defined]
-                            raise TimeoutError(
-                                f"Timed out waiting for ACK from {req_meta.remote_host}:{req_meta.remote_port}"
-                            )
-                        ack = sock.recv()
-                        if ack != b"ACK":
-                            raise ValueError(f"Unexpected ACK response: {ack}")
-                        return
-                except Exception as e:
-                    if attempt < max_retries:
-                        logger.warning(
-                            "Failed to send done sending signal. "
-                            "request_id=%s, destination=%s:%d, attempt=%d/%d, error=%s. ",
-                            external_req_id,
-                            req_meta.remote_host,
-                            req_meta.remote_port,
-                            attempt,
-                            max_retries,
-                            e,
-                        )
-                        time.sleep(0.1)
-                    else:
-                        raise RuntimeError(f"Failed to receive ACK after {max_retries} attempts: {e}") from e
+            self._send_signal_and_wait_ack(
+                path=path,
+                encoded_data=encoded_data,
+                request_id=external_req_id,
+                remote_host=req_meta.remote_host,
+                remote_port=req_meta.remote_port,
+                timeout=self.timeout,
+                signal_name="done sending",
+            )
         except Exception as e:
             logger.error(
                 "Sending signal fail. signal_type=%s, request_id=%s, destination=%s:%s, error=%s. ",
@@ -1972,6 +2139,75 @@ class MooncakeLayerwiseConnectorWorker:
                 req_meta.remote_port,
                 e,
             )
+
+    def send_layer_staged_signal(
+        self,
+        req_id: str,
+        req_meta: ReqMeta,
+        layer_name: str,
+        group_idx: int,
+    ) -> None:
+        """Wait until Decode persists one staged layer into swapped Full KV."""
+        external_req_id = get_external_request_id(req_id)
+        path = make_zmq_path("tcp", req_meta.remote_host, req_meta.remote_port)
+        encoded_data = msgspec.msgpack.Encoder().encode(
+            (
+                LAYER_STAGED_MSG,
+                external_req_id,
+                layer_name,
+                req_meta.remote_block_ids[group_idx],
+            )
+        )
+        self._send_signal_and_wait_ack(
+            path=path,
+            encoded_data=encoded_data,
+            request_id=external_req_id,
+            remote_host=req_meta.remote_host,
+            remote_port=req_meta.remote_port,
+            timeout=self.layer_ack_timeout,
+            signal_name=f"sparse Host layer {layer_name}",
+        )
+
+    @staticmethod
+    def _send_signal_and_wait_ack(
+        *,
+        path: str,
+        encoded_data: bytes,
+        request_id: str,
+        remote_host: str,
+        remote_port: int,
+        timeout: float,
+        signal_name: str,
+    ) -> None:
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                with zmq_ctx(zmq.REQ, path) as sock:  # type: ignore
+                    sock.setsockopt(zmq.SNDTIMEO, int(timeout * 1000))
+                    ensure_zmq_send(sock, encoded_data, f"{remote_host}:{remote_port}")
+                    if not sock.poll(int(timeout * 1000), zmq.POLLIN):  # type: ignore[attr-defined]
+                        raise TimeoutError(f"Timed out waiting for ACK from {remote_host}:{remote_port}")
+                    ack = sock.recv()
+                    if ack != b"ACK":
+                        raise ValueError(f"Unexpected ACK response: {ack}")
+                    return
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        "Failed to send %s signal. request_id=%s, destination=%s:%d, attempt=%d/%d, error=%s. ",
+                        signal_name,
+                        request_id,
+                        remote_host,
+                        remote_port,
+                        attempt,
+                        max_retries,
+                        e,
+                    )
+                    time.sleep(0.1)
+                else:
+                    raise RuntimeError(
+                        f"Failed to receive ACK for {signal_name} after {max_retries} attempts: {e}"
+                    ) from e
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass

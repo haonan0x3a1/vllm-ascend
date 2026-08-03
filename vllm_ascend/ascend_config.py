@@ -116,32 +116,17 @@ class SparseKVOffloadConfig:
             )
         if self.mode == "host" and kv_transfer_config is not None:
             connector = kv_transfer_config.kv_connector
-            if connector != "AscendStoreConnector":
+            if connector != "MooncakeLayerwiseConnector":
                 raise ValueError(
                     "sparse_kv_offload host mode with PD disaggregation "
-                    "currently requires AscendStoreConnector with the memcache "
-                    f"layerwise backend, got {connector!r}."
-                )
-            extra_config = kv_transfer_config.kv_connector_extra_config or {}
-            if not extra_config.get("use_layerwise", False):
-                raise ValueError("sparse_kv_offload host mode requires AscendStoreConnector use_layerwise=true.")
-            if str(extra_config.get("backend", "")).lower() != "memcache":
-                raise ValueError(
-                    "sparse_kv_offload host mode requires "
-                    "AscendStoreConnector backend='memcache' so the mixed "
-                    "Host/NPU cache tuple is transferred layerwise."
+                    "currently requires MooncakeLayerwiseConnector with NPU "
+                    f"transfer staging, got {connector!r}."
                 )
             if kv_transfer_config.kv_role not in {"kv_producer", "kv_consumer"}:
                 raise ValueError(
                     "sparse_kv_offload host mode currently supports only "
                     "PD-disaggregated kv_producer/kv_consumer roles, got "
                     f"{kv_transfer_config.kv_role!r}."
-                )
-            if kv_transfer_config.kv_role == "kv_consumer" and extra_config.get("consumer_is_to_load") is not True:
-                raise ValueError(
-                    "sparse_kv_offload host mode on the kv_consumer requires "
-                    "AscendStoreConnector consumer_is_to_load=true; otherwise "
-                    "the Decode scheduler will not claim or load the Prefill KV."
                 )
         if enable_sparse_c8:
             raise ValueError(f"sparse_kv_offload {self.mode} mode does not support sparse C8 KV cache.")

@@ -3924,7 +3924,25 @@ class NPUModelRunner(GPUModelRunner):
             self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group():
-            get_kv_transfer_group().register_kv_caches(kv_caches)
+            kv_transfer_group = get_kv_transfer_group()
+            sparse_staging = getattr(
+                self,
+                "_sparse_kv_offload_transfer_staging",
+                None,
+            )
+            if sparse_staging is not None:
+                register_staging = getattr(
+                    kv_transfer_group,
+                    "register_sparse_kv_offload_staging",
+                    None,
+                )
+                if not callable(register_staging):
+                    raise RuntimeError(
+                        "sparse_kv_offload host mode requires a KV connector "
+                        "that supports NPU transfer staging."
+                    )
+                register_staging(sparse_staging)
+            kv_transfer_group.register_kv_caches(kv_caches)
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
@@ -4075,6 +4093,11 @@ class NPUModelRunner(GPUModelRunner):
             indexer_alignment_bytes_per_layer=(
                 indexer_alignment_bytes_per_layer
             ),
+            shared_prefill_alignment_bytes=(
+                KV_TRANSFER_CACHE_ALIGNMENT_BYTES
+                if self.vllm_config.kv_transfer_config is not None
+                else 0
+            ),
         )
 
     def validate_sparse_kv_offload_memory(
@@ -4089,12 +4112,14 @@ class NPUModelRunner(GPUModelRunner):
 
         logger.info(
             "Sparse KV offload Host-mode NPU memory plan: total=%d, "
-            "indexer=%d, alignment=%d, shared_prefill=%d, selected=%d, "
+            "indexer=%d, alignment=%d, shared_prefill=%d, "
+            "shared_prefill_alignment=%d, selected=%d, "
             "metadata=%d, available=%d bytes.",
             plan.total_bytes,
             plan.indexer_cache_bytes,
             plan.indexer_alignment_bytes,
             plan.shared_prefill_bytes,
+            plan.shared_prefill_alignment_bytes,
             plan.selected_cache_bytes,
             plan.selection_metadata_bytes,
             available_memory_bytes,
@@ -4136,18 +4161,23 @@ class NPUModelRunner(GPUModelRunner):
 
         first_full_kv = kv_caches[sparse_layer_names[0]]
         assert isinstance(first_full_kv, tuple)
-        shared_prefill_kv = (
-            torch.empty(
-                tuple(first_full_kv[0].shape),
-                dtype=first_full_kv[0].dtype,
-                device=self.device,
-            ),
-            torch.empty(
-                tuple(first_full_kv[1].shape),
-                dtype=first_full_kv[1].dtype,
-                device=self.device,
-            ),
+        first_full_bytes = first_full_kv[0].nbytes
+        second_full_bytes = first_full_kv[1].nbytes
+        shared_prefill_raw = self._allocate_int8_cache_tensor(
+            first_full_bytes + second_full_bytes,
+            KV_TRANSFER_CACHE_ALIGNMENT_BYTES,
         )
+        shared_prefill_kv = (
+            shared_prefill_raw[:first_full_bytes]
+            .view(first_full_kv[0].dtype)
+            .view(first_full_kv[0].shape),
+            shared_prefill_raw[
+                first_full_bytes : first_full_bytes + second_full_bytes
+            ]
+            .view(first_full_kv[1].dtype)
+            .view(first_full_kv[1].shape),
+        )
+        self._sparse_kv_offload_transfer_staging = shared_prefill_kv
 
         for layer_name in sparse_layer_names:
             full_kv = kv_caches[layer_name]

@@ -202,6 +202,10 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(plan.indexer_cache_bytes, 5 * 128 * 128 * 2)
         self.assertEqual(plan.indexer_alignment_bytes, 2 * 1024 * 1024)
         self.assertEqual(plan.shared_prefill_bytes, 5 * 128 * 576 * 2)
+        self.assertEqual(
+            plan.shared_prefill_alignment_bytes,
+            2 * 1024 * 1024,
+        )
         self.assertEqual(plan.selected_cache_bytes, 2 * 2048 * 576 * 2)
         runner.validate_sparse_kv_offload_memory(
             kv_cache_config,
