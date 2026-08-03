@@ -890,15 +890,22 @@ def _run_connector_persist() -> int:
         sparse_host_staging_kv=staging,
     )
     receiver.persist_staged_layer("layer0", [1, 3])
+    final_npu_copy = tuple(torch.empty_like(tensor) for tensor in staging)
+    for npu_copy, swapped_tensor in zip(final_npu_copy, final):
+        # Reading a framework swapped tensor directly with .cpu() can enter
+        # devmm_h2h_copy and segfault on the validated CANN runtime. Mirror the
+        # production Gather direction by restoring it to NPU first.
+        npu_copy.copy_(swapped_tensor, non_blocking=False)
+    torch.npu.synchronize()
     verification = {
-        "full_nope_block_1": torch.equal(final[0][1].cpu(), staging[0][1].cpu()),
-        "full_nope_block_3": torch.equal(final[0][3].cpu(), staging[0][3].cpu()),
-        "full_rope_block_1": torch.equal(final[1][1].cpu(), staging[1][1].cpu()),
-        "full_rope_block_3": torch.equal(final[1][3].cpu(), staging[1][3].cpu()),
-        "full_nope_block_0_untouched": bool(torch.all(final[0][0].cpu() == -1)),
-        "full_nope_block_2_untouched": bool(torch.all(final[0][2].cpu() == -1)),
-        "full_rope_block_0_untouched": bool(torch.all(final[1][0].cpu() == -1)),
-        "full_rope_block_2_untouched": bool(torch.all(final[1][2].cpu() == -1)),
+        "full_nope_block_1": torch.equal(final_npu_copy[0][1].cpu(), staging[0][1].cpu()),
+        "full_nope_block_3": torch.equal(final_npu_copy[0][3].cpu(), staging[0][3].cpu()),
+        "full_rope_block_1": torch.equal(final_npu_copy[1][1].cpu(), staging[1][1].cpu()),
+        "full_rope_block_3": torch.equal(final_npu_copy[1][3].cpu(), staging[1][3].cpu()),
+        "full_nope_block_0_untouched": bool(torch.all(final_npu_copy[0][0].cpu() == -1)),
+        "full_nope_block_2_untouched": bool(torch.all(final_npu_copy[0][2].cpu() == -1)),
+        "full_rope_block_0_untouched": bool(torch.all(final_npu_copy[1][0].cpu() == -1)),
+        "full_rope_block_2_untouched": bool(torch.all(final_npu_copy[1][2].cpu() == -1)),
     }
     result = {
         "matches": all(verification.values()),
@@ -906,7 +913,7 @@ def _run_connector_persist() -> int:
         "verification": verification,
     }
     print(RESULT_MARKER + json.dumps(result, sort_keys=True), flush=True)
-    del receiver, final, staging, combined_staging, raw
+    del receiver, final_npu_copy, final, staging, combined_staging, raw
     gc.collect()
     torch.npu.synchronize()
     return 0 if result["matches"] else 1
