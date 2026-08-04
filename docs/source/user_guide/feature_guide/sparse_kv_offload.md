@@ -21,7 +21,9 @@ Atlas A3:
 
 The default `mirror` mode remains available as a lower-risk integration check.
 It keeps Full KV on the NPU and mirrors updated physical blocks into swapped
-memory. It validates Gather and SFA correctness but does not save HBM.
+memory. During Decode it compares selected-workspace SFA output with an SFA
+reference computed from framework Full KV and stops at the first mismatching
+layer. It validates Gather and SFA correctness but does not save HBM.
 
 `host` mode is the memory-saving implementation. It automatically reserves the
 number of logical blocks required by `max_model_len`, including vLLM's null

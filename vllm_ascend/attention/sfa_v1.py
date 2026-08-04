@@ -76,6 +76,9 @@ if TYPE_CHECKING:
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 
+SPARSE_KV_MIRROR_RTOL = 1e-2
+SPARSE_KV_MIRROR_ATOL = 1e-2
+
 O_PROJ_ACLNN_INPUT_PARAMS = (
     "aclnn_input_scale",
     "aclnn_input_scale_reciprocal",
@@ -1494,6 +1497,48 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key,
         )
 
+    def _validate_sparse_kv_offload_mirror_outputs(
+        self,
+        selected_output: torch.Tensor,
+        reference_output: torch.Tensor,
+        full_topk_indices: torch.Tensor,
+        full_actual_seq_lengths_key: torch.Tensor,
+        selected_actual_seq_lengths_key: torch.Tensor,
+    ) -> None:
+        """Fail at the first layer where Mirror mode changes SFA numerics."""
+        if torch.allclose(
+            selected_output,
+            reference_output,
+            rtol=SPARSE_KV_MIRROR_RTOL,
+            atol=SPARSE_KV_MIRROR_ATOL,
+        ):
+            return
+
+        # Mirror mode is a correctness diagnostic rather than a performance
+        # path. The device-to-host synchronizations below intentionally make a
+        # single failure self-contained enough to identify its runtime inputs.
+        absolute_difference = (selected_output.float() - reference_output.float()).abs()
+        max_abs_diff = absolute_difference.max().item()
+        mean_abs_diff = absolute_difference.mean().item()
+        topk_cpu = full_topk_indices.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+        valid_topk = topk_cpu[topk_cpu >= 0]
+        if valid_topk.numel() == 0:
+            topk_range = "empty"
+        else:
+            topk_range = f"[{int(valid_topk.min())}, {int(valid_topk.max())}]"
+
+        raise RuntimeError(
+            "sparse_kv_offload mirror verification failed at "
+            f"layer={self.layer_name!r}, tp_rank={self.tp_rank}: "
+            f"max_abs_diff={max_abs_diff:.6g}, "
+            f"mean_abs_diff={mean_abs_diff:.6g}, "
+            f"full_kv_lengths={full_actual_seq_lengths_key.detach().cpu().tolist()}, "
+            "selected_kv_lengths="
+            f"{selected_actual_seq_lengths_key.detach().cpu().tolist()}, "
+            f"valid_topk={valid_topk.numel()}/{topk_cpu.numel()}, "
+            f"topk_range={topk_range}."
+        )
+
     def forward(
         self,
         layer_name,
@@ -1850,6 +1895,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
 
+        verify_sparse_kv_mirror = (
+            self.sparse_kv_offload_config.enabled
+            and self.sparse_kv_offload_config.mode == "mirror"
+            and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+        )
+        if verify_sparse_kv_mirror:
+            full_topk_indices = topk_indices
+            full_actual_seq_lengths_query = actual_seq_lengths_query
+            full_actual_seq_lengths_key = actual_seq_lengths_key
+
         (
             kv_cache_for_attention,
             topk_indices,
@@ -1874,6 +1929,24 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query,
             actual_seq_lengths_key,
         )
+
+        if verify_sparse_kv_mirror:
+            reference_attn_output = self._execute_sparse_flash_attention_process(
+                ql_nope,
+                q_pe,
+                full_kv_cache,
+                full_topk_indices,
+                attn_metadata,
+                full_actual_seq_lengths_query,
+                full_actual_seq_lengths_key,
+            )
+            self._validate_sparse_kv_offload_mirror_outputs(
+                attn_output,
+                reference_attn_output,
+                full_topk_indices,
+                full_actual_seq_lengths_key,
+                actual_seq_lengths_key,
+            )
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()

@@ -434,6 +434,44 @@ def test_sfa_decode_switches_to_selected_kv_and_metadata():
     assert result[4] is selection.actual_seq_lengths_kv
 
 
+def test_mirror_output_validation_accepts_numerically_close_results():
+    fake_impl = MagicMock()
+    fake_impl.layer_name = "model.layers.0.self_attn"
+    fake_impl.tp_rank = 0
+
+    AscendSFAImpl._validate_sparse_kv_offload_mirror_outputs(
+        fake_impl,
+        torch.tensor([1.0, 2.0]),
+        torch.tensor([1.0, 2.001]),
+        torch.tensor([[[0, 1, -1, -1]]], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+    )
+
+
+def test_mirror_output_validation_reports_runtime_inputs_on_mismatch():
+    fake_impl = MagicMock()
+    fake_impl.layer_name = "model.layers.3.self_attn"
+    fake_impl.tp_rank = 2
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"layer='model.layers.3.self_attn', tp_rank=2: .*"
+            r"full_kv_lengths=\[18\], selected_kv_lengths=\[17\], "
+            r"valid_topk=2/4, topk_range=\[0, 17\]"
+        ),
+    ):
+        AscendSFAImpl._validate_sparse_kv_offload_mirror_outputs(
+            fake_impl,
+            torch.tensor([1.0, 2.0]),
+            torch.tensor([1.0, 3.0]),
+            torch.tensor([[[0, 17, -1, -1]]], dtype=torch.int32),
+            torch.tensor([18], dtype=torch.int32),
+            torch.tensor([17], dtype=torch.int32),
+        )
+
+
 def test_sfa_request_boundary_resets_existing_selection_workspace():
     workspace = MagicMock()
     fake_impl = MagicMock()
