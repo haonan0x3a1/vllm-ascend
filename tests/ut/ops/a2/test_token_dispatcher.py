@@ -58,6 +58,7 @@ def build_token_dispatch_input_fixture(
     comm_quant_mode: int | None = None,
     act_quant_type: torch.dtype | None = None,
     is_per_channel_weight: bool = False,
+    expert_smooth_scale: torch.Tensor | None = None,
     mc2_mask: torch.Tensor | None = None,
 ) -> MoETokenDispatchInput:
     mxfp_spec = None
@@ -73,6 +74,7 @@ def build_token_dispatch_input_fixture(
             mc2_mask=mc2_mask,
             apply_router_weight_on_input=apply_router_weight_on_input,
             pertoken_scale=pertoken_scale,
+            expert_smooth_scale=expert_smooth_scale,
         ),
         quant=MoEQuantParams(
             quant_type=quant_type,
@@ -305,6 +307,26 @@ class TestTokenDispatcherWithMC2(TestBase):
 
         self.assertEqual(kwargs["expert_token_nums_type"], EXPERT_TOKEN_NUMS_TYPE_CUMSUM)
 
+    def test_cann_moe_gmm_dispatch_passes_expert_smooth_scale(self):
+        hidden_states = torch.randn(10, 128)
+        topk_weights = torch.randn(10, 1)
+        topk_ids = torch.randint(0, 8, (10, 1))
+        expert_map = torch.arange(8)
+        smooth_scale = torch.ones(8, 128)
+
+        token_dispatch_input = build_token_dispatch_input_fixture(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            expert_map=expert_map,
+            quant_type=QuantType.W4A8,
+            is_per_channel_weight=True,
+            expert_smooth_scale=smooth_scale,
+        )
+        kwargs = self.dispatcher.get_dispatch_mc2_kwargs(token_dispatch_input)
+
+        self.assertIs(kwargs["scales"], smooth_scale)
+
     def test_get_combine_mc_kwargs_with_quant(self):
         hidden_states = torch.randn(10, 128)
         topk_ids = torch.randint(0, 8, (10, 1))
@@ -435,6 +457,44 @@ def test_allgather_token_dispatch_quant_mode_without_dynamic_scale():
         init_kwargs = mock_init_routing.call_args.kwargs
         assert init_kwargs["quant_mode"] == expected_quant_mode
         assert init_kwargs["act_quant_type"] == act_quant_type
+
+
+def test_allgather_cann_moe_gmm_quantizes_with_expert_smooth_scale():
+    dispatcher = TokenDispatcherWithAllGather(
+        top_k=2,
+        num_experts=8,
+        num_local_experts=8,
+    )
+    hidden_states = torch.randn(3, 128)
+    topk_weights = torch.tensor([[0.7, 0.3], [0.6, 0.4], [0.5, 0.5]])
+    topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int32)
+    expert_smooth_scale = torch.ones(8, 128)
+    returned_dynamic_scale = torch.ones(6)
+    init_routing_output = (
+        torch.randint(-8, 8, (6, 128), dtype=torch.int8),
+        torch.arange(6, dtype=torch.int32),
+        torch.tensor([1, 2, 2, 1, 0, 0, 0, 0], dtype=torch.int32),
+        returned_dynamic_scale,
+    )
+    token_dispatch_input = build_token_dispatch_input_fixture(
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        quant_type=QuantType.W4A8,
+        is_per_channel_weight=True,
+        expert_smooth_scale=expert_smooth_scale,
+    )
+
+    with patch(
+        "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_init_routing",
+        return_value=init_routing_output,
+    ) as mock_init_routing:
+        output = dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+
+    init_kwargs = mock_init_routing.call_args.kwargs
+    assert init_kwargs["scale"] is expert_smooth_scale
+    assert init_kwargs["quant_mode"] == 1
+    assert output.dynamic_scale is returned_dynamic_scale
 
 
 class TestTokenDispatcherWithAllGather(TestBase):

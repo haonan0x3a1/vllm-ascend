@@ -183,7 +183,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             kwargs_mc2["x_active_mask"] = token_dispatch_input.routing.mc2_mask
 
         stage1_kwargs = {
-            "scales": None,
+            "scales": token_dispatch_input.routing.expert_smooth_scale,
             "quant_mode": quant_mode,
             "group_ep": self.moe_all_to_all_group_name,
             "ep_world_size": self.ep_world_size,
@@ -364,6 +364,9 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         topk_ids = token_dispatch_input.topk_ids
         expert_map = token_dispatch_input.routing.expert_map
         dynamic_scale = token_dispatch_input.routing.pertoken_scale
+        expert_smooth_scale = token_dispatch_input.routing.expert_smooth_scale
+        if dynamic_scale is not None and expert_smooth_scale is not None:
+            raise ValueError("pertoken_scale and expert_smooth_scale cannot be supplied together.")
         quant_type = token_dispatch_input.quant.quant_type
         act_quant_type = (
             token_dispatch_input.quant.mxfp.act_quant_type if token_dispatch_input.quant.mxfp is not None else None
@@ -400,7 +403,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         sorted_hidden_states, expanded_row_idx, expert_tokens, dynamic_scale = DeviceOperator.npu_moe_init_routing(
             hidden_states,
             topk_ids,
-            scale=dynamic_scale,
+            scale=expert_smooth_scale if expert_smooth_scale is not None else dynamic_scale,
             active_num=num_tokens * self.top_k,
             expert_num=global_num_experts,
             expert_tokens_num_type=1,
@@ -474,6 +477,10 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         self,
         token_dispatch_input: MoETokenDispatchInput,
     ):
+        if token_dispatch_input.routing.expert_smooth_scale is not None:
+            raise NotImplementedError(
+                "CANN MoEGMM expert smooth scales are not supported by the AllToAllV dispatcher yet."
+            )
         with_quant = token_dispatch_input.quant.is_int_quant or token_dispatch_input.quant.is_fp8
         hidden_states = token_dispatch_input.hidden_states
         topk_weights = token_dispatch_input.topk_weights

@@ -146,6 +146,9 @@ def build_fused_experts_input(
     w2_scale_bias: list[torch.Tensor] | torch.Tensor | None = None,
     w1_offset: torch.Tensor | None = None,
     w2_offset: torch.Tensor | None = None,
+    w2_alpha: torch.Tensor | None = None,
+    expert_smooth_scale: torch.Tensor | None = None,
+    is_cann_moe_gmm: bool = False,
     swiglu_limit: float | None = 0.0,
 ) -> MoEFusedExpertsInput:
     if not vllm_version_is("0.23.0") and swiglu_limit is None:
@@ -167,6 +170,7 @@ def build_fused_experts_input(
             w2_scale_bias=w2_scale_bias,
             w1_offset=w1_offset,
             w2_offset=w2_offset,
+            w2_alpha=w2_alpha,
         ),
         routing=MoERoutingParams(
             expert_map=expert_map,
@@ -175,6 +179,7 @@ def build_fused_experts_input(
             apply_router_weight_on_input=apply_router_weight_on_input,
             log2phy=log2phy,
             pertoken_scale=pertoken_scale,
+            expert_smooth_scale=expert_smooth_scale,
         ),
         activation=activation,
         need_trans=need_trans,
@@ -191,6 +196,7 @@ def build_fused_experts_input(
                 mxfp_use_bf16=mxfp_use_bf16,
             ),
             is_per_channel_weight=is_per_channel_weight,
+            is_cann_moe_gmm=is_cann_moe_gmm,
         ),
         swiglu_limit=swiglu_limit,
     )

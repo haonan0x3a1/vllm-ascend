@@ -1,11 +1,16 @@
 import unittest
 from typing import ClassVar
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
-from vllm_ascend.ops.fused_moe.moe_mlp import cumsum_group_list, unified_apply_mlp, unquant_apply_mlp
+from vllm_ascend.ops.fused_moe.moe_mlp import (
+    cann_moe_gmm_apply_mlp,
+    cumsum_group_list,
+    unified_apply_mlp,
+    unquant_apply_mlp,
+)
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEMlpComputeInput,
     MoEQuantParams,
@@ -62,8 +67,108 @@ class TestW4A8RuntimeFlags(unittest.TestCase):
             MoEQuantParams(quant_type=QuantType.W8A8, is_per_channel_weight=True).use_w4a8_per_channel_gmm_swiglu
         )
 
+    def test_cann_moe_gmm_runtime_flag(self):
+        self.assertTrue(MoEQuantParams(quant_type=QuantType.W4A8, is_cann_moe_gmm=True).is_cann_moe_gmm)
+
 
 class TestUnifiedApplyMlpRequest(unittest.TestCase):
+    def test_cann_moe_gmm_runs_reference_operator_sequence(self):
+        hidden_states = torch.randint(-8, 8, (2, 8), dtype=torch.int8)
+        w1 = torch.zeros(1, 8, 4, dtype=torch.int32)
+        w2 = torch.zeros(1, 4, 2, dtype=torch.int32)
+        w1_scale = torch.ones(1, 1, 8, dtype=torch.int64)
+        w2_scale = torch.ones(1, 1, 4, dtype=torch.int64)
+        w1_bias = torch.zeros(1, 8)
+        w2_bias = torch.zeros(1, 4)
+        w2_alpha = torch.ones(1)
+        dynamic_scale = torch.ones(2)
+        group_list = torch.tensor([1, 1], dtype=torch.int64)
+        gate_up = torch.randn(2, 8, dtype=torch.bfloat16)
+        intermediate = torch.randint(-8, 8, (2, 4), dtype=torch.int8)
+        intermediate_scale = torch.ones(2)
+        expected = torch.randn(2, 4, dtype=torch.bfloat16)
+        expected_event = object()
+        stream = MagicMock()
+        stream.record_event.return_value = expected_event
+
+        with (
+            patch(
+                "vllm_ascend.ops.fused_moe.moe_mlp.torch_npu.npu_grouped_matmul",
+                side_effect=[[gate_up], [expected]],
+            ) as mock_grouped_matmul,
+            patch(
+                "vllm_ascend.ops.fused_moe.moe_mlp.torch_npu.npu_swiglu_clip_quant",
+                return_value=(intermediate, intermediate_scale),
+            ) as mock_swiglu,
+            patch(
+                "vllm_ascend.ops.fused_moe.moe_mlp.torch.npu.current_stream",
+                return_value=stream,
+            ),
+        ):
+            output, event = cann_moe_gmm_apply_mlp(
+                hidden_states=hidden_states,
+                w1=w1,
+                w1_scale=w1_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+                w1_bias=w1_bias,
+                w2_bias=w2_bias,
+                w2_alpha=w2_alpha,
+                dynamic_scale=dynamic_scale,
+                group_list=group_list,
+                group_list_type=1,
+            )
+
+        self.assertTrue(output is expected)
+        self.assertTrue(event is expected_event)
+        self.assertEqual(mock_grouped_matmul.call_count, 2)
+        self.assertIs(mock_grouped_matmul.call_args_list[0].kwargs["bias"][0], w1_bias)
+        self.assertIs(mock_grouped_matmul.call_args_list[0].kwargs["scale"][0], w1_scale)
+        self.assertIs(mock_grouped_matmul.call_args_list[1].kwargs["bias"][0], w2_bias)
+        self.assertIs(mock_grouped_matmul.call_args_list[1].kwargs["scale"][0], w2_scale)
+        mock_swiglu.assert_called_once_with(
+            gate_up,
+            group_list,
+            w2_alpha,
+            activate_left=True,
+            quant_mode=1,
+            clamp_mode=1,
+        )
+
+    def test_request_cann_moe_gmm_path(self):
+        expected = torch.randn(2, 8)
+        mlp_compute_input = MoEMlpComputeInput(
+            hidden_states=torch.randint(-8, 8, (2, 8), dtype=torch.int8),
+            group_list=torch.tensor([1, 1], dtype=torch.int64),
+            group_list_type=1,
+            dynamic_scale=torch.ones(2),
+            topk_scales=None,
+            weights=MoEWeights(
+                w1=torch.zeros(1, 8, 4, dtype=torch.int32),
+                w2=torch.zeros(1, 4, 2, dtype=torch.int32),
+                w1_bias=torch.zeros(1, 8),
+                w2_bias=torch.zeros(1, 4),
+                w1_scale=torch.ones(1, 8, dtype=torch.int64),
+                w2_scale=torch.ones(1, 4, dtype=torch.int64),
+                w2_alpha=torch.ones(1),
+            ),
+            quant=MoEQuantParams(quant_type=QuantType.W4A8, is_cann_moe_gmm=True),
+            fusion=False,
+        )
+
+        with (
+            patch(
+                "vllm_ascend.ops.fused_moe.moe_mlp.cann_moe_gmm_apply_mlp",
+                return_value=expected,
+            ) as mock_cann_mlp,
+            patch("vllm_ascend.ops.fused_moe.moe_mlp.quant_apply_mlp") as mock_quant,
+        ):
+            output = unified_apply_mlp(mlp_compute_input=mlp_compute_input)
+
+        self.assertTrue(output is expected)
+        mock_cann_mlp.assert_called_once()
+        mock_quant.assert_not_called()
+
     def test_unquant_apply_mlp_wraps_tensor_weights_for_grouped_matmul(self):
         hidden_states = torch.randn(2, 8)
         gate_up_out = torch.randn(2, 16)

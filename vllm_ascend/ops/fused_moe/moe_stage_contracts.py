@@ -53,6 +53,7 @@ class MoEWeights:
     w2_scale_bias: torch.Tensor | list[torch.Tensor] | None = None
     w1_offset: torch.Tensor | None = None
     w2_offset: torch.Tensor | None = None
+    w2_alpha: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)

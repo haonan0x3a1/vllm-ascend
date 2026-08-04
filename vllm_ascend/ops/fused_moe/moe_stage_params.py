@@ -41,6 +41,8 @@ class MoERoutingParams:
     log2phy: torch.Tensor | None = None
     # Precomputed activation scales from prepare stage for quantized dispatch.
     pertoken_scale: torch.Tensor | None = None
+    # Per-expert input smooth scales used by CANN MoEGMM checkpoints.
+    expert_smooth_scale: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +64,7 @@ class MoEQuantParams:
     comm_quant_mode: int | None = None
     mxfp: MoEMxfpParams | None = None
     is_per_channel_weight: bool = False
+    is_cann_moe_gmm: bool = False
 
     @property
     def is_quant(self) -> bool:

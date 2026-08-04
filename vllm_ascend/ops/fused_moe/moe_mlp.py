@@ -85,6 +85,70 @@ def _require_single_tensor_for_swiglu_quant(
     return tensor_or_list
 
 
+def cann_moe_gmm_apply_mlp(
+    *,
+    hidden_states: torch.Tensor,
+    w1: list[torch.Tensor] | torch.Tensor,
+    w1_scale: list[torch.Tensor] | torch.Tensor,
+    w2: list[torch.Tensor] | torch.Tensor,
+    w2_scale: list[torch.Tensor] | torch.Tensor,
+    w1_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+    w2_alpha: torch.Tensor | None,
+    dynamic_scale: torch.Tensor | None,
+    group_list: torch.Tensor,
+    group_list_type: int,
+) -> tuple[torch.Tensor, torch.npu.Event]:
+    """Run the CANN recipe pre-packed W4A8 MoEGMM MLP sequence."""
+
+    if w1_bias is None or w2_bias is None or w2_alpha is None:
+        raise ValueError("CANN MoEGMM requires w1_bias, w2_bias, and w2_alpha.")
+    if dynamic_scale is None:
+        raise ValueError("CANN MoEGMM requires per-token scales from token dispatch.")
+
+    w1_tensor = _require_single_tensor_for_swiglu_quant(w1, name="w1")
+    w2_tensor = _require_single_tensor_for_swiglu_quant(w2, name="w2")
+    w1_scale_tensor = _require_single_tensor_for_swiglu_quant(w1_scale, name="w1_scale")
+    w2_scale_tensor = _require_single_tensor_for_swiglu_quant(w2_scale, name="w2_scale")
+
+    gate_up = torch_npu.npu_grouped_matmul(
+        [hidden_states],
+        [w1_tensor],
+        bias=[w1_bias],
+        scale=[w1_scale_tensor],
+        per_token_scale=[dynamic_scale],
+        group_list=group_list,
+        split_item=3,
+        output_dtype=torch.bfloat16,
+        group_type=0,
+        group_list_type=group_list_type,
+        act_type=0,
+    )[0]
+    intermediate, intermediate_scale = torch_npu.npu_swiglu_clip_quant(
+        gate_up,
+        group_list,
+        w2_alpha,
+        activate_left=True,
+        quant_mode=1,
+        clamp_mode=1,
+    )
+    before_gmm2_evt = torch.npu.current_stream().record_event()
+    output = torch_npu.npu_grouped_matmul(
+        [intermediate],
+        [w2_tensor],
+        bias=[w2_bias],
+        scale=[w2_scale_tensor],
+        per_token_scale=[intermediate_scale],
+        group_list=group_list,
+        split_item=3,
+        output_dtype=torch.bfloat16,
+        group_type=0,
+        group_list_type=group_list_type,
+        act_type=0,
+    )[0]
+    return output, before_gmm2_evt
+
+
 def quant_apply_mlp(
     hidden_states: torch.Tensor,
     w1: list[torch.Tensor] | torch.Tensor,
@@ -446,6 +510,21 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     dynamic_eplb = mlp_compute_input.dynamic_eplb
     fusion = mlp_compute_input.fusion
     swiglu_limit = mlp_compute_input.swiglu_limit
+
+    if mlp_compute_input.quant.is_cann_moe_gmm:
+        return cann_moe_gmm_apply_mlp(
+            hidden_states=hidden_states,
+            w1=w1,
+            w1_scale=w1_scale,
+            w2=w2,
+            w2_scale=w2_scale,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
+            w2_alpha=mlp_compute_input.weights.w2_alpha,
+            dynamic_scale=dynamic_scale,
+            group_list=group_list,
+            group_list_type=group_list_type,
+        )
 
     if not mlp_compute_input.quant.is_quant:
         return unquant_apply_mlp(

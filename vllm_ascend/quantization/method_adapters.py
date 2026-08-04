@@ -17,6 +17,7 @@
 #
 
 from collections.abc import Callable
+from functools import partial
 
 import torch
 from vllm.distributed import get_tensor_model_parallel_rank
@@ -32,6 +33,35 @@ from vllm_ascend.distributed.parallel_state import get_flashcomm2_otp_group, get
 from vllm_ascend.utils import enable_dsa_cp_with_layer_shard, flashcomm2_enable, mlp_tp_enable, oproj_tp_enable
 
 from .methods import AscendAttentionScheme, AscendLinearScheme, AscendMoEScheme, is_mx_quant_type
+
+
+def _load_cann_moe_gmm_aux_parameter(
+    base_weight_loader: Callable,
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+    weight_name: str,
+    shard_id: str,
+    expert_id: int,
+    return_success: bool = False,
+) -> bool | None:
+    """Load CANN MoEGMM bias/alpha through vLLM's expert sharding path.
+
+    The upstream FusedMoE loader already has the correct TP/EP handling for
+    per-channel tensors, but only dispatches that path for scale-like names.
+    CANN checkpoints store equivalent expert-wise auxiliary tensors under
+    ``bias`` and ``alpha`` names. Marking the delegated name as scale-like
+    reuses the existing sharding logic without patching vLLM Core.
+    """
+
+    delegated_weight_name = f"{weight_name}.scale"
+    return base_weight_loader(
+        param,
+        loaded_weight,
+        delegated_weight_name,
+        shard_id=shard_id,
+        expert_id=expert_id,
+        return_success=return_success,
+    )
 
 
 class AscendLinearMethod(LinearMethodBase):
@@ -222,6 +252,7 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
+        base_weight_loader = extra_weight_attrs.get("weight_loader")
         weight_param = self.quant_method.get_weight(
             num_experts, intermediate_size_per_partition, hidden_size, params_dtype
         )
@@ -243,6 +274,14 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
             param = torch.nn.Parameter(param_value, requires_grad=False)
             layer.register_parameter(param_key, param)
             set_weight_attrs(param, extra_weight_attrs)
+            if (
+                getattr(self.quant_method, "is_cann_moe_gmm", False)
+                and param_key in {"w13_bias", "w2_bias", "w2_alpha"}
+                and base_weight_loader is not None
+            ):
+                auxiliary_loader = partial(_load_cann_moe_gmm_aux_parameter, base_weight_loader)
+                auxiliary_loader.supports_moe_loading = True  # type: ignore[attr-defined]
+                param.weight_loader = auxiliary_loader
             if any(fields in param_key for fields in per_group_param):
                 param.quant_method = FusedMoeWeightScaleSupported.GROUP.value
 

@@ -29,6 +29,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.quantization.constants import ASCEND_MOE_TARGET_KEY, CANN_MOE_GMM_TARGET
 from vllm_ascend.utils import COMPRESSED_TENSORS_METHOD, maybe_trans_nz
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
@@ -356,6 +357,9 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         self.new_quant_version = quant_version == "1.0.0"
 
         self.quant_method = vllm_config.quant_config.quant_description.get("ascend_quant_method", "")
+        self.is_cann_moe_gmm = (
+            vllm_config.quant_config.quant_description.get(ASCEND_MOE_TARGET_KEY) == CANN_MOE_GMM_TARGET
+        )
         if self.quant_method == COMPRESSED_TENSORS_METHOD:
             self.weight_strategy = vllm_config.quant_config.quant_description.get("weight_strategy", "group")
 
@@ -363,6 +367,10 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             1 if vllm_config.parallel_config.enable_expert_parallel else get_tensor_model_parallel_world_size()
         )
         self.dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
+        if self.is_cann_moe_gmm and self.dynamic_eplb:
+            raise NotImplementedError(
+                "CANN MoEGMM checkpoints do not support dynamic EPLB yet."
+            )
         if self.new_quant_version and self.tp_size > 16:
             raise ValueError("The current weight does not support moe part tp>16.")
 
@@ -378,12 +386,41 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
     def get_weight(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
+        if self.is_cann_moe_gmm:
+            return self.get_weight_cann_moe_gmm(
+                num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype
+            )
         if self.quant_method == COMPRESSED_TENSORS_METHOD:
             return self.get_weight_compressed_tensors(
                 num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype
             )
         else:
             return self.get_weight_modelslim(num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype)
+
+    @staticmethod
+    def get_weight_cann_moe_gmm(
+        num_experts: int,
+        intermediate_size_per_partition: int,
+        hidden_sizes: int,
+        params_dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        del params_dtype
+        # CANN MoEGMM checkpoints store two signed int4 values in each int8
+        # element along the expert output dimension.
+        return {
+            "w13_weight": torch.empty(
+                num_experts,
+                intermediate_size_per_partition,
+                hidden_sizes,
+                dtype=torch.int8,
+            ),
+            "w2_weight": torch.empty(
+                num_experts,
+                hidden_sizes // 2,
+                intermediate_size_per_partition,
+                dtype=torch.int8,
+            ),
+        }
 
     def get_weight_compressed_tensors(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
@@ -417,6 +454,10 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
     def get_dynamic_quant_param(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
+        if self.is_cann_moe_gmm:
+            return self.get_dynamic_quant_param_cann_moe_gmm(
+                num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype
+            )
         if self.quant_method == COMPRESSED_TENSORS_METHOD:
             return self.get_dynamic_quant_param_compressed_tensors(
                 num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype
@@ -425,6 +466,31 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             return self.get_dynamic_quant_param_modelslim(
                 num_experts, intermediate_size_per_partition, hidden_sizes, params_dtype
             )
+
+    @staticmethod
+    def get_dynamic_quant_param_cann_moe_gmm(
+        num_experts: int,
+        intermediate_size_per_partition: int,
+        hidden_sizes: int,
+        params_dtype: torch.dtype,
+    ) -> dict[str, Any]:
+        del params_dtype
+        # Keep a trailing singleton dimension on scales/alpha so the upstream
+        # expert loader can shard and copy the per-projection checkpoint
+        # tensors without model-specific changes in vLLM Core.
+        return {
+            "w13_bias": torch.empty(num_experts, 2 * intermediate_size_per_partition, dtype=torch.float32),
+            "w2_bias": torch.empty(num_experts, hidden_sizes, dtype=torch.float32),
+            "w13_weight_scale": torch.empty(
+                num_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.int64
+            ),
+            "w2_weight_scale": torch.empty(num_experts, hidden_sizes, 1, dtype=torch.int64),
+            "smooth_scale_1": torch.ones(num_experts, hidden_sizes, dtype=torch.float32),
+            "smooth_scale_2": torch.ones(
+                num_experts, intermediate_size_per_partition, dtype=torch.float32
+            ),
+            "w2_alpha": torch.ones(num_experts, 1, dtype=torch.float32),
+        }
 
     def get_dynamic_quant_param_compressed_tensors(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
@@ -566,6 +632,11 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             w1_scale_bias = [layer.w13_scale_bias.detach()] if hasattr(layer, "w13_scale_bias") else None
             w2_scale_bias = [layer.w2_scale_bias.detach()] if hasattr(layer, "w2_scale_bias") else None
 
+        w1_bias = layer.w13_bias if self.is_cann_moe_gmm else None
+        w2_bias = layer.w2_bias if self.is_cann_moe_gmm else None
+        w2_alpha = layer.w2_alpha if self.is_cann_moe_gmm else None
+        expert_smooth_scale = layer.smooth_scale_1 if self.is_cann_moe_gmm else None
+
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         return moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
@@ -574,6 +645,8 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                 topk_ids=topk_ids,
                 w1=w1,
                 w2=w2,
+                w1_bias=w1_bias,
+                w2_bias=w2_bias,
                 quant_type=self.quant_type,
                 dynamic_eplb=self.dynamic_eplb,
                 expert_map=expert_map,
@@ -587,7 +660,10 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
                 w2_scale=w2_scale,
                 w1_scale_bias=w1_scale_bias,
                 w2_scale_bias=w2_scale_bias,
+                w2_alpha=w2_alpha,
+                expert_smooth_scale=expert_smooth_scale,
                 is_per_channel_weight=self.is_per_channel_weight,
+                is_cann_moe_gmm=self.is_cann_moe_gmm,
                 swiglu_limit=layer.swiglu_limit,
             )
         )
@@ -636,7 +712,11 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             layer.register_parameter("w2_scale_bias", w2_scale_bias)
 
     def pack_to_int32(self, weight: torch.Tensor):
-        if self.new_quant_version or self.quant_method == COMPRESSED_TENSORS_METHOD:
+        if (
+            self.new_quant_version
+            or self.quant_method == COMPRESSED_TENSORS_METHOD
+            or self.is_cann_moe_gmm
+        ):
             # pack 4 int8(int4*2) to int32, because in pytorch, we need to use int32 to represent int4
             assert weight.shape[-1] % 4 == 0, (
                 f"the last dim of weight needs to be divided by 4 but got shape {weight.shape}"
@@ -665,10 +745,30 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         return scale
 
     def process_weights_after_loading(self, layer):
-        if self.quant_method == COMPRESSED_TENSORS_METHOD:
+        if self.is_cann_moe_gmm:
+            self.process_weights_after_loading_cann_moe_gmm(layer)
+        elif self.quant_method == COMPRESSED_TENSORS_METHOD:
             self.process_weights_after_loading_compressed_tensors(layer)
         else:
             self.process_weights_after_loading_modelslim(layer)
+
+    def process_weights_after_loading_cann_moe_gmm(self, layer):
+        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
+        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
+        layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
+        layer.w13_weight.data = self.pack_to_int32(layer.w13_weight.data)
+        layer.w2_weight.data = self.pack_to_int32(layer.w2_weight.data)
+
+        # Checkpoint scales are [out_features, 1]. GMM expects the fused
+        # expert payload in [num_experts, 1, out_features] layout.
+        layer.w13_weight_scale.data = layer.w13_weight_scale.data.transpose(1, 2).contiguous()
+        layer.w2_weight_scale.data = layer.w2_weight_scale.data.transpose(1, 2).contiguous()
+        layer.w13_bias.data = layer.w13_bias.data.to(torch.float32)
+        layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
+        layer.w2_alpha.data = layer.w2_alpha.data.squeeze(-1).to(torch.float32)
+        layer.smooth_scale_1.data = layer.smooth_scale_1.data.to(torch.float32)
+        layer.smooth_scale_2.data = layer.smooth_scale_2.data.to(torch.float32)
 
     def process_weights_after_loading_compressed_tensors(self, layer):
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()

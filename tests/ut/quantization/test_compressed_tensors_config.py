@@ -9,6 +9,7 @@ from tests.ut.base import TestBase
 from tests.ut.quantization.conftest_quantization import COMPRESSED_TENSORS_W8A8_CONFIG
 from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 from vllm_ascend.quantization.compressed_tensors_config import AscendCompressedTensorsConfig
+from vllm_ascend.quantization.constants import ASCEND_MOE_TARGET_KEY, CANN_MOE_GMM_TARGET
 from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod, AscendLinearMethod
 from vllm_ascend.quantization.methods import AscendW8A8DynamicFusedMoEMethod, AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import COMPRESSED_TENSORS_METHOD, vllm_version_is
@@ -74,6 +75,32 @@ class TestAscendCompressedTensorsQuanType(TestBase):
         input_q = self._make_input_quant(num_bits=2, strategy="tensor", dynamic=False, symmetric=True)
         with self.assertRaises(NotImplementedError):
             self.config._detect_quant_type(weight, input_q, "int_quantized")
+
+    def test_moe_gmm_target_takes_priority_over_linear_fallback(self):
+        linear_scheme = {"weights": "linear"}
+        moe_scheme = {"weights": "moe"}
+        self.config.target_scheme_map = {
+            "Linear": linear_scheme,
+            CANN_MOE_GMM_TARGET: moe_scheme,
+        }
+
+        self.config._add_fused_moe_to_target_scheme_map()
+
+        self.assertIs(self.config.target_scheme_map["FusedMoE"], moe_scheme)
+
+    def test_moe_gmm_scheme_marks_checkpoint_layout(self):
+        self.config.target_scheme_map = {CANN_MOE_GMM_TARGET: {}}
+        layer = MagicMock()
+        sentinel = MagicMock()
+
+        with (
+            patch.object(self.config, "_get_quant_args", return_value=(MagicMock(), MagicMock(), "int-quantized")),
+            patch.object(self.config, "_create_scheme_for_layer_type", return_value=sentinel),
+        ):
+            result = self.config._get_moe_scheme(layer, "model.layers.3.mlp.experts.0.gate_proj")
+
+        self.assertIs(result, sentinel)
+        self.assertEqual(self.config.quant_description[ASCEND_MOE_TARGET_KEY], CANN_MOE_GMM_TARGET)
 
 
 class TestAscendCompressedTensorsConfigGetQuantMethod(TestBase):

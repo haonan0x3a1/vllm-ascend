@@ -324,6 +324,73 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
         result = self.quant_method.get_weight(self.experts, self.input_size, self.output_size, torch.bfloat16)
         self.assertEqual(result["w13_weight"].dtype, torch.int8)
 
+    def test_get_weight_cann_moe_gmm_uses_prepacked_shapes(self):
+        self.quant_method.is_cann_moe_gmm = True
+        result = self.quant_method.get_weight(self.experts, self.input_size, self.output_size, torch.bfloat16)
+
+        self.assertEqual(result["w13_weight"].shape, (self.experts, self.input_size, self.output_size))
+        self.assertEqual(
+            result["w2_weight"].shape,
+            (self.experts, self.output_size // 2, self.input_size),
+        )
+
+    def test_get_dynamic_quant_param_cann_moe_gmm(self):
+        self.quant_method.is_cann_moe_gmm = True
+        result = self.quant_method.get_dynamic_quant_param(
+            self.experts, self.input_size, self.output_size, torch.bfloat16
+        )
+
+        self.assertEqual(result["w13_bias"].shape, (self.experts, 2 * self.input_size))
+        self.assertEqual(result["w2_bias"].shape, (self.experts, self.output_size))
+        self.assertEqual(result["w13_weight_scale"].dtype, torch.int64)
+        self.assertEqual(result["w13_weight_scale"].shape, (self.experts, 2 * self.input_size, 1))
+        self.assertEqual(result["w2_alpha"].shape, (self.experts, 1))
+
+    @patch("vllm_ascend.quantization.methods.w4a8.maybe_trans_nz")
+    def test_process_weights_after_loading_cann_moe_gmm(self, mock_maybe_trans_nz):
+        mock_maybe_trans_nz.side_effect = identity
+        self.quant_method.is_cann_moe_gmm = True
+        layer = torch.nn.Module()
+        tensors = {
+            **self.quant_method.get_weight(
+                self.experts,
+                self.input_size,
+                self.output_size,
+                torch.bfloat16,
+            ),
+            **self.quant_method.get_dynamic_quant_param(
+                self.experts,
+                self.input_size,
+                self.output_size,
+                torch.bfloat16,
+            ),
+        }
+        for name, tensor in tensors.items():
+            layer.register_parameter(
+                name,
+                torch.nn.Parameter(tensor, requires_grad=False),
+            )
+
+        self.quant_method.process_weights_after_loading(layer)
+
+        self.assertEqual(
+            layer.w13_weight.shape,
+            (self.experts, self.output_size, self.input_size // 4),
+        )
+        self.assertEqual(
+            layer.w2_weight.shape,
+            (self.experts, self.input_size, self.output_size // 8),
+        )
+        self.assertEqual(
+            layer.w13_weight_scale.shape,
+            (self.experts, 1, 2 * self.input_size),
+        )
+        self.assertEqual(
+            layer.w2_weight_scale.shape,
+            (self.experts, 1, self.output_size),
+        )
+        self.assertEqual(layer.w2_alpha.shape, (self.experts,))
+
     def test_get_dynamic_quant_param_compressed_tensors(self):
         self.quant_method.quant_method = COMPRESSED_TENSORS_METHOD
         result = self.quant_method.get_dynamic_quant_param(

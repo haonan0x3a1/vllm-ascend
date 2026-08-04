@@ -34,6 +34,7 @@ from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_ascend.utils import COMPRESSED_TENSORS_METHOD, vllm_version_is
 
+from .constants import ASCEND_MOE_TARGET_KEY, CANN_MOE_GMM_TARGET
 from .methods import AscendLinearScheme, AscendMoEScheme
 
 if vllm_version_is("0.23.0"):
@@ -104,9 +105,17 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
         targeting 'Linear' needs to also match
         FusedMoE modules.
         """
-        if "Linear" not in self.target_scheme_map or "FusedMoE" in self.target_scheme_map:
+        if "FusedMoE" in self.target_scheme_map:
             return
-        self.target_scheme_map["FusedMoE"] = self.target_scheme_map["Linear"]
+
+        # CANN recipe checkpoints may describe routed experts with the
+        # ``MoEGMM`` target. Prefer that explicit MoE scheme over the generic
+        # Linear fallback: its W4A8 weights are already packed and therefore
+        # require a different allocation/loading path.
+        if CANN_MOE_GMM_TARGET in self.target_scheme_map:
+            self.target_scheme_map["FusedMoE"] = self.target_scheme_map[CANN_MOE_GMM_TARGET]
+        elif "Linear" in self.target_scheme_map:
+            self.target_scheme_map["FusedMoE"] = self.target_scheme_map["Linear"]
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "AscendCompressedTensorsConfig":
@@ -226,6 +235,14 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
         """
         # Add FusedMoE to target scheme map if needed
         self._add_fused_moe_to_target_scheme_map()
+
+        if self.quant_description is not None:
+            moe_target = (
+                CANN_MOE_GMM_TARGET
+                if CANN_MOE_GMM_TARGET in self.target_scheme_map
+                else "FusedMoE"
+            )
+            self.quant_description[ASCEND_MOE_TARGET_KEY] = moe_target
 
         weight_quant, input_quant, format = self._get_quant_args(layer, layer_name)
         if weight_quant is None:

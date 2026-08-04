@@ -9,6 +9,7 @@ from vllm_ascend.quantization.method_adapters import (
     AscendFusedMoEMethod,
     AscendKVCacheMethod,
     AscendLinearMethod,
+    _load_cann_moe_gmm_aux_parameter,
 )
 from vllm_ascend.quantization.methods.base import AscendAttentionScheme, AscendLinearScheme, AscendMoEScheme
 
@@ -190,3 +191,21 @@ class TestAscendFusedMoEMethod(TestBase):
         self.mock_scheme.apply.return_value = None
         self.method.apply(layer, x, router_logits, top_k, renormalize)
         self.mock_scheme.apply.assert_called_once()
+
+    def test_cann_moe_gmm_aux_loader_reuses_scale_sharding(self):
+        base_loader = MagicMock(return_value=True)
+        param = torch.nn.Parameter(torch.empty(2, 4), requires_grad=False)
+        loaded = torch.ones(4)
+
+        result = _load_cann_moe_gmm_aux_parameter(
+            base_loader,
+            param,
+            loaded,
+            "model.layers.3.mlp.experts.w13_bias",
+            shard_id="w1",
+            expert_id=2,
+            return_success=True,
+        )
+
+        self.assertTrue(result)
+        self.assertTrue(base_loader.call_args.args[2].endswith(".scale"))
