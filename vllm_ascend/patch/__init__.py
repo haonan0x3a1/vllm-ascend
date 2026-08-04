@@ -776,21 +776,23 @@
 #
 #   2. `vllm.model_executor.models.deepseek_v2.DeepseekV2Model.load_weights`
 #    Why:
-#       Ascend W4A8 checkpoints can contain dense-projection ``*.alpha``
-#       activation clip metadata that the dynamic W8A8 linear scheme does not
-#       register or consume. Upstream treats unknown non-bias tensors as required
-#       parameters and raises ``KeyError`` while loading these checkpoints.
+#       Ascend W4A8C8 checkpoints can contain activation clip ``*.alpha``, KV
+#       clip ``ckv_a_alpha``, and Indexer Hadamard metadata that are not always
+#       registered or consumed by the selected runtime path. Upstream treats
+#       unknown non-bias tensors as required parameters and raises ``KeyError``
+#       while loading these checkpoints.
 #    How:
-#       Filter only unregistered, non-expert ``*.alpha`` tensors before calling
-#       the upstream loader. Expert ``down_proj.alpha`` remains available for the
-#       CANN MoE GMM ``w2_alpha`` mapping, and unrelated unknown tensors still
-#       retain upstream failure behavior.
+#       Filter only unregistered converter-defined auxiliary tensors before
+#       calling the upstream loader. Registered tensors and expert
+#       ``down_proj.alpha`` remain available for their runtime consumers, and
+#       unrelated unknown tensors retain upstream failure behavior.
 #    Related PR (if no, explain why):
 #       No upstream PR. This checkpoint metadata and its consumer are
 #       Ascend-specific.
 #    Future Plan:
-#       Remove this patch if the Ascend dynamic W8A8 linear scheme consumes the
-#       activation clip metadata directly.
+#       Remove this patch when all converter-defined auxiliary tensors are
+#       represented by explicit runtime parameters or filtered by the upstream
+#       model loader.
 #
 # ** 19b. File: worker/model_runner_v1.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

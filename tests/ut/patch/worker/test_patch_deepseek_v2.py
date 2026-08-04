@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from vllm_ascend.patch.worker.patch_deepseek_v2 import (
-    _filter_unregistered_non_expert_alpha_weights,
+    _filter_unregistered_ascend_auxiliary_weights,
     _should_skip_indexer_init,
 )
 
@@ -49,7 +49,7 @@ def test_dense_checkpoint_only_alpha_is_filtered():
     ]
 
     filtered = list(
-        _filter_unregistered_non_expert_alpha_weights(
+        _filter_unregistered_ascend_auxiliary_weights(
             weights,
             {"layers.0.mlp.down_proj.weight"},
         )
@@ -70,9 +70,44 @@ def test_registered_or_expert_alpha_is_preserved():
     ]
 
     filtered = list(
-        _filter_unregistered_non_expert_alpha_weights(
+        _filter_unregistered_ascend_auxiliary_weights(
             weights,
             {registered_alpha},
+        )
+    )
+
+    assert filtered == weights
+
+
+def test_unregistered_c8_kv_metadata_is_filtered():
+    weight = torch.ones(1)
+    ckv_a_alpha = "layers.0.self_attn.ckv_a_alpha"
+    indexer_hadamard = "layers.0.self_attn.indexer.hadamard_matrix"
+    weights = [
+        (ckv_a_alpha, weight),
+        (indexer_hadamard, weight),
+    ]
+
+    filtered = list(
+        _filter_unregistered_ascend_auxiliary_weights(weights, set())
+    )
+
+    assert filtered == []
+
+
+def test_registered_c8_kv_metadata_is_preserved():
+    weight = torch.ones(1)
+    ckv_a_alpha = "layers.0.self_attn.ckv_a_alpha"
+    indexer_hadamard = "layers.0.self_attn.indexer.hadamard_matrix"
+    weights = [
+        (ckv_a_alpha, weight),
+        (indexer_hadamard, weight),
+    ]
+
+    filtered = list(
+        _filter_unregistered_ascend_auxiliary_weights(
+            weights,
+            {ckv_a_alpha, indexer_hadamard},
         )
     )
 

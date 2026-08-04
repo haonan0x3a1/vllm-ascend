@@ -27,24 +27,36 @@ from vllm.model_executor.models.deepseek_v2 import (
 from vllm.model_executor.models.utils import extract_layer_index
 
 
-def _filter_unregistered_non_expert_alpha_weights(
+def _filter_unregistered_ascend_auxiliary_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     parameter_names: set[str],
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Drop checkpoint-only activation clip metadata for dense projections.
+    """Drop unconsumed metadata added by the Ascend checkpoint converter.
 
-    Some Ascend W4A8 checkpoints include ``*.alpha`` tensors generated from
-    activation clipping metadata.  The current dynamic W8A8 linear scheme does
-    not register or consume those tensors.  Expert ``down_proj.alpha`` tensors
-    are different: the CANN MoE GMM scheme maps them to ``w2_alpha`` and must
-    continue through the upstream expert loader.
+    Ascend W4A8C8 checkpoints can contain activation clip ``*.alpha``, KV clip
+    ``ckv_a_alpha``, and Indexer Hadamard tensors. The current runtime does not
+    register these checkpoint tensors when their corresponding path is not in
+    use; for example, a BF16 KV-cache override does not consume C8 KV clip
+    metadata. Expert ``down_proj.alpha`` is different: CANN MoE GMM maps it to
+    ``w2_alpha`` and it must continue through the upstream expert loader.
+
+    Registered tensors are always retained so a runtime implementation can
+    consume them when support is available.
     """
     for name, weight in weights:
-        is_unregistered_alpha = (
-            name.endswith(".alpha") and name not in parameter_names
+        is_non_expert_activation_alpha = (
+            name.endswith(".alpha") and ".experts." not in name
         )
-        is_expert_parameter = ".experts." in name
-        if is_unregistered_alpha and not is_expert_parameter:
+        is_kv_clip_alpha = name.endswith(".self_attn.ckv_a_alpha")
+        is_indexer_hadamard = name.endswith(
+            ".self_attn.indexer.hadamard_matrix"
+        )
+        is_ascend_auxiliary = (
+            is_non_expert_activation_alpha
+            or is_kv_clip_alpha
+            or is_indexer_hadamard
+        )
+        if name not in parameter_names and is_ascend_auxiliary:
             continue
         yield name, weight
 
@@ -59,7 +71,7 @@ def _deepseek_v2_model_load_weights(
     parameter_names = {name for name, _ in self.named_parameters()}
     return _ORIGINAL_DEEPSEEK_V2_MODEL_LOAD_WEIGHTS(
         self,
-        _filter_unregistered_non_expert_alpha_weights(weights, parameter_names),
+        _filter_unregistered_ascend_auxiliary_weights(weights, parameter_names),
     )
 
 
