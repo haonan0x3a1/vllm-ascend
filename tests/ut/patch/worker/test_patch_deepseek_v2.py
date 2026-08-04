@@ -2,7 +2,12 @@
 
 from types import SimpleNamespace
 
-from vllm_ascend.patch.worker.patch_deepseek_v2 import _should_skip_indexer_init
+import torch
+
+from vllm_ascend.patch.worker.patch_deepseek_v2 import (
+    _filter_unregistered_non_expert_alpha_weights,
+    _should_skip_indexer_init,
+)
 
 
 def _config(**overrides) -> SimpleNamespace:
@@ -34,3 +39,41 @@ def test_mtp_layer_keeps_indexer():
         "model.layers.80.self_attn",
         skip_topk=True,
     )
+
+
+def test_dense_checkpoint_only_alpha_is_filtered():
+    weight = torch.ones(1)
+    weights = [
+        ("layers.0.mlp.down_proj.alpha", weight),
+        ("layers.0.mlp.down_proj.weight", weight),
+    ]
+
+    filtered = list(
+        _filter_unregistered_non_expert_alpha_weights(
+            weights,
+            {"layers.0.mlp.down_proj.weight"},
+        )
+    )
+
+    assert filtered == [("layers.0.mlp.down_proj.weight", weight)]
+
+
+def test_registered_or_expert_alpha_is_preserved():
+    weight = torch.ones(1)
+    registered_alpha = "layers.0.mlp.down_proj.alpha"
+    expert_alpha = "layers.3.mlp.experts.0.down_proj.alpha"
+    unrelated_unknown = "layers.0.mlp.unknown_metadata"
+    weights = [
+        (registered_alpha, weight),
+        (expert_alpha, weight),
+        (unrelated_unknown, weight),
+    ]
+
+    filtered = list(
+        _filter_unregistered_non_expert_alpha_weights(
+            weights,
+            {registered_alpha},
+        )
+    )
+
+    assert filtered == weights

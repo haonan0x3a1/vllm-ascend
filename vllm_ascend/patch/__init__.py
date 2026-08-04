@@ -774,6 +774,24 @@
 #       Remove this patch when vLLM Ascend depends on a vLLM version that includes
 #       PR #45895.
 #
+#   2. `vllm.model_executor.models.deepseek_v2.DeepseekV2Model.load_weights`
+#    Why:
+#       Ascend W4A8 checkpoints can contain dense-projection ``*.alpha``
+#       activation clip metadata that the dynamic W8A8 linear scheme does not
+#       register or consume. Upstream treats unknown non-bias tensors as required
+#       parameters and raises ``KeyError`` while loading these checkpoints.
+#    How:
+#       Filter only unregistered, non-expert ``*.alpha`` tensors before calling
+#       the upstream loader. Expert ``down_proj.alpha`` remains available for the
+#       CANN MoE GMM ``w2_alpha`` mapping, and unrelated unknown tensors still
+#       retain upstream failure behavior.
+#    Related PR (if no, explain why):
+#       No upstream PR. This checkpoint metadata and its consumer are
+#       Ascend-specific.
+#    Future Plan:
+#       Remove this patch if the Ascend dynamic W8A8 linear scheme consumes the
+#       activation clip metadata directly.
+#
 # ** 19b. File: worker/model_runner_v1.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `NPUModelRunner._check_and_update_cudagraph_mode`

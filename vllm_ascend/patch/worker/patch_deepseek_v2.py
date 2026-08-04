@@ -1,3 +1,5 @@
+from collections.abc import Iterable, Iterator
+
 import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
@@ -18,10 +20,47 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.deepseek_v2 import (
     DeepSeekV2FusedQkvAProjLinear,
     DeepseekV2MLAAttention,
+    DeepseekV2Model,
     Indexer,
     yarn_get_mscale,
 )
 from vllm.model_executor.models.utils import extract_layer_index
+
+
+def _filter_unregistered_non_expert_alpha_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    parameter_names: set[str],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Drop checkpoint-only activation clip metadata for dense projections.
+
+    Some Ascend W4A8 checkpoints include ``*.alpha`` tensors generated from
+    activation clipping metadata.  The current dynamic W8A8 linear scheme does
+    not register or consume those tensors.  Expert ``down_proj.alpha`` tensors
+    are different: the CANN MoE GMM scheme maps them to ``w2_alpha`` and must
+    continue through the upstream expert loader.
+    """
+    for name, weight in weights:
+        is_unregistered_alpha = (
+            name.endswith(".alpha") and name not in parameter_names
+        )
+        is_expert_parameter = ".experts." in name
+        if is_unregistered_alpha and not is_expert_parameter:
+            continue
+        yield name, weight
+
+
+_ORIGINAL_DEEPSEEK_V2_MODEL_LOAD_WEIGHTS = DeepseekV2Model.load_weights
+
+
+def _deepseek_v2_model_load_weights(
+    self: DeepseekV2Model,
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> set[str]:
+    parameter_names = {name for name, _ in self.named_parameters()}
+    return _ORIGINAL_DEEPSEEK_V2_MODEL_LOAD_WEIGHTS(
+        self,
+        _filter_unregistered_non_expert_alpha_weights(weights, parameter_names),
+    )
 
 
 def _should_skip_indexer_init(
@@ -277,3 +316,4 @@ def _deepseek_v2_mla_attention_init(
 
 
 DeepseekV2MLAAttention.__init__ = _deepseek_v2_mla_attention_init
+DeepseekV2Model.load_weights = _deepseek_v2_model_load_weights
