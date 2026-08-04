@@ -610,3 +610,65 @@ class SparseKVOffloadWorkspace:
             actual_seq_lengths_query=selected_query_actual_seq_lengths,
             actual_seq_lengths_kv=selected_actual_seq_lengths,
         )
+
+    def validate_mirror_selection(
+        self,
+        *,
+        full_kv_cache: tuple[torch.Tensor, ...],
+        selection: SparseKVSelection,
+        topk_indices: torch.Tensor,
+        full_block_table: torch.Tensor,
+    ) -> None:
+        """Distinguish mirror-copy, Gather, and selected-SFA failures."""
+        if self.mode != "mirror":
+            raise RuntimeError("Mirror selection validation is only valid in mirror mode.")
+
+        topk_cpu = topk_indices.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+        valid_topk = topk_cpu[topk_cpu >= 0]
+        selected_length = int(selection.actual_seq_lengths_kv.detach().cpu()[0])
+        if valid_topk.numel() != selected_length:
+            raise RuntimeError(
+                "sparse_kv_offload mirror Top-K length mismatch: "
+                f"valid_topk={valid_topk.numel()}, selected_length={selected_length}."
+            )
+        if selected_length == 0:
+            return
+
+        logical_blocks = torch.div(valid_topk, self.block_size, rounding_mode="floor")
+        logical_offsets = valid_topk.remainder(self.block_size)
+        full_block_table_cpu = full_block_table.detach().to(device="cpu", dtype=torch.int64)[0]
+        full_slots_cpu = full_block_table_cpu.index_select(0, logical_blocks) * self.block_size + logical_offsets
+
+        selected_positions = torch.arange(selected_length, dtype=torch.int64)
+        selected_logical_blocks = torch.div(selected_positions, self.block_size, rounding_mode="floor")
+        selected_offsets = selected_positions.remainder(self.block_size)
+        selected_block_table_cpu = selection.block_table.detach().to(device="cpu", dtype=torch.int64)[0]
+        selected_slots_cpu = (
+            selected_block_table_cpu.index_select(0, selected_logical_blocks) * self.block_size + selected_offsets
+        )
+
+        full_slots = full_slots_cpu.to(device=self.device, non_blocking=False)
+        selected_slots = selected_slots_cpu.to(device=self.device, non_blocking=False)
+        mirror_cache = (self.full_nope_source, self.full_rope_source)
+        for cache_name, framework_tensor, mirror_tensor, selected_tensor in zip(
+            ("nope", "rope"),
+            full_kv_cache[:2],
+            mirror_cache,
+            selection.kv_cache,
+        ):
+            framework_rows = framework_tensor.view(-1, framework_tensor.shape[-1]).index_select(0, full_slots)
+            mirror_rows = mirror_tensor.view(-1, mirror_tensor.shape[-1]).index_select(0, full_slots)
+            selected_rows = selected_tensor.view(-1, selected_tensor.shape[-1]).index_select(0, selected_slots)
+
+            if not torch.equal(mirror_rows, framework_rows):
+                max_abs_diff = (mirror_rows.float() - framework_rows.float()).abs().max().item()
+                raise RuntimeError(
+                    "sparse_kv_offload mirror Full-KV sync mismatch: "
+                    f"cache={cache_name}, max_abs_diff={max_abs_diff:.6g}."
+                )
+            if not torch.equal(selected_rows, mirror_rows):
+                max_abs_diff = (selected_rows.float() - mirror_rows.float()).abs().max().item()
+                raise RuntimeError(
+                    "sparse_kv_offload mirror Gather selection mismatch: "
+                    f"cache={cache_name}, max_abs_diff={max_abs_diff:.6g}."
+                )

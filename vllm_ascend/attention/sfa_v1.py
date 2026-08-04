@@ -1471,6 +1471,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             full_actual_seq_lengths=actual_seq_lengths_key,
             full_query_actual_seq_lengths=actual_seq_lengths_query,
         )
+        if self.sparse_kv_offload_config.mode == "mirror":
+            workspace.validate_mirror_selection(
+                full_kv_cache=full_kv_cache,
+                selection=selection,
+                topk_indices=topk_indices,
+                full_block_table=attn_metadata.block_table,
+            )
         selected_metadata = replace(
             attn_metadata,
             block_table=selection.block_table,
@@ -1520,6 +1527,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         absolute_difference = (selected_output.float() - reference_output.float()).abs()
         max_abs_diff = absolute_difference.max().item()
         mean_abs_diff = absolute_difference.mean().item()
+        selected_nan_count = torch.isnan(selected_output).sum().item()
+        reference_nan_count = torch.isnan(reference_output).sum().item()
         topk_cpu = full_topk_indices.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
         valid_topk = topk_cpu[topk_cpu >= 0]
         if valid_topk.numel() == 0:
@@ -1532,6 +1541,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             f"layer={self.layer_name!r}, tp_rank={self.tp_rank}: "
             f"max_abs_diff={max_abs_diff:.6g}, "
             f"mean_abs_diff={mean_abs_diff:.6g}, "
+            f"selected_nan_count={selected_nan_count}, "
+            f"reference_nan_count={reference_nan_count}, "
             f"full_kv_lengths={full_actual_seq_lengths_key.detach().cpu().tolist()}, "
             "selected_kv_lengths="
             f"{selected_actual_seq_lengths_key.detach().cpu().tolist()}, "

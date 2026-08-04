@@ -472,6 +472,69 @@ def test_mirror_output_validation_reports_runtime_inputs_on_mismatch():
         )
 
 
+def test_mirror_selection_validation_distinguishes_copy_and_gather_mismatches():
+    full_nope = torch.randn(4, BLOCK_SIZE, 1, 2)
+    full_rope = torch.randn(4, BLOCK_SIZE, 1, 1)
+    workspace = SparseKVOffloadWorkspace(
+        (full_nope, full_rope),
+        index_topk=INDEX_TOPK,
+        block_size=BLOCK_SIZE,
+        mode="mirror",
+        swapped_allocator=lambda shape, dtype, device: torch.empty(
+            shape,
+            dtype=dtype,
+            device=device,
+        ),
+        gather_op=MagicMock(),
+        validate_device=False,
+    )
+    workspace.full_nope_source.copy_(full_nope)
+    workspace.full_rope_source.copy_(full_rope)
+
+    full_block_table = torch.tensor([[2, 1]], dtype=torch.int32)
+    topk_indices = torch.full((1, 1, INDEX_TOPK), -1, dtype=torch.int32)
+    topk_indices[0, 0, :2] = torch.tensor([130, 5], dtype=torch.int32)
+    full_slots = torch.tensor([130, 2 * BLOCK_SIZE + 5], dtype=torch.int64)
+    workspace.selected_nope.view(-1, 2)[:2].copy_(full_nope.view(-1, 2).index_select(0, full_slots))
+    workspace.selected_rope.view(-1, 1)[:2].copy_(full_rope.view(-1, 1).index_select(0, full_slots))
+    selection = SparseKVSelection(
+        kv_cache=(
+            workspace.selected_nope.unsqueeze(2),
+            workspace.selected_rope.unsqueeze(2),
+        ),
+        block_table=workspace.selection_block_table,
+        sparse_indices=torch.tensor([[[0, 1]]], dtype=torch.int32),
+        actual_seq_lengths_query=torch.tensor([1], dtype=torch.int32),
+        actual_seq_lengths_kv=torch.tensor([2], dtype=torch.int32),
+    )
+
+    workspace.validate_mirror_selection(
+        full_kv_cache=(full_nope, full_rope),
+        selection=selection,
+        topk_indices=topk_indices,
+        full_block_table=full_block_table,
+    )
+
+    workspace.full_nope_source.view(-1, 2)[full_slots[0], 0] += 1
+    with pytest.raises(RuntimeError, match="Full-KV sync mismatch"):
+        workspace.validate_mirror_selection(
+            full_kv_cache=(full_nope, full_rope),
+            selection=selection,
+            topk_indices=topk_indices,
+            full_block_table=full_block_table,
+        )
+    workspace.full_nope_source.copy_(full_nope)
+
+    workspace.selected_nope.view(-1, 2)[0, 0] += 1
+    with pytest.raises(RuntimeError, match="Gather selection mismatch"):
+        workspace.validate_mirror_selection(
+            full_kv_cache=(full_nope, full_rope),
+            selection=selection,
+            topk_indices=topk_indices,
+            full_block_table=full_block_table,
+        )
+
+
 def test_sfa_request_boundary_resets_existing_selection_workspace():
     workspace = MagicMock()
     fake_impl = MagicMock()
