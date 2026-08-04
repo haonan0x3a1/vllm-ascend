@@ -161,9 +161,17 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
 
     @patch("vllm_ascend.quantization.methods.w4a8.get_ascend_config")
     @patch("vllm_ascend.quantization.methods.w4a8.get_current_vllm_config")
+    @patch("vllm_ascend.quantization.methods.w4a8.get_ep_group")
     @patch("vllm_ascend.quantization.methods.w4a8.get_mc2_group")
     @patch("torch.distributed.get_rank", return_value=0)
-    def setUp(self, mock_get_rank, mock_get_mc2_group, get_current_vllm_config, mock_get_ascend_config):
+    def setUp(
+        self,
+        mock_get_rank,
+        mock_get_mc2_group,
+        mock_get_ep_group,
+        get_current_vllm_config,
+        mock_get_ascend_config,
+    ):
         # Mock ascend config
         mock_ascend_config = Mock()
         mock_ascend_config.eplb_config.dynamic_eplb = False
@@ -176,6 +184,9 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
             max_num_batched_tokens=2048, max_model_len=2048, enable_chunked_prefill=False
         )
         get_current_vllm_config.return_value = mock_vllm_config
+        self.ep_group = MagicMock()
+        self.ep_group.world_size = 1
+        mock_get_ep_group.return_value = self.ep_group
         self.quant_method = AscendW4A8DynamicFusedMoEMethod()
 
     def test_get_weight(self):
@@ -370,6 +381,14 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
                 name,
                 torch.nn.Parameter(tensor, requires_grad=False),
             )
+        local_smooth_scale = layer.smooth_scale_1.detach().clone()
+        global_smooth_scale = torch.cat(
+            (local_smooth_scale, local_smooth_scale + 1),
+            dim=0,
+        )
+        layer.global_num_experts = self.experts * 2
+        self.ep_group.world_size = 2
+        self.ep_group.all_gather.return_value = global_smooth_scale
 
         self.quant_method.process_weights_after_loading(layer)
 
@@ -390,6 +409,8 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
             (self.experts, 1, self.output_size),
         )
         self.assertEqual(layer.w2_alpha.shape, (self.experts,))
+        self.ep_group.all_gather.assert_called_once()
+        self.assertTrue(torch.equal(layer.smooth_scale_1, global_smooth_scale))
 
     def test_get_dynamic_quant_param_compressed_tensors(self):
         self.quant_method.quant_method = COMPRESSED_TENSORS_METHOD

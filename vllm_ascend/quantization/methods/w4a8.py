@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -360,6 +360,7 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         self.is_cann_moe_gmm = (
             vllm_config.quant_config.quant_description.get(ASCEND_MOE_TARGET_KEY) == CANN_MOE_GMM_TARGET
         )
+        self.ep_group = get_ep_group()
         if self.quant_method == COMPRESSED_TENSORS_METHOD:
             self.weight_strategy = vllm_config.quant_config.quant_description.get("weight_strategy", "group")
 
@@ -769,6 +770,30 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         layer.w2_alpha.data = layer.w2_alpha.data.squeeze(-1).to(torch.float32)
         layer.smooth_scale_1.data = layer.smooth_scale_1.data.to(torch.float32)
         layer.smooth_scale_2.data = layer.smooth_scale_2.data.to(torch.float32)
+
+        # MC2 dispatch quantization indexes smooth_scale_1 with global expert
+        # IDs, while EP weight loading leaves only the local expert shard on
+        # each rank. Match the CANN Recipes lifecycle by gathering this one
+        # dispatch table after loading; expert weights and GMM parameters stay
+        # sharded locally.
+        global_num_experts = getattr(
+            layer,
+            "global_num_experts",
+            layer.smooth_scale_1.shape[0] * self.ep_group.world_size,
+        )
+        local_num_experts = layer.smooth_scale_1.shape[0]
+        if local_num_experts != global_num_experts:
+            expected_global_num_experts = local_num_experts * self.ep_group.world_size
+            if expected_global_num_experts != global_num_experts:
+                raise RuntimeError(
+                    "CANN MoEGMM cannot assemble the global expert smooth-scale "
+                    f"table: local={local_num_experts}, ep_size={self.ep_group.world_size}, "
+                    f"global={global_num_experts}."
+                )
+            layer.smooth_scale_1.data = self.ep_group.all_gather(
+                layer.smooth_scale_1.data.contiguous(),
+                0,
+            )
 
     def process_weights_after_loading_compressed_tensors(self, layer):
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
