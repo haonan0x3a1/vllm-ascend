@@ -201,22 +201,11 @@ def test_host_workspace_uses_shared_prefill_cache_and_persists_only_touched_slot
 
     assert workspace.full_nope_source is full_nope
     assert workspace.full_rope_source is full_rope
-    forward_cache = workspace.get_forward_kv_cache(
-        full_kv_cache,
-        is_decode=False,
-    )
+    forward_cache = workspace.get_forward_kv_cache(full_kv_cache)
     assert forward_cache[0] is prefill_nope
     assert forward_cache[1] is prefill_rope
     assert forward_cache[2] is indexer_cache
-    assert (
-        workspace.get_forward_kv_cache(
-            full_kv_cache,
-            is_decode=True,
-        )
-        is full_kv_cache
-    )
-
-    updated_blocks = workspace.persist_prefill_blocks(
+    updated_blocks = workspace.persist_updated_slots(
         full_kv_cache,
         torch.tensor(
             [
@@ -533,7 +522,7 @@ def test_sfa_host_prefill_persists_workspace_without_gathering():
     )
 
     workspace.sync_updated_blocks.assert_not_called()
-    workspace.persist_prefill_blocks.assert_called_once_with(
+    workspace.persist_updated_slots.assert_called_once_with(
         full_kv_cache,
         metadata.slot_mapping_cpu,
         metadata.num_actual_tokens,
@@ -541,3 +530,73 @@ def test_sfa_host_prefill_persists_workspace_without_gathering():
     workspace.reset_selection_state.assert_called_once_with()
     workspace.gather.assert_not_called()
     assert result[0] is forward_kv_cache
+
+
+def test_sfa_host_decode_persists_staging_before_gathering():
+    full_kv_cache = (
+        torch.empty(4, BLOCK_SIZE, 1, 2),
+        torch.empty(4, BLOCK_SIZE, 1, 1),
+        torch.empty(4, BLOCK_SIZE, 1, 4),
+    )
+    forward_kv_cache = (
+        torch.empty_like(full_kv_cache[0]),
+        torch.empty_like(full_kv_cache[1]),
+        full_kv_cache[2],
+    )
+    topk_indices = torch.full((1, 1, INDEX_TOPK), -1, dtype=torch.int32)
+    actual_query = torch.tensor([1], dtype=torch.int32)
+    actual_key = torch.tensor([129], dtype=torch.int32)
+    metadata = _make_sfa_metadata(AscendAttentionState.DecodeOnly)
+    selection = SparseKVSelection(
+        kv_cache=(
+            torch.empty(16, BLOCK_SIZE, 1, 2),
+            torch.empty(16, BLOCK_SIZE, 1, 1),
+        ),
+        block_table=torch.arange(16, dtype=torch.int32).view(1, 16),
+        sparse_indices=torch.full((1, 1, INDEX_TOPK), -1, dtype=torch.int32),
+        actual_seq_lengths_query=torch.tensor([1], dtype=torch.int32),
+        actual_seq_lengths_kv=torch.tensor([128], dtype=torch.int32),
+    )
+    workspace = MagicMock()
+    events = []
+    workspace.persist_updated_slots.side_effect = lambda *args, **kwargs: events.append("persist")
+
+    def gather_after_persist(*args, **kwargs):
+        events.append("gather")
+        return selection
+
+    workspace.gather.side_effect = gather_after_persist
+    fake_impl = MagicMock()
+    fake_impl.sparse_kv_offload_config = SparseKVOffloadConfig(
+        enabled=True,
+        mode="host",
+    )
+    fake_impl._get_sparse_kv_offload_workspace.return_value = workspace
+
+    result = AscendSFAImpl._prepare_sparse_kv_offload_attention(
+        fake_impl,
+        full_kv_cache,
+        forward_kv_cache,
+        topk_indices,
+        metadata,
+        actual_query,
+        actual_key,
+    )
+
+    workspace.sync_updated_blocks.assert_not_called()
+    workspace.persist_updated_slots.assert_called_once_with(
+        full_kv_cache,
+        metadata.slot_mapping_cpu,
+        metadata.num_actual_tokens,
+    )
+    workspace.reset_selection_state.assert_not_called()
+    workspace.gather.assert_called_once_with(
+        topk_indices=topk_indices,
+        full_block_table=metadata.block_table,
+        full_actual_seq_lengths=actual_key,
+        full_query_actual_seq_lengths=actual_query,
+    )
+    assert events == ["persist", "gather"]
+    assert result[0] is selection.kv_cache
+    assert result[1] is selection.sparse_indices
+    assert result[2].block_table is selection.block_table

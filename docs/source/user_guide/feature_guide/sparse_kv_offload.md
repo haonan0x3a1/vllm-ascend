@@ -7,10 +7,12 @@ Atlas A3:
 
 1. The full MLA latent/RoPE KV cache resides in Host-backed swapped memory.
 2. The Lightning Indexer cache remains on the NPU.
-3. Prefill uses one NPU workspace shared by all layers. A later
+3. Prefill and decode writes use one NPU staging workspace shared by all
+   layers. A later
    chunked-prefill chunk first restores that layer's prior physical blocks
    from Full Host KV, then persists only the token rows touched by the current
-   forward back into Host KV.
+   forward back into Host KV. Decode also persists its newly generated token
+   row before Top-K Gather.
 4. Lightning Indexer produces Top-K token indices for a decode step.
 5. `npu_gather_selection_kv_cache` reads Full Host KV and materializes selected
    KV on the NPU.
@@ -39,8 +41,9 @@ HBM budget.
 - Online P/D staging requires the Ascend Mooncake TransferEngine package
   `mooncake-transfer-engine-npu>=0.3.12.post1`.
 - A DeepSeek-V3.2 DSA model with `index_topk=2048`.
-- Host mode requires the fused A3 MLAPO decode path and a supported W8A8
-  checkpoint.
+- MLAPO remains an optional optimization for checkpoints supported by the
+  existing A3 SFA MLAPO path. Other quantization schemes, including Dynamic
+  W8A8 Attention weights, use the shared NPU staging path.
 
 Before serving a model, run the focused configuration, workspace, and
 model-runner tests:
@@ -79,7 +82,7 @@ vllm serve /path/to/DeepSeek-V3.2-Exp \
   --block-size 128 \
   --no-enable-prefix-caching \
   --additional-config \
-  '{"enable_mlapo":true,"sparse_kv_offload":{"enabled":true,"mode":"host"}}'
+  '{"enable_mlapo":false,"sparse_kv_offload":{"enabled":true,"mode":"host"}}'
 ```
 
 ### Mirror validation mode
@@ -111,7 +114,7 @@ per-role topology fields follow the standard Mooncake layerwise P/D guide:
 
 ```text
 --additional-config \
-  '{"enable_mlapo":true,"sparse_kv_offload":{"enabled":true,"mode":"host"}}' \
+  '{"enable_mlapo":false,"sparse_kv_offload":{"enabled":true,"mode":"host"}}' \
 --kv-transfer-config \
   '{"kv_connector":"MooncakeLayerwiseConnector",
     "kv_role":"kv_producer",

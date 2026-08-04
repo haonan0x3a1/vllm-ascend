@@ -4137,7 +4137,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         kv_caches: dict[str, torch.Tensor],
     ) -> None:
-        """Allocate one cross-layer NPU prefill cache for Host Full-KV mode."""
+        """Allocate one cross-layer NPU write cache for Host Full-KV mode."""
         sparse_offload_config = self.ascend_config.sparse_kv_offload
         if not sparse_offload_config.enabled or sparse_offload_config.mode != "host":
             return
@@ -4215,7 +4215,7 @@ class NPUModelRunner(GPUModelRunner):
 
         prefill_bytes = sum(tensor.numel() * tensor.element_size() for tensor in shared_prefill_kv)
         logger.info(
-            "Allocated one shared sparse KV offload prefill workspace: "
+            "Allocated one shared sparse KV offload write-staging workspace: "
             "layers=%d, blocks=%d, bytes=%d.",
             len(sparse_layer_names),
             shared_prefill_kv[0].shape[0],

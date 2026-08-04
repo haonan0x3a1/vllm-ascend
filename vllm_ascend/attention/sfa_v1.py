@@ -746,18 +746,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 self.c8_k_cache_dtype = act_dtype
                 self.c8_k_scale_cache_dtype = act_dtype
 
-        if (
-            self.sparse_kv_offload_config.enabled
-            and self.sparse_kv_offload_config.mode == "host"
-            and not self.enable_mlapo
-        ):
-            raise RuntimeError(
-                "sparse_kv_offload host mode requires the fused A3 MLAPO "
-                "decode path so decode can write new KV directly "
-                "to swapped Full KV. Enable MLAPO and use its supported W8A8 "
-                "DeepSeek-V3.2 checkpoint."
-            )
-
         if not self.enable_mlapo:
             # if mlapo, W_UK_T can't trans nz
             self.W_UK_T = maybe_trans_nz(self.W_UK_T)
@@ -1355,11 +1343,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         self,
         prefill_kv_cache: tuple[torch.Tensor, torch.Tensor],
     ) -> None:
-        """Bind the model-runner-owned cross-layer prefill NPU workspace."""
+        """Bind the model-runner-owned cross-layer NPU write workspace."""
         if not self.sparse_kv_offload_config.enabled:
             raise RuntimeError("Cannot bind a sparse KV offload prefill cache when the feature is disabled.")
         if self.sparse_kv_offload_config.mode != "host":
-            raise RuntimeError("The shared prefill cache is only used by sparse KV offload host mode.")
+            raise RuntimeError("The shared write cache is only used by sparse KV offload host mode.")
         self.sparse_kv_offload_prefill_cache = prefill_kv_cache
 
     def initialize_sparse_kv_offload_workspace(
@@ -1383,10 +1371,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if not self.sparse_kv_offload_config.enabled:
             return full_kv_cache
         workspace = self._get_sparse_kv_offload_workspace(full_kv_cache)
-        return workspace.get_forward_kv_cache(
-            full_kv_cache,
-            is_decode=attn_metadata.attn_state == AscendAttentionState.DecodeOnly,
-        )
+        return workspace.get_forward_kv_cache(full_kv_cache)
 
     def _restore_sparse_kv_offload_prefill_context(
         self,
@@ -1457,8 +1442,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.slot_mapping_cpu,
                 attn_metadata.num_actual_tokens,
             )
-        elif attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
-            workspace.persist_prefill_blocks(
+        else:
+            # Native Dynamic-W8A8 MLA kernels cannot write directly to the
+            # Host-backed swapped Full KV tensors. Host mode therefore uses
+            # the shared NPU cache for both prefill and decode writes, then
+            # persists only this forward's touched token rows before Gather.
+            workspace.persist_updated_slots(
                 full_kv_cache,
                 attn_metadata.slot_mapping_cpu,
                 attn_metadata.num_actual_tokens,

@@ -161,8 +161,9 @@ class SparseKVOffloadWorkspace:
 
     Mirror mode owns a swapped-memory mirror of the framework NPU KV cache.
     Host mode treats the framework KV cache itself as the swapped-memory Full
-    KV store and uses a model-runner-owned, cross-layer NPU cache for prefill.
-    Both modes own a per-layer selected-KV NPU workspace for decode.
+    KV store and uses a model-runner-owned, cross-layer NPU cache as the write
+    staging area for both prefill and decode. Both modes own a per-layer
+    selected-KV NPU workspace for decode.
     """
 
     def __init__(
@@ -323,12 +324,16 @@ class SparseKVOffloadWorkspace:
     def get_forward_kv_cache(
         self,
         full_kv_cache: tuple[torch.Tensor, ...],
-        *,
-        is_decode: bool,
     ) -> tuple[torch.Tensor, ...]:
-        """Return the cache that MLA Prolog/Prefill Attention should access."""
+        """Return the cache that MLA Prolog/Prefill Attention should access.
+
+        Host-backed swapped memory is readable by Gather/copy operations but
+        is not a valid output for every native MLA preprocessing kernel. Route
+        both prefill and decode writes through the shared NPU workspace; the
+        touched rows are persisted into Full Host KV before sparse Gather.
+        """
         self._validate_full_kv_cache(full_kv_cache, self.block_size)
-        if self.mode == "host" and not is_decode:
+        if self.mode == "host":
             assert self.prefill_kv_cache is not None
             return (*self.prefill_kv_cache, *full_kv_cache[2:])
         return full_kv_cache
@@ -469,15 +474,15 @@ class SparseKVOffloadWorkspace:
             num_actual_tokens,
         )
 
-    def persist_prefill_blocks(
+    def persist_updated_slots(
         self,
         full_kv_cache: tuple[torch.Tensor, ...],
         slot_mapping_cpu: torch.Tensor,
         num_actual_tokens: int,
     ) -> tuple[int, ...]:
-        """Copy the current layer's shared NPU prefill cache into Full Host KV."""
+        """Copy touched rows from the shared NPU staging cache to Full Host KV."""
         if self.mode != "host":
-            raise RuntimeError("persist_prefill_blocks is only valid in sparse KV offload host mode.")
+            raise RuntimeError("persist_updated_slots is only valid in sparse KV offload host mode.")
         assert self.prefill_kv_cache is not None
         return self._copy_updated_slots(
             self.prefill_kv_cache,

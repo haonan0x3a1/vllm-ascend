@@ -415,10 +415,6 @@ class AscendConfig:
         self.c8_enable_reshape_optim = self.enable_sparse_c8 and additional_config.get("c8_enable_reshape_optim", False)
         self.sparse_kv_offload = SparseKVOffloadConfig.from_dict(additional_config.get("sparse_kv_offload"))
         self.sparse_kv_offload.validate(vllm_config, self.enable_sparse_c8)
-        if self.sparse_kv_offload.enabled and self.sparse_kv_offload.mode == "host" and not self.enable_mlapo:
-            raise ValueError(
-                "sparse_kv_offload host mode requires enable_mlapo=true for direct decode writes to swapped Full KV."
-            )
         quant_config = getattr(vllm_config, "quant_config", None)
         self._sparse_c8_layer_ids, self._sparse_c8_layer_names = self._parse_sparse_c8_layers_from_quant_config(
             quant_config
