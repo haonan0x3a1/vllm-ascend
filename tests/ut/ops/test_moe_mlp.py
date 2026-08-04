@@ -90,6 +90,7 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
         expected_event = object()
         stream = MagicMock()
         stream.record_event.return_value = expected_event
+        mock_swiglu = MagicMock(return_value=(intermediate, intermediate_scale))
 
         with (
             patch(
@@ -97,9 +98,9 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
                 side_effect=[[gate_up], [expected]],
             ) as mock_grouped_matmul,
             patch(
-                "vllm_ascend.ops.fused_moe.moe_mlp.torch_npu.npu_swiglu_clip_quant",
-                return_value=(intermediate, intermediate_scale),
-            ) as mock_swiglu,
+                "vllm_ascend.ops.fused_moe.moe_mlp._get_cann_recipe_swiglu_clip_quant_op",
+                return_value=mock_swiglu,
+            ),
             patch(
                 "vllm_ascend.ops.fused_moe.moe_mlp.torch.npu.current_stream",
                 return_value=stream,

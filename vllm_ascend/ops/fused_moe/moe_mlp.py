@@ -14,6 +14,8 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
+import importlib
+from functools import lru_cache
 
 import torch
 import torch_npu
@@ -37,6 +39,28 @@ from vllm_ascend.utils import (
 )
 
 ASCEND_DEVICE_TYPE = get_ascend_device_type()
+
+
+@lru_cache(maxsize=1)
+def _get_cann_recipe_swiglu_clip_quant_op():
+    """Load the CANN Recipes SwiGLU quantization operator on demand."""
+    try:
+        importlib.import_module("custom_ops")
+    except ImportError as exc:
+        raise RuntimeError(
+            "CANN MoEGMM requires the cann-recipes-infer custom_ops package. "
+            "Install the matching custom operator wheel before starting vLLM."
+        ) from exc
+
+    swiglu_op = getattr(torch.ops.custom, "npu_swiglu_clip_quant", None)
+    if not callable(swiglu_op):
+        raise RuntimeError(
+            "custom_ops was imported, but "
+            "torch.ops.custom.npu_swiglu_clip_quant is unavailable. Check "
+            "that the custom operator wheel matches the installed CANN and "
+            "torch-npu versions."
+        )
+    return swiglu_op
 
 
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb):
@@ -124,7 +148,7 @@ def cann_moe_gmm_apply_mlp(
         group_list_type=group_list_type,
         act_type=0,
     )[0]
-    intermediate, intermediate_scale = torch_npu.npu_swiglu_clip_quant(
+    intermediate, intermediate_scale = _get_cann_recipe_swiglu_clip_quant_op()(
         gate_up,
         group_list,
         w2_alpha,
