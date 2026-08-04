@@ -361,15 +361,14 @@ def test_host_mode_restores_chunked_prefill_context(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_host_gather_selected_sfa_matches_full_npu_kv_sfa(dtype):
+@pytest.mark.parametrize("seq_len", [18, 256])
+def test_host_gather_selected_sfa_matches_full_npu_kv_sfa(dtype, seq_len):
     torch.manual_seed(2026)
     device = torch.device("npu")
     num_blocks = 4
     kv_lora_rank = 512
     rope_head_dim = 64
-    num_query_heads = 8
-    seq_len = 256
-
+    num_query_heads = 16
     full_nope = torch.randn(
         num_blocks,
         BLOCK_SIZE,
@@ -498,3 +497,128 @@ def test_host_gather_selected_sfa_matches_full_npu_kv_sfa(dtype):
         rtol=1e-2,
         atol=1e-2,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mirror_gather_selected_sfa_matches_full_npu_kv_across_decode_updates(
+    dtype,
+):
+    """Exercise selected-KV reuse across two non-block-aligned decode steps."""
+    torch.manual_seed(2026)
+    device = torch.device("npu")
+    num_blocks = 4
+    kv_lora_rank = 512
+    rope_head_dim = 64
+    num_query_heads = 16
+    full_nope = torch.randn(
+        num_blocks,
+        BLOCK_SIZE,
+        1,
+        kv_lora_rank,
+        dtype=dtype,
+        device=device,
+    )
+    full_rope = torch.randn(
+        num_blocks,
+        BLOCK_SIZE,
+        1,
+        rope_head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    full_block_table = torch.tensor(
+        [[2, 1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    workspace = SparseKVOffloadWorkspace(
+        (full_nope, full_rope),
+        index_topk=INDEX_TOPK,
+        block_size=BLOCK_SIZE,
+        mode="mirror",
+    )
+    fake_impl = MagicMock()
+    fake_impl.scale = 1.0 / math.sqrt(kv_lora_rank + rope_head_dim)
+    full_metadata = MagicMock()
+    full_metadata.block_table = full_block_table
+
+    for step, seq_len in enumerate((18, 19)):
+        # The newly generated token extends the same partially filled physical
+        # block. Mirroring the block must make the new row visible without
+        # invalidating selected-KV reuse from the previous decode step.
+        updated_slot = 2 * BLOCK_SIZE + seq_len - 1
+        workspace.sync_updated_blocks(
+            (full_nope, full_rope),
+            torch.tensor([updated_slot], dtype=torch.int64),
+            num_actual_tokens=1,
+        )
+
+        topk_indices = torch.full(
+            (1, 1, INDEX_TOPK),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        logical_indices = torch.arange(
+            seq_len,
+            dtype=torch.int32,
+            device=device,
+        )
+        topk_indices[0, 0, :seq_len] = torch.roll(
+            logical_indices,
+            shifts=step,
+        )
+        actual_query = torch.tensor([1], dtype=torch.int32, device=device)
+        actual_key = torch.tensor([seq_len], dtype=torch.int32, device=device)
+        ql_nope = torch.randn(
+            1,
+            num_query_heads,
+            kv_lora_rank,
+            dtype=dtype,
+            device=device,
+        )
+        q_pe = torch.randn(
+            1,
+            num_query_heads,
+            rope_head_dim,
+            dtype=dtype,
+            device=device,
+        )
+
+        full_output = AscendSFAImpl._execute_sparse_flash_attention_process(
+            fake_impl,
+            ql_nope,
+            q_pe,
+            (full_nope, full_rope),
+            topk_indices,
+            full_metadata,
+            actual_query,
+            actual_key,
+        )
+        selection = workspace.gather(
+            topk_indices=topk_indices,
+            full_block_table=full_block_table,
+            full_actual_seq_lengths=actual_key,
+            full_query_actual_seq_lengths=actual_query,
+        )
+        selected_metadata = MagicMock()
+        selected_metadata.block_table = selection.block_table
+        selected_output = AscendSFAImpl._execute_sparse_flash_attention_process(
+            fake_impl,
+            ql_nope,
+            q_pe,
+            selection.kv_cache,
+            selection.sparse_indices,
+            selected_metadata,
+            selection.actual_seq_lengths_query,
+            selection.actual_seq_lengths_kv,
+        )
+        torch.npu.synchronize()
+
+        assert selection.actual_seq_lengths_kv.cpu().tolist() == [seq_len]
+        torch.testing.assert_close(
+            selected_output,
+            full_output,
+            rtol=1e-2,
+            atol=1e-2,
+        )
