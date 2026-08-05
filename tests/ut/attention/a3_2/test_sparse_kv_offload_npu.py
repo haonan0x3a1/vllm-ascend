@@ -66,16 +66,28 @@ def test_gather_reads_full_kv_from_swapped_memory(dtype):
         index_topk=INDEX_TOPK,
         block_size=BLOCK_SIZE,
     )
+    slot_mapping_cpu = torch.tensor(
+        [
+            2 * BLOCK_SIZE,
+            1 * BLOCK_SIZE,
+        ],
+        dtype=torch.int64,
+    )
+    workspace.validate_mirror_slot_mapping(
+        slot_mapping_cpu.to(device=device),
+        slot_mapping_cpu,
+        num_actual_tokens=2,
+    )
     updated_blocks = workspace.sync_updated_blocks(
         (full_nope, full_rope),
-        torch.tensor(
-            [
-                2 * BLOCK_SIZE,
-                1 * BLOCK_SIZE,
-            ],
-            dtype=torch.int64,
-        ),
+        slot_mapping_cpu,
         num_actual_tokens=2,
+    )
+    workspace.validate_mirror_sync(
+        (full_nope, full_rope),
+        slot_mapping_cpu,
+        num_actual_tokens=2,
+        updated_blocks=updated_blocks,
     )
     assert updated_blocks == (1, 2)
 

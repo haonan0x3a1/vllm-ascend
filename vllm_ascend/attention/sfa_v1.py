@@ -1440,10 +1440,21 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         workspace = self._get_sparse_kv_offload_workspace(full_kv_cache)
         if self.sparse_kv_offload_config.mode == "mirror":
-            workspace.sync_updated_blocks(
+            workspace.validate_mirror_slot_mapping(
+                attn_metadata.slot_mapping,
+                attn_metadata.slot_mapping_cpu,
+                attn_metadata.num_actual_tokens,
+            )
+            updated_blocks = workspace.sync_updated_blocks(
                 full_kv_cache,
                 attn_metadata.slot_mapping_cpu,
                 attn_metadata.num_actual_tokens,
+            )
+            workspace.validate_mirror_sync(
+                full_kv_cache,
+                attn_metadata.slot_mapping_cpu,
+                attn_metadata.num_actual_tokens,
+                updated_blocks,
             )
         else:
             # Native Dynamic-W8A8 MLA kernels cannot write directly to the

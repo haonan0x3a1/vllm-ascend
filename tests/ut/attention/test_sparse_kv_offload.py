@@ -419,6 +419,17 @@ def test_sfa_decode_switches_to_selected_kv_and_metadata():
         metadata.slot_mapping_cpu,
         metadata.num_actual_tokens,
     )
+    workspace.validate_mirror_slot_mapping.assert_called_once_with(
+        metadata.slot_mapping,
+        metadata.slot_mapping_cpu,
+        metadata.num_actual_tokens,
+    )
+    workspace.validate_mirror_sync.assert_called_once_with(
+        full_kv_cache,
+        metadata.slot_mapping_cpu,
+        metadata.num_actual_tokens,
+        workspace.sync_updated_blocks.return_value,
+    )
     workspace.reset_selection_state.assert_not_called()
     workspace.gather.assert_called_once_with(
         topk_indices=topk_indices,
@@ -516,7 +527,7 @@ def test_mirror_selection_validation_distinguishes_copy_and_gather_mismatches():
     )
 
     workspace.full_nope_source.view(-1, 2)[full_slots[0], 0] += 1
-    with pytest.raises(RuntimeError, match="Full-KV sync mismatch"):
+    with pytest.raises(RuntimeError, match="Full-KV changed during Gather"):
         workspace.validate_mirror_selection(
             full_kv_cache=(full_nope, full_rope),
             selection=selection,
@@ -533,6 +544,43 @@ def test_mirror_selection_validation_distinguishes_copy_and_gather_mismatches():
             topk_indices=topk_indices,
             full_block_table=full_block_table,
         )
+
+
+def test_mirror_diagnostics_compare_slots_and_treat_paired_nans_as_equal():
+    full_nope = torch.zeros(2, BLOCK_SIZE, 1, 2, dtype=torch.bfloat16)
+    full_rope = torch.zeros(2, BLOCK_SIZE, 1, 1, dtype=torch.bfloat16)
+    workspace = SparseKVOffloadWorkspace(
+        (full_nope, full_rope),
+        index_topk=INDEX_TOPK,
+        block_size=BLOCK_SIZE,
+        mode="mirror",
+        swapped_allocator=lambda shape, dtype, device: torch.empty(
+            shape,
+            dtype=dtype,
+            device=device,
+        ),
+        gather_op=MagicMock(),
+        validate_device=False,
+    )
+
+    workspace.validate_mirror_slot_mapping(
+        torch.tensor([3, BLOCK_SIZE + 5], dtype=torch.int64),
+        torch.tensor([3, BLOCK_SIZE + 5], dtype=torch.int64),
+        num_actual_tokens=2,
+    )
+    with pytest.raises(RuntimeError, match="slot_mapping mismatch"):
+        workspace.validate_mirror_slot_mapping(
+            torch.tensor([3, BLOCK_SIZE + 6], dtype=torch.int64),
+            torch.tensor([3, BLOCK_SIZE + 5], dtype=torch.int64),
+            num_actual_tokens=2,
+        )
+
+    paired_nan_left = torch.tensor([float("nan"), 1], dtype=torch.bfloat16)
+    paired_nan_right = torch.tensor([float("nan"), 1], dtype=torch.bfloat16)
+    assert workspace._mirror_tensors_match(
+        paired_nan_left,
+        paired_nan_right,
+    )
 
 
 def test_sfa_request_boundary_resets_existing_selection_workspace():
@@ -579,6 +627,8 @@ def test_sfa_prefill_only_updates_host_mirror():
     )
 
     workspace.sync_updated_blocks.assert_called_once()
+    workspace.validate_mirror_slot_mapping.assert_called_once()
+    workspace.validate_mirror_sync.assert_called_once()
     workspace.reset_selection_state.assert_called_once_with()
     workspace.gather.assert_not_called()
     assert result[0] is full_kv_cache

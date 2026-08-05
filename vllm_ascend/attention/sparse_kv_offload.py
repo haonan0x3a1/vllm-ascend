@@ -474,6 +474,138 @@ class SparseKVOffloadWorkspace:
             num_actual_tokens,
         )
 
+    @staticmethod
+    def _mirror_tensors_match(
+        left: torch.Tensor,
+        right: torch.Tensor,
+    ) -> bool:
+        """Compare diagnostic tensors exactly while treating paired NaNs alike."""
+        left_cpu = left.detach().to(device="cpu")
+        right_cpu = right.detach().to(device="cpu")
+        return torch.allclose(
+            left_cpu,
+            right_cpu,
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+        )
+
+    @staticmethod
+    def _mirror_difference_summary(
+        left: torch.Tensor,
+        right: torch.Tensor,
+    ) -> str:
+        left_cpu = left.detach().float().to(device="cpu")
+        right_cpu = right.detach().float().to(device="cpu")
+        finite_pairs = torch.isfinite(left_cpu) & torch.isfinite(right_cpu)
+        if finite_pairs.any():
+            max_abs_diff = (left_cpu[finite_pairs] - right_cpu[finite_pairs]).abs().max().item()
+        else:
+            max_abs_diff = float("nan")
+        return (
+            f"max_finite_abs_diff={max_abs_diff:.6g}, "
+            f"left_nan_count={torch.isnan(left_cpu).sum().item()}, "
+            f"right_nan_count={torch.isnan(right_cpu).sum().item()}"
+        )
+
+    def validate_mirror_slot_mapping(
+        self,
+        slot_mapping: torch.Tensor,
+        slot_mapping_cpu: torch.Tensor,
+        num_actual_tokens: int,
+    ) -> None:
+        """Verify the CPU mapping used for mirroring matches the MLA mapping."""
+        if self.mode != "mirror":
+            raise RuntimeError("Mirror slot validation is only valid in mirror mode.")
+        device_slots = slot_mapping[:num_actual_tokens].detach().to(
+            device="cpu",
+            dtype=torch.int64,
+        )
+        cpu_slots = slot_mapping_cpu[:num_actual_tokens].detach().to(dtype=torch.int64)
+        if torch.equal(device_slots, cpu_slots):
+            return
+
+        mismatches = torch.nonzero(device_slots != cpu_slots).flatten()
+        first_mismatch = int(mismatches[0])
+        raise RuntimeError(
+            "sparse_kv_offload mirror slot_mapping mismatch before Full-KV sync: "
+            f"mismatch_count={mismatches.numel()}, "
+            f"first_index={first_mismatch}, "
+            f"device_slot={int(device_slots[first_mismatch])}, "
+            f"cpu_slot={int(cpu_slots[first_mismatch])}."
+        )
+
+    def validate_mirror_sync(
+        self,
+        full_kv_cache: tuple[torch.Tensor, ...],
+        slot_mapping_cpu: torch.Tensor,
+        num_actual_tokens: int,
+        updated_blocks: tuple[int, ...],
+    ) -> None:
+        """Classify Mirror copy failures before Gather can touch any buffer.
+
+        Mirror mode is a correctness diagnostic, so the device synchronizations
+        and D2H comparisons here are intentional. If a synchronized retry fixes
+        the copy, the first copy raced with the MLA cache producer. If it does
+        not, the swapped-memory copy/layout path itself is inconsistent.
+        """
+        if self.mode != "mirror":
+            raise RuntimeError("Mirror sync validation is only valid in mirror mode.")
+        if not updated_blocks:
+            return
+
+        if self.device.type == "npu":
+            torch.npu.synchronize()
+
+        mirror_cache = (self.full_nope_source, self.full_rope_source)
+        for cache_name, framework_tensor, mirror_tensor in zip(
+            ("nope", "rope"),
+            full_kv_cache[:2],
+            mirror_cache,
+        ):
+            for block_id in updated_blocks:
+                framework_block = framework_tensor[block_id]
+                mirror_block = mirror_tensor[block_id]
+                if self._mirror_tensors_match(mirror_block, framework_block):
+                    continue
+
+                initial_summary = self._mirror_difference_summary(
+                    mirror_block,
+                    framework_block,
+                )
+                self._copy_updated_blocks(
+                    full_kv_cache,
+                    mirror_cache,
+                    slot_mapping_cpu,
+                    num_actual_tokens,
+                )
+                if self.device.type == "npu":
+                    torch.npu.synchronize()
+                retry_framework_block = framework_tensor[block_id]
+                retry_mirror_block = mirror_tensor[block_id]
+                retry_matches = self._mirror_tensors_match(
+                    retry_mirror_block,
+                    retry_framework_block,
+                )
+                retry_summary = self._mirror_difference_summary(
+                    retry_mirror_block,
+                    retry_framework_block,
+                )
+                if retry_matches:
+                    raise RuntimeError(
+                        "sparse_kv_offload mirror producer visibility race before Gather: "
+                        f"cache={cache_name}, block_id={block_id}, "
+                        f"initial=({initial_summary}), "
+                        "synchronized_retry=matched."
+                    )
+                raise RuntimeError(
+                    "sparse_kv_offload mirror swapped-copy mismatch before Gather "
+                    "after synchronized retry: "
+                    f"cache={cache_name}, block_id={block_id}, "
+                    f"initial=({initial_summary}), "
+                    f"retry=({retry_summary})."
+                )
+
     def persist_updated_slots(
         self,
         full_kv_cache: tuple[torch.Tensor, ...],
@@ -660,15 +792,21 @@ class SparseKVOffloadWorkspace:
             mirror_rows = mirror_tensor.view(-1, mirror_tensor.shape[-1]).index_select(0, full_slots)
             selected_rows = selected_tensor.view(-1, selected_tensor.shape[-1]).index_select(0, selected_slots)
 
-            if not torch.equal(mirror_rows, framework_rows):
-                max_abs_diff = (mirror_rows.float() - framework_rows.float()).abs().max().item()
-                raise RuntimeError(
-                    "sparse_kv_offload mirror Full-KV sync mismatch: "
-                    f"cache={cache_name}, max_abs_diff={max_abs_diff:.6g}."
+            if not self._mirror_tensors_match(mirror_rows, framework_rows):
+                summary = self._mirror_difference_summary(
+                    mirror_rows,
+                    framework_rows,
                 )
-            if not torch.equal(selected_rows, mirror_rows):
-                max_abs_diff = (selected_rows.float() - mirror_rows.float()).abs().max().item()
+                raise RuntimeError(
+                    "sparse_kv_offload mirror Full-KV changed during Gather: "
+                    f"cache={cache_name}, {summary}."
+                )
+            if not self._mirror_tensors_match(selected_rows, mirror_rows):
+                summary = self._mirror_difference_summary(
+                    selected_rows,
+                    mirror_rows,
+                )
                 raise RuntimeError(
                     "sparse_kv_offload mirror Gather selection mismatch: "
-                    f"cache={cache_name}, max_abs_diff={max_abs_diff:.6g}."
+                    f"cache={cache_name}, {summary}."
                 )
