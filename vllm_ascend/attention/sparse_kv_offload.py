@@ -510,6 +510,24 @@ class SparseKVOffloadWorkspace:
             f"right_nan_count={torch.isnan(right_float).sum().item()}"
         )
 
+    def _materialize_mirror_block(
+        self,
+        tensor: torch.Tensor,
+        block_id: int,
+    ) -> torch.Tensor:
+        """Read one paged block into ordinary NPU storage via index_select."""
+        block_start = block_id * self.block_size
+        block_slots = torch.arange(
+            block_start,
+            block_start + self.block_size,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        return tensor.view(-1, tensor.shape[-1]).index_select(
+            0,
+            block_slots,
+        )
+
     def validate_mirror_slot_mapping(
         self,
         slot_mapping: torch.Tensor,
@@ -566,8 +584,14 @@ class SparseKVOffloadWorkspace:
             mirror_cache,
         ):
             for block_id in updated_blocks:
-                framework_block = framework_tensor[block_id]
-                mirror_block = mirror_tensor[block_id]
+                framework_block = self._materialize_mirror_block(
+                    framework_tensor,
+                    block_id,
+                )
+                mirror_block = self._materialize_mirror_block(
+                    mirror_tensor,
+                    block_id,
+                )
                 if self._mirror_tensors_match(mirror_block, framework_block):
                     continue
 
@@ -583,8 +607,14 @@ class SparseKVOffloadWorkspace:
                 )
                 if self.device.type == "npu":
                     torch.npu.synchronize()
-                retry_framework_block = framework_tensor[block_id]
-                retry_mirror_block = mirror_tensor[block_id]
+                retry_framework_block = self._materialize_mirror_block(
+                    framework_tensor,
+                    block_id,
+                )
+                retry_mirror_block = self._materialize_mirror_block(
+                    mirror_tensor,
+                    block_id,
+                )
                 retry_matches = self._mirror_tensors_match(
                     retry_mirror_block,
                     retry_framework_block,
