@@ -473,8 +473,8 @@ def test_mirror_output_validation_reports_runtime_inputs_on_mismatch():
 
 
 def test_mirror_selection_validation_distinguishes_copy_and_gather_mismatches():
-    full_nope = torch.randn(4, BLOCK_SIZE, 1, 2)
-    full_rope = torch.randn(4, BLOCK_SIZE, 1, 1)
+    full_nope = torch.randn(4, BLOCK_SIZE, 1, 2, dtype=torch.bfloat16)
+    full_rope = torch.randn(4, BLOCK_SIZE, 1, 1, dtype=torch.bfloat16)
     workspace = SparseKVOffloadWorkspace(
         (full_nope, full_rope),
         index_topk=INDEX_TOPK,
