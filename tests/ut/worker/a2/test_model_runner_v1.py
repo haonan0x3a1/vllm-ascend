@@ -57,6 +57,35 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(k_cache_raw.numel(), kv_cache_spec.page_size_bytes)
         self.assertEqual(v_cache_raw.numel(), kv_cache_spec.page_size_bytes)
 
+    def test_sparse_offload_populates_cpu_slot_mapping(self):
+        runner = self._build_runner()
+        runner.ascend_config = SimpleNamespace(sparse_kv_offload=SimpleNamespace(enabled=True))
+        runner.input_batch = SimpleNamespace(block_table=MagicMock())
+        req_indices = np.array([0, 0], dtype=np.int64)
+        positions = np.array([0, 1], dtype=np.int64)
+
+        runner._compute_sparse_kv_offload_slot_mapping_cpu(
+            req_indices,
+            positions,
+        )
+
+        runner.input_batch.block_table.compute_slot_mapping_cpu.assert_called_once_with(
+            req_indices,
+            positions,
+        )
+
+    def test_disabled_sparse_offload_leaves_cpu_slot_mapping_untouched(self):
+        runner = self._build_runner()
+        runner.ascend_config = SimpleNamespace(sparse_kv_offload=SimpleNamespace(enabled=False))
+        runner.input_batch = SimpleNamespace(block_table=MagicMock())
+
+        runner._compute_sparse_kv_offload_slot_mapping_cpu(
+            np.array([0], dtype=np.int64),
+            np.array([0], dtype=np.int64),
+        )
+
+        runner.input_batch.block_table.compute_slot_mapping_cpu.assert_not_called()
+
     def test_reshape_kv_cache_uses_layer_spec_for_draft_gqa(self):
         runner = self._build_runner()
         kv_cache_spec = FullAttentionSpec(

@@ -1294,8 +1294,16 @@ class NPUModelRunner(GPUModelRunner):
             self._correct_optimistic_seq_lens_cpu(num_reqs)
 
         # For non-PCP, compute slot_mapping on GPU. PCP slot_mapping was
-        # already computed on GPU before PCP split the positions.
+        # already computed on GPU before PCP split the positions. Sparse KV
+        # offload also consumes a CPU mapping to update swapped Full-KV
+        # blocks. CpuGpuBuffer does not keep its two sides coherent, so build
+        # the CPU mapping from the host-side inputs before launching the
+        # device mapping kernel.
         if self.pcp_size <= 1:
+            self._compute_sparse_kv_offload_slot_mapping_cpu(
+                req_indices,
+                positions_np[:total_num_scheduled_tokens],
+            )
             self.input_batch.block_table.compute_slot_mapping(
                 num_reqs,
                 self.query_start_loc.gpu[: num_reqs + 1],
@@ -1387,6 +1395,18 @@ class NPUModelRunner(GPUModelRunner):
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
+        )
+
+    def _compute_sparse_kv_offload_slot_mapping_cpu(
+        self,
+        req_indices: np.ndarray,
+        positions: np.ndarray,
+    ) -> None:
+        if not self.ascend_config.sparse_kv_offload.enabled:
+            return
+        self.input_batch.block_table.compute_slot_mapping_cpu(
+            req_indices,
+            positions,
         )
 
     def _rebuild_input_ids_with_corrected_positions(

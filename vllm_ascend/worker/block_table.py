@@ -173,6 +173,38 @@ class BlockTable:
                 BLOCK_SIZE=1024,
             )
 
+    def compute_slot_mapping_cpu(
+        self,
+        req_indices: np.ndarray,
+        positions: np.ndarray,
+    ) -> None:
+        """Compute the non-context-parallel slot mapping on the host.
+
+        ``compute_slot_mapping`` writes only the device side of the
+        ``CpuGpuBuffer``. Sparse KV offload also needs the same physical slot
+        IDs on the host to decide which Full-KV blocks to update, so derive
+        them from the already-host-resident request indices, positions, and
+        block table instead of introducing a device-to-host synchronization.
+        """
+        if self.dcp_world_size * self.pcp_world_size != 1:
+            raise ValueError("CPU slot mapping currently supports only non-context-parallel execution.")
+
+        req_indices = np.asarray(req_indices, dtype=np.int64)
+        positions = np.asarray(positions, dtype=np.int64)
+        if req_indices.shape != positions.shape:
+            raise ValueError(
+                f"req_indices and positions must have the same shape, got {req_indices.shape} and {positions.shape}."
+            )
+
+        num_tokens = positions.shape[0]
+        logical_block_indices = positions // self.block_size
+        block_numbers = self.block_table.np[
+            req_indices,
+            logical_block_indices,
+        ]
+        block_offsets = positions % self.block_size
+        self.slot_mapping.np[:num_tokens] = block_numbers.astype(np.int64) * self.block_size + block_offsets
+
     def compute_slot_mapping_draft(self, req_indices: np.ndarray, positions: np.ndarray) -> None:
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 0, K, K, K + 1, K + 1, K + 2, 2 * K, 2 * K, 2 * K + 1]
@@ -404,6 +436,16 @@ class MultiGroupBlockTable:
                 block_table.compute_slot_mapping_draft(req_indices_compressed_list[i], positions_compressed_list[i])
             else:
                 block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
+
+    def compute_slot_mapping_cpu(
+        self,
+        req_indices: np.ndarray,
+        positions: np.ndarray,
+    ) -> None:
+        for block_table in self.block_tables:
+            if block_table.is_mamba_group:
+                continue
+            block_table.compute_slot_mapping_cpu(req_indices, positions)
 
     def compute_slot_mapping_draft(
         self,

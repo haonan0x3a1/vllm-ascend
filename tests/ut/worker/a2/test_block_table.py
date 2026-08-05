@@ -86,6 +86,29 @@ class TestBlockTableComputeSlotMapping(TestBase):
             block_ids = list(range(i * 4, (i + 1) * 4))  # [0,1,2,3], [4,5,6,7], etc.
             block_table.add_row(block_ids, i)
 
+    def test_compute_slot_mapping_cpu_uses_host_block_table(self):
+        block_table = self.create_block_table(1, 0, 1, 0, 1)
+        block_table.add_row([1, 3], 0)
+        block_table.add_row([7], 1)
+        req_indices = np.array([0, 0, 0, 1], dtype=np.int64)
+        positions = np.array([0, 127, 128, 5], dtype=np.int64)
+
+        block_table.compute_slot_mapping_cpu(req_indices, positions)
+
+        np.testing.assert_array_equal(
+            block_table.slot_mapping.np[:4],
+            np.array([128, 255, 384, 901], dtype=np.int32),
+        )
+
+    def test_compute_slot_mapping_cpu_rejects_context_parallelism(self):
+        block_table = self.create_block_table(2, 0, 1, 0, 1)
+
+        with self.assertRaisesRegex(ValueError, "non-context-parallel"):
+            block_table.compute_slot_mapping_cpu(
+                np.array([0], dtype=np.int64),
+                np.array([0], dtype=np.int64),
+            )
+
     def _test_slot_mapping_for_ranks(self, dcp_world_size, pcp_world_size, cp_kv_cache_interleave_size, test_configs):
         """Helper method to test slot_mapping across multiple ranks
 
