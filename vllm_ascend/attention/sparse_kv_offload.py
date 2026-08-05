@@ -479,33 +479,35 @@ class SparseKVOffloadWorkspace:
         left: torch.Tensor,
         right: torch.Tensor,
     ) -> bool:
-        """Compare diagnostic tensors exactly while treating paired NaNs alike."""
-        left_cpu = left.detach().to(device="cpu")
-        right_cpu = right.detach().to(device="cpu")
-        return torch.allclose(
-            left_cpu,
-            right_cpu,
-            rtol=0,
-            atol=0,
-            equal_nan=True,
+        """Compare diagnostic tensors without copying swapped storage to CPU."""
+        if torch.equal(left, right):
+            return True
+        equal_or_paired_nan = torch.eq(left, right) | (
+            torch.isnan(left) & torch.isnan(right)
         )
+        return bool(torch.all(equal_or_paired_nan).item())
 
     @staticmethod
     def _mirror_difference_summary(
         left: torch.Tensor,
         right: torch.Tensor,
     ) -> str:
-        left_cpu = left.detach().float().to(device="cpu")
-        right_cpu = right.detach().float().to(device="cpu")
-        finite_pairs = torch.isfinite(left_cpu) & torch.isfinite(right_cpu)
+        left_float = left.detach().float()
+        right_float = right.detach().float()
+        finite_pairs = torch.isfinite(left_float) & torch.isfinite(right_float)
         if finite_pairs.any():
-            max_abs_diff = (left_cpu[finite_pairs] - right_cpu[finite_pairs]).abs().max().item()
+            finite_difference = torch.where(
+                finite_pairs,
+                (left_float - right_float).abs(),
+                0,
+            )
+            max_abs_diff = finite_difference.max().item()
         else:
             max_abs_diff = float("nan")
         return (
             f"max_finite_abs_diff={max_abs_diff:.6g}, "
-            f"left_nan_count={torch.isnan(left_cpu).sum().item()}, "
-            f"right_nan_count={torch.isnan(right_cpu).sum().item()}"
+            f"left_nan_count={torch.isnan(left_float).sum().item()}, "
+            f"right_nan_count={torch.isnan(right_float).sum().item()}"
         )
 
     def validate_mirror_slot_mapping(
