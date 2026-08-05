@@ -1303,6 +1303,14 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         self.assertIsNone(worker.kv_send_layer_thread)
         self.assertIsNotNone(worker.kv_recv_layer_thread)
 
+    def test_init_accepts_quant_config_without_kv_quant_flags(self):
+        self.vllm_config.quant_config = SimpleNamespace()
+
+        worker = MooncakeLayerwiseConnectorWorker(self.vllm_config, self.kv_cache_config, self.engine_id)
+
+        self.assertFalse(worker.enable_kv_quant)
+        self.assertFalse(worker.enable_c8_quant)
+
     def test_register_kv_caches_mla_case(self):
         mla_cache1 = MagicMock()
         mla_cache1.size.return_value = (10, 16, 1, 16)

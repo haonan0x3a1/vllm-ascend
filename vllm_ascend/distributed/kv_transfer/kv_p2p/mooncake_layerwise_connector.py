@@ -1280,12 +1280,9 @@ class MooncakeLayerwiseConnectorWorker:
         self.layer_metadata: dict[str, LayerMetadata] = {}
         self.attn_resharding_group_idx = set[int]()
 
-        self.enable_kv_quant = (
-            vllm_config.quant_config.enable_fa_quant if vllm_config.quant_config is not None else False
-        )
-        self.enable_c8_quant = (
-            vllm_config.quant_config.enable_c8_quant if vllm_config.quant_config is not None else False
-        )
+        quant_config = vllm_config.quant_config
+        self.enable_kv_quant = getattr(quant_config, "enable_fa_quant", False)
+        self.enable_c8_quant = getattr(quant_config, "enable_c8_quant", False)
         self.pd_head_ratio = get_ascend_config().pd_head_ratio
         self.num_head_replica = get_ascend_config().num_head_replica
         self.resharding_stream = None
