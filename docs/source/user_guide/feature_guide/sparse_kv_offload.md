@@ -130,6 +130,11 @@ Change only `kv_role` to `kv_consumer` for the Decode worker and use the actual
 matching topology. The current sparse Host validation still requires
 `--max-num-seqs 1`, `--block-size 128`, eager mode, and prefix caching disabled.
 
+For a parameterized same-node correctness PoC, including environment and port
+preflight, role-specific launch commands, below/above-Top-K validation, and
+evidence collection, see
+`examples/disaggregated_prefill_v1/dsv32_sparse_offload_poc/README.md`.
+
 The feature is disabled by default. When disabled, allocation and SFA execution
 remain unchanged.
 
