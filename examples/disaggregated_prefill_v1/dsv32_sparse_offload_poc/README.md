@@ -38,8 +38,10 @@ bash run.sh preflight
 ```
 
 `preflight` 验证路径、依赖 API、卡号映射、API/KV 控制端口以及 Mooncake ADXL
-端口余量。它只能验证 NPU 可见性，不能判断共享卡的实际所有权；还必须确认
-`npu-smi info` 中配置的 16 张卡没有其他人的进程。
+端口余量。为避免复用过 Prefill/Decode 终端时只看到半组卡，它会在自己的临时
+进程中忽略继承的 `ASCEND_RT_VISIBLE_DEVICES`；启动 Prefill/Decode 时仍按
+`config.env` 分别设置卡号。它只能验证 NPU 可见性，不能判断共享卡的实际所有权；
+还必须确认 `npu-smi info` 中配置的 16 张卡没有其他人的进程。
 
 使用三个终端，按顺序启动：
 

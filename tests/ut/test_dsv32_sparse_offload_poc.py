@@ -46,6 +46,18 @@ def test_runtime_modules_load_torch_before_custom_extensions():
     assert list(modules) == list(POC_TOOLS.RUNTIME_IMPORT_ORDER)
 
 
+def test_preflight_clears_inherited_role_device_visibility():
+    environment = {
+        "ASCEND_RT_VISIBLE_DEVICES": "8,9,10,11,12,13,14,15",
+        "KEEP_ME": "value",
+    }
+
+    removed = POC_TOOLS.clear_inherited_device_visibility(environment)
+
+    assert removed == "8,9,10,11,12,13,14,15"
+    assert environment == {"KEEP_ME": "value"}
+
+
 def test_count_lifecycle_records_uses_specific_completion_events():
     request_id = "chatcmpl-test"
     prefill_log = "\n".join(

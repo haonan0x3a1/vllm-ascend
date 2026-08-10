@@ -22,13 +22,14 @@ import argparse
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import shutil
 import socket
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass
 from datetime import datetime
 from importlib import import_module
@@ -52,6 +53,7 @@ RUNTIME_IMPORT_ORDER = (
     "mooncake",
     "vllm_ascend",
 )
+DEVICE_VISIBILITY_ENV = "ASCEND_RT_VISIBLE_DEVICES"
 
 
 @dataclass(frozen=True)
@@ -168,6 +170,13 @@ def import_runtime_modules(
     return {name: importer(name) for name in RUNTIME_IMPORT_ORDER}
 
 
+def clear_inherited_device_visibility(
+    environment: MutableMapping[str, str],
+) -> str | None:
+    """Expose the container's full NPU topology to the preflight process."""
+    return environment.pop(DEVICE_VISIBILITY_ENV, None)
+
+
 def preflight(args: argparse.Namespace) -> int:
     errors: list[str] = []
     prefill_devices = parse_devices(args.prefill_devices)
@@ -216,6 +225,12 @@ def preflight(args: argparse.Namespace) -> int:
         print(f"  {distribution}: {package_version(distribution)}")
 
     try:
+        inherited_visibility = clear_inherited_device_visibility(os.environ)
+        if inherited_visibility is not None:
+            print(
+                f"Ignoring inherited {DEVICE_VISIBILITY_ENV}="
+                f"{inherited_visibility!r} for the physical topology check."
+            )
         runtime_modules = import_runtime_modules()
         torch = runtime_modules["torch"]
         torch_npu = runtime_modules["torch_npu"]
