@@ -20,7 +20,7 @@
 
 ```bash
 cd /workspace/w50062541/code/vllm-ascend/examples/disaggregated_prefill_v1/dsv32_sparse_offload_poc
-cp config.example.env config.env
+cp --update=none config.example.env config.env
 ```
 
 根据实际服务器检查并修改 `config.env`。该文件被 Git 忽略，不会提交服务器路径和端口。

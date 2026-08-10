@@ -16,6 +16,7 @@
 import importlib.util
 import sys
 from pathlib import Path
+from types import ModuleType
 
 
 MODULE_PATH = (
@@ -30,6 +31,19 @@ assert SPEC is not None and SPEC.loader is not None
 POC_TOOLS = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = POC_TOOLS
 SPEC.loader.exec_module(POC_TOOLS)
+
+
+def test_runtime_modules_load_torch_before_custom_extensions():
+    imported_names = []
+
+    def fake_importer(name: str) -> ModuleType:
+        imported_names.append(name)
+        return ModuleType(name)
+
+    modules = POC_TOOLS.import_runtime_modules(fake_importer)
+
+    assert imported_names == list(POC_TOOLS.RUNTIME_IMPORT_ORDER)
+    assert list(modules) == list(POC_TOOLS.RUNTIME_IMPORT_ORDER)
 
 
 def test_count_lifecycle_records_uses_specific_completion_events():

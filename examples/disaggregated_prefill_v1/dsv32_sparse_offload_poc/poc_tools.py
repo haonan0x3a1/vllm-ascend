@@ -28,10 +28,13 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from types import ModuleType
 from urllib.request import ProxyHandler, Request, build_opener
 
 FATAL_PATTERN = re.compile(
@@ -40,6 +43,14 @@ FATAL_PATTERN = re.compile(
     r"Full-KV changed during Gather|Gather selection mismatch|"
     r"OutOfMemoryError|Segmentation fault|double free|"
     r"Worker failed|RuntimeError:|Traceback"
+)
+
+RUNTIME_IMPORT_ORDER = (
+    "torch",
+    "torch_npu",
+    "custom_ops",
+    "mooncake",
+    "vllm_ascend",
 )
 
 
@@ -150,6 +161,13 @@ def package_version(distribution: str) -> str:
         return "NOT INSTALLED"
 
 
+def import_runtime_modules(
+    importer: Callable[[str], ModuleType] = import_module,
+) -> dict[str, ModuleType]:
+    """Import runtime extensions after PyTorch has loaded its shared libraries."""
+    return {name: importer(name) for name in RUNTIME_IMPORT_ORDER}
+
+
 def preflight(args: argparse.Namespace) -> int:
     errors: list[str] = []
     prefill_devices = parse_devices(args.prefill_devices)
@@ -198,11 +216,10 @@ def preflight(args: argparse.Namespace) -> int:
         print(f"  {distribution}: {package_version(distribution)}")
 
     try:
-        import custom_ops  # noqa: F401
-        import mooncake  # noqa: F401
-        import torch
-        import torch_npu
-        import vllm_ascend
+        runtime_modules = import_runtime_modules()
+        torch = runtime_modules["torch"]
+        torch_npu = runtime_modules["torch_npu"]
+        vllm_ascend = runtime_modules["vllm_ascend"]
 
         print(f"vllm-ascend source: {Path(vllm_ascend.__file__).resolve()}")
         print(f"NPU available: {torch.npu.is_available()}")
