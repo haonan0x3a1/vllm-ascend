@@ -4,12 +4,15 @@
 启动、预检、验收和证据归档固化为一个入口。它面向正确性 PoC，
 不是性能或生产部署脚本。
 
+Mooncake 传输路径、内存类型、真实 NPU 探针和最终 Stop/Go 结论见
+[MOONCAKE_TRANSFER_PATHS_2026-08-14.md](MOONCAKE_TRANSFER_PATHS_2026-08-14.md)。
+
 已验证基线：
 
 - 真实 DeepSeek-V3.2 W4A8 权重，运行时 BF16 KV；
 - 61 个主模型层，TP8 Prefill + TP8 Decode，Expert Parallel；
 - `MooncakeLayerwiseConnector` 逐层 NPU staging；
-- Host Full KV、Lightning Indexer Top-K、CANN Gather 和 SFA；
+- framework swapped Full KV、Lightning Indexer Top-K、CANN Gather 和 SFA；
 - `max_model_len=4096`，Prompt 覆盖 1818–3618 tokens；
 - 超过 `index_topk=2048` 的请求强制执行 8 个 Decode tokens；
 - 单请求模式下每个请求完成 8 个 Prefill 和 8 个 Decode rank 生命周期。
@@ -45,9 +48,10 @@ bash run.sh preflight
 
 ## Host 传输可行性门槛
 
-当前已验证基线使用 Mooncake Ascend transport 将逐层缓存传入 Decode NPU
-staging。为了评估 Full KV 改走 `P Host DDR -> D Host DDR` 是否能减少对 Decode
-NPU 的干扰，先单独验证当前 Ascend Mooncake wheel 的 TCP Host transport：
+当前已验证基线使用 Mooncake Ascend transport 将逐层缓存传入 Decode 普通 NPU
+staging。为了评估 Full KV 改走
+`P framework swapped Full KV -> D framework swapped Full KV` 是否能减少对
+Decode NPU 的干扰，先单独验证当前 Ascend Mooncake wheel 的 TCP Host transport：
 
 ```bash
 bash run.sh probe-host-transfer
@@ -92,9 +96,14 @@ engine。发送端和接收端都必须分别出现 Ascend 与 TCP-only 原生�
 才返回成功，证据保存在
 `LOG_DIR/dsv32-mooncake-hybrid-transfer-probe.log`。
 
-这个测试通过也只确定“双引擎可共存”的实现前提；下一门槛仍是生产内存链路
-`P NPU -> P pinned Host -> D pinned Host -> D swapped Full KV -> Gather`。在该链路通过
-以前，不应把 Host relay 接入生产 Connector。
+这个测试通过也只确定“双引擎可共存”的实现前提。后续兼容性探针虽然验证了：
+
+```text
+P 普通 NPU staging -> P pinned Host relay -> D pinned Host relay
+-> D 普通 NPU staging -> D framework swapped Full KV -> Gather
+```
+
+但它没有消除 Decode 端 Full KV 经过普通 NPU staging，因此不构成目标传输路径。
 
 双引擎门槛通过后，曾使用下面的兼容性探针验证 Host 数据可以经现有
 NPU staging 桥接进入 swapped Full KV：
@@ -127,7 +136,7 @@ Prefill NPU staging
 并没有消除 Decode 端 Full KV 经过 NPU staging，因此不是目标 Host 路径，
 也不能据此开始性能对比。
 
-在启动任何 16 卡 Host relay 服务前，只运行下面这个决定路线的硬件门槛：
+用于决定路线的 direct Host Gather 硬件门槛为：
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=8 bash run.sh probe-direct-host-gather
@@ -139,12 +148,12 @@ Full-KV 维度放在普通 pinned Host Tensor 中，使用非恒等物理块映�
 staging，也不使用 swapped Tensor。测试在独立子进程执行，检查 selected KV 数值、
 Host 源数据和 guard，并要求子进程正常退出。
 
-- 若通过：才可把持久化 Decode Full-KV Pool 改为 Mooncake 可注册的 pinned Host
-  内存，并移除 Decode Full-KV NPU bridge。
-- 若失败：当前公开 Tensor/算子接口不能实现该直接路径；停止扩展 `host_relay`，
-  保留已验证的 `npu_staging` 基线，并把底层 Host allocation/alias 支持作为依赖问题。
-
-该命令是当前唯一待运行的微型门槛；无论通过还是失败，都不继续追加同类探针。
+该门槛已在当前 CANN/torch_npu/Mooncake 环境的真实 NPU 上运行并失败，关键错误为
+`MTE accesses an invalid GM address`。这说明当前公开 Tensor/算子接口不能让 CANN
+Gather 直接读取普通 pinned Host Tensor。停止扩展 `host_relay`，保留已验证的
+`npu_staging` 基线，并把同一 swapped allocation 的 CPU Host 地址/NPU SVM alias
+支持作为下层依赖问题。除非 CANN、torch_npu 或 Mooncake 的相关接口发生变化，
+否则不再重复运行该探针或追加同类 bridge 探针。
 
 ## 选择生产传输路径
 
@@ -159,14 +168,17 @@ SPARSE_KV_TRANSFER_MODE=host_relay
 ```
 
 `npu_staging` 保持原路径：Full KV 与 Indexer 都通过 Mooncake Ascend transport
-进入 Decode NPU staging，再把 Full KV 持久化到 Decode swapped Host cache。
+进入 Decode 普通 NPU staging，再通过本地 NPU→swapped copy 把 Full KV 持久化到
+Decode framework swapped Full KV。
 
 `host_relay` 当前是默认关闭的兼容性/诊断模式，使用两套共存的 Mooncake engine：
 
 ```text
-Full KV: P NPU staging -> P pinned Host -> Mooncake TCP
-         -> D pinned Host -> D NPU staging -> D swapped Full KV
-Indexer: P NPU ---------------- Mooncake Ascend ----------------> D NPU
+Full KV: P 普通 NPU staging --本地 NPU→pinned copy--> P pinned Host relay
+         --Mooncake TCP--> D pinned Host relay
+         --本地 pinned→NPU copy--> D 普通 NPU staging
+         --本地 NPU→swapped copy--> D framework swapped Full KV
+Indexer: P Indexer NPU KV --Mooncake Ascend NPU→NPU--> D Indexer NPU KV
 ```
 
 Decode 只有在 Host relay 已桥接到 swapped Full KV、Indexer 也已传完后才确认该层。
@@ -221,7 +233,8 @@ NPU 状态和传输生命周期归档到 `OUTPUT_DIR` 下的带时间戳目录�
 - 当前只支持单请求、Eager、`block_size=128`、BF16/FP16 KV。
 - 不支持 Prefix Cache、Sparse C8、MTP/Speculative Decode 或 DSA CP/PCP/DCP。
 - 逐层 staging 采用同步 ACK；尚未证明通信计算重叠或性能收益。
-- `host_relay` 当前使用 TCP 作为功能和性能基线；尚未证明跨节点 RDMA/RoCE/UB
-  Host transport，也不使用 Mooncake Store。
+- `host_relay` 只是默认关闭的兼容性诊断路径，不是性能候选；它使用 TCP 验证
+  pinned Host relay 传输，尚未证明跨节点 RDMA/RoCE/UB Host transport，也不使用
+  Mooncake Store。
 - 如果端口被 Ray 等共享服务占用，应修改 `config.env` 选择完整空闲端口段，
   不要终止不属于本任务的进程。
