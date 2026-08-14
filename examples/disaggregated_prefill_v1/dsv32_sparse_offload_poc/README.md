@@ -96,7 +96,8 @@ engine。发送端和接收端都必须分别出现 Ascend 与 TCP-only 原生�
 `P NPU -> P pinned Host -> D pinned Host -> D swapped Full KV -> Gather`。在该链路通过
 以前，不应把 Host relay 接入生产 Connector。
 
-双引擎门槛通过后，运行最后一个独立硬件探针：
+双引擎门槛通过后，曾使用下面的兼容性探针验证 Host 数据可以经现有
+NPU staging 桥接进入 swapped Full KV：
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=8,9 bash run.sh probe-host-relay
@@ -122,8 +123,28 @@ Prefill NPU staging
 到 swapped Full KV 的本地桥接，与生产 Connector 已验证的 basic-slice persistence
 路径保持一致；不直接把 pinned Host 地址写入 swapped/SVM alias。脚本只有看到
 `1 passed` 才返回成功，证据保存在
-`LOG_DIR/dsv32-mooncake-host-relay-probe.log`。这是 Host relay 接入生产 Connector 前
-的最后一个独立探针；通过后不再增加微型门槛，直接进入 Connector 集成。
+`LOG_DIR/dsv32-mooncake-host-relay-probe.log`。它证明的是兼容性 fallback，
+并没有消除 Decode 端 Full KV 经过 NPU staging，因此不是目标 Host 路径，
+也不能据此开始性能对比。
+
+在启动任何 16 卡 Host relay 服务前，只运行下面这个决定路线的硬件门槛：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=8 bash run.sh probe-direct-host-gather
+```
+
+其中 `8` 必须替换为当时空闲的一张物理卡。该测试把真实 DeepSeek-V3.2 BF16
+Full-KV 维度放在普通 pinned Host Tensor 中，使用非恒等物理块映射 `[[2,1]]`，
+直接调用真实 CANN `npu_gather_selection_kv_cache`，不经过 Decode NPU Full-KV
+staging，也不使用 swapped Tensor。测试在独立子进程执行，检查 selected KV 数值、
+Host 源数据和 guard，并要求子进程正常退出。
+
+- 若通过：才可把持久化 Decode Full-KV Pool 改为 Mooncake 可注册的 pinned Host
+  内存，并移除 Decode Full-KV NPU bridge。
+- 若失败：当前公开 Tensor/算子接口不能实现该直接路径；停止扩展 `host_relay`，
+  保留已验证的 `npu_staging` 基线，并把底层 Host allocation/alias 支持作为依赖问题。
+
+该命令是当前唯一待运行的微型门槛；无论通过还是失败，都不继续追加同类探针。
 
 ## 选择生产传输路径
 
@@ -140,7 +161,7 @@ SPARSE_KV_TRANSFER_MODE=host_relay
 `npu_staging` 保持原路径：Full KV 与 Indexer 都通过 Mooncake Ascend transport
 进入 Decode NPU staging，再把 Full KV 持久化到 Decode swapped Host cache。
 
-`host_relay` 使用两套共存的 Mooncake engine：
+`host_relay` 当前是默认关闭的兼容性/诊断模式，使用两套共存的 Mooncake engine：
 
 ```text
 Full KV: P NPU staging -> P pinned Host -> Mooncake TCP
@@ -149,8 +170,8 @@ Indexer: P NPU ---------------- Mooncake Ascend ----------------> D NPU
 ```
 
 Decode 只有在 Host relay 已桥接到 swapped Full KV、Indexer 也已传完后才确认该层。
-两个模式复用相同的请求、block 映射、Gather 和 SFA 路径，便于后续做正确性及
-性能 A/B。`run.sh` 会主动清除外部 `MC_FORCE_TCP`；不要手工导出它，否则现有
+这个实现仍让 Full KV 经过 Decode NPU，不是 mentor 所指的最终 Host 路径，当前
+不得用它得出性能收益结论。`run.sh` 会主动清除外部 `MC_FORCE_TCP`；不要手工导出它，否则现有
 Ascend engine 可能被错误初始化成 TCP。两种模式使用带模式名的独立日志和结果
 文件，避免覆盖对照证据。
 

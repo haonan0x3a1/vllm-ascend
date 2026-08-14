@@ -66,6 +66,7 @@ LOGICAL_BLOCK_START = {2: 0, 1: BLOCK_SIZE}
 RELAY_TRANSFER_BYTES = len(TOUCHED_BLOCKS) * (NOPE_BLOCK_BYTES + ROPE_BLOCK_BYTES)
 HOST_RELAY_PROCESS_TIMEOUT_SECONDS = 180
 HOST_RELAY_STAGE_MARKER = "MOONCAKE_HOST_RELAY_STAGE="
+DIRECT_HOST_GATHER_PROCESS_TIMEOUT_SECONDS = 120
 
 
 def _validate_relay_layout() -> None:
@@ -397,6 +398,182 @@ def _gather_verification(torch_module, workspace) -> dict[str, bool]:
     }
 
 
+def _run_direct_pinned_host_gather() -> int:
+    """Run Gather with Full KV backed directly by pinned Host memory."""
+    import torch
+    import torch_npu
+
+    # Importing the extension mounts the custom op on torch_npu.
+    import custom_ops  # noqa: F401
+
+    torch.npu.set_device(0)
+    host_raw, host_buffer = _allocate_aligned_host_buffer(
+        torch,
+        fill_value=HOST_DESTINATION_SENTINEL,
+        pinned=True,
+    )
+    full_nope, full_rope = _relay_views(torch, host_buffer)
+    for block_id in TOUCHED_BLOCKS:
+        full_nope[block_id].copy_(
+            _expected_block(
+                torch,
+                block_id=block_id,
+                width=KV_LORA_RANK,
+                rope=False,
+            )
+        )
+        full_rope[block_id].copy_(
+            _expected_block(
+                torch,
+                block_id=block_id,
+                width=ROPE_HEAD_DIM,
+                rope=True,
+            )
+        )
+
+    device = torch.device("npu:0")
+    selection_num_blocks = math.ceil(INDEX_TOPK / BLOCK_SIZE)
+    selected_nope = torch.empty(
+        (selection_num_blocks, BLOCK_SIZE, KV_LORA_RANK),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    selected_rope = torch.empty(
+        (selection_num_blocks, BLOCK_SIZE, ROPE_HEAD_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    selection_block_table = torch.arange(
+        selection_num_blocks,
+        dtype=torch.int32,
+        device=device,
+    ).view(1, selection_num_blocks)
+    selection_block_status = torch.full(
+        (1, 1, INDEX_TOPK + 1),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    topk_indices = torch.full(
+        (1, 1, INDEX_TOPK),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    topk_indices[0, 0, : 2 * BLOCK_SIZE] = torch.arange(
+        2 * BLOCK_SIZE,
+        dtype=torch.int32,
+        device=device,
+    )
+    full_block_table = torch.tensor(
+        [[2, 1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    full_actual_seq = torch.tensor(
+        [2 * BLOCK_SIZE],
+        dtype=torch.int32,
+        device=device,
+    )
+    full_query_actual_seq = torch.tensor(
+        [1],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    gather_op = getattr(torch_npu, "npu_gather_selection_kv_cache", None)
+    if not callable(gather_op):
+        raise RuntimeError(
+            "custom_ops did not register "
+            "torch_npu.npu_gather_selection_kv_cache"
+        )
+    selected_actual_seq = gather_op(
+        selection_k_rope=selected_rope,
+        selection_kv_cache=selected_nope,
+        selection_kv_block_table=selection_block_table,
+        selection_kv_block_status=selection_block_status,
+        selection_topk_indices=topk_indices,
+        full_k_rope=full_rope.squeeze(2),
+        full_kv_cache=full_nope.squeeze(2),
+        full_kv_block_table=full_block_table,
+        full_kv_actual_seq=full_actual_seq,
+        full_q_actual_seq=full_query_actual_seq,
+        selection_topk_block_size=1,
+    )
+    torch.npu.synchronize()
+
+    selected_nope_cpu = (
+        selected_nope.view(-1, KV_LORA_RANK)[: 2 * BLOCK_SIZE]
+        .float()
+        .cpu()
+    )
+    selected_rope_cpu = (
+        selected_rope.view(-1, ROPE_HEAD_DIM)[: 2 * BLOCK_SIZE]
+        .float()
+        .cpu()
+    )
+    logical_tokens = torch.arange(2 * BLOCK_SIZE, dtype=torch.float32)
+    gather = {
+        "selected_nope": bool(
+            torch.equal(
+                selected_nope_cpu,
+                logical_tokens.view(-1, 1).expand(
+                    2 * BLOCK_SIZE,
+                    KV_LORA_RANK,
+                ),
+            )
+        ),
+        "selected_rope": bool(
+            torch.equal(
+                selected_rope_cpu,
+                logical_tokens.mul(0.5).view(-1, 1).expand(
+                    2 * BLOCK_SIZE,
+                    ROPE_HEAD_DIM,
+                ),
+            )
+        ),
+        "actual_seq_lengths": selected_actual_seq.cpu().tolist()
+        == [2 * BLOCK_SIZE],
+    }
+    source_guards = _relay_guard_verification(torch, host_buffer)
+    source_payload = _relay_payload_verification(
+        torch,
+        (full_nope, full_rope),
+    )
+    result = {
+        "matches": all(
+            (
+                *gather.values(),
+                *source_guards.values(),
+                *source_payload.values(),
+            )
+        ),
+        "host_buffer_pinned": host_buffer.is_pinned(),
+        "host_buffer_alignment_mod": host_buffer.data_ptr() % BUFFER_BYTES,
+        "full_nope_device": str(full_nope.device),
+        "full_rope_device": str(full_rope.device),
+        "gather": gather,
+        "source_guards": source_guards,
+        "source_payload": source_payload,
+        "touched_blocks": TOUCHED_BLOCKS,
+    }
+    print(RESULT_MARKER + json.dumps(result, sort_keys=True), flush=True)
+    if not result["matches"]:
+        raise RuntimeError(
+            "Gather did not read pinned Host Full KV correctly: "
+            f"{result}"
+        )
+    del selected_actual_seq
+    del selected_rope
+    del selected_nope
+    del full_rope
+    del full_nope
+    del host_buffer
+    del host_raw
+    gc.collect()
+    return 0
+
+
 def _run_host_relay_receiver() -> int:
     import torch_npu
 
@@ -722,9 +899,57 @@ def test_mooncake_host_relay_to_swapped_gather():
             receiver_output.join()
 
 
+def test_gather_reads_pinned_host_full_kv_directly():
+    """Decide whether Decode can Gather without a Full-KV NPU bridge."""
+    _require_native_mooncake()
+    module_name = (
+        "tests.ut.distributed.kv_transfer.a3_2."
+        "test_mooncake_host_relay_npu"
+    )
+    child_environment = os.environ.copy()
+    child_environment.pop(HOST_TCP_FORCE_ENV, None)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            module_name,
+            "--role",
+            "direct_host_gather",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=DIRECT_HOST_GATHER_PROCESS_TIMEOUT_SECONDS,
+        env=child_environment,
+    )
+    assert completed.returncode == 0, (
+        "Pinned Host Full-KV direct Gather failed. This means the current "
+        "runtime cannot remove the Decode Full-KV NPU bridge through this "
+        "Tensor interface.\n"
+        f"stdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
+    )
+    result = _extract_json_marker(completed.stdout, RESULT_MARKER)
+    assert result["matches"], result
+    assert result["host_buffer_pinned"]
+    assert result["host_buffer_alignment_mod"] == 0
+    assert result["full_nope_device"] == "cpu"
+    assert result["full_rope_device"] == "cpu"
+    assert all(result["gather"].values())
+    assert all(result["source_guards"].values())
+    assert all(result["source_payload"].values())
+    print(
+        "Pinned Host Full-KV direct Gather verified: "
+        + json.dumps(result, sort_keys=True)
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--role", choices=("receiver", "sender"), required=True)
+    parser.add_argument(
+        "--role",
+        choices=("receiver", "sender", "direct_host_gather"),
+        required=True,
+    )
     parser.add_argument("--target-host")
     parser.add_argument("--target-host-port", type=int)
     parser.add_argument("--target-host-address", type=int)
@@ -735,6 +960,8 @@ if __name__ == "__main__":
     args = _parse_args()
     if args.role == "receiver":
         raise SystemExit(_run_host_relay_receiver())
+    if args.role == "direct_host_gather":
+        raise SystemExit(_run_direct_pinned_host_gather())
     if (
         args.target_host is None
         or args.target_host_port is None

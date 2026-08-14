@@ -29,6 +29,8 @@ Commands:
   probe-host-transfer   Validate Mooncake TCP Host-to-Host transport.
   probe-hybrid-transfer Validate coexisting Ascend and TCP Mooncake engines.
   probe-host-relay      Validate the BF16 Host relay through swapped KV and Gather.
+  probe-direct-host-gather
+                        Decide whether Gather can read pinned Host Full KV directly.
   decode                Start the Decode service in the foreground.
   prefill               Start the Prefill service in the foreground.
   proxy                 Start the P/D proxy in the foreground.
@@ -86,6 +88,7 @@ PROXY_LOG="$LOG_DIR/dsv32-pd-real61-4k-$SPARSE_KV_TRANSFER_MODE-proxy.log"
 HOST_TRANSFER_LOG="$LOG_DIR/dsv32-mooncake-host-transfer-probe.log"
 HYBRID_TRANSFER_LOG="$LOG_DIR/dsv32-mooncake-hybrid-transfer-probe.log"
 HOST_RELAY_LOG="$LOG_DIR/dsv32-mooncake-host-relay-probe.log"
+DIRECT_HOST_GATHER_LOG="$LOG_DIR/dsv32-direct-pinned-host-gather-probe.log"
 VALIDATION_OUTPUT="$OUTPUT_DIR/dsv32-pd-real61-4k-$SPARSE_KV_TRANSFER_MODE-final-suite.json"
 PROXY_SCRIPT="$REPO_DIR/examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_example.py"
 HOST_TRANSFER_TEST="tests/ut/distributed/kv_transfer/a3_2/"
@@ -94,6 +97,18 @@ HYBRID_TRANSFER_TEST="tests/ut/distributed/kv_transfer/a3_2/"
 HYBRID_TRANSFER_TEST+="test_mooncake_transfer_engine_npu.py::test_mooncake_ascend_and_tcp_engines_coexist"
 HOST_RELAY_TEST="tests/ut/distributed/kv_transfer/a3_2/"
 HOST_RELAY_TEST+="test_mooncake_host_relay_npu.py::test_mooncake_host_relay_to_swapped_gather"
+DIRECT_HOST_GATHER_TEST="tests/ut/distributed/kv_transfer/a3_2/"
+DIRECT_HOST_GATHER_TEST+="test_mooncake_host_relay_npu.py::test_gather_reads_pinned_host_full_kv_directly"
+
+require_one_probe_device() {
+    local command_name=$1
+    if [[ ! "${ASCEND_RT_VISIBLE_DEVICES:-}" =~ ^[0-9]+$ ]]; then
+        echo "$command_name requires exactly one explicitly selected free NPU." >&2
+        echo "Example: ASCEND_RT_VISIBLE_DEVICES=8 bash run.sh $command_name" >&2
+        exit 1
+    fi
+    echo "$command_name physical NPU: $ASCEND_RT_VISIBLE_DEVICES"
+}
 
 require_two_probe_devices() {
     local command_name=$1
@@ -307,6 +322,20 @@ case "$ACTION" in
                 exit 1
             fi
             echo "Host relay probe evidence: $HOST_RELAY_LOG"
+        )
+        ;;
+    probe-direct-host-gather)
+        (
+            require_one_probe_device probe-direct-host-gather
+            unset MC_FORCE_TCP
+            cd "$REPO_DIR"
+            "$MOONCAKE_PYTHON" -m pytest -sv "$DIRECT_HOST_GATHER_TEST" \
+                2>&1 | tee "$DIRECT_HOST_GATHER_LOG"
+            if ! grep -Eq '(^|[^0-9])1 passed([^0-9]|$)' "$DIRECT_HOST_GATHER_LOG"; then
+                echo "Direct pinned Host Gather probe did not pass: $DIRECT_HOST_GATHER_LOG" >&2
+                exit 1
+            fi
+            echo "Direct pinned Host Gather evidence: $DIRECT_HOST_GATHER_LOG"
         )
         ;;
     decode|prefill)
