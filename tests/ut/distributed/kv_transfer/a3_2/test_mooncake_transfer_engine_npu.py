@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import queue
 import socket
 import subprocess
@@ -43,6 +44,14 @@ from packaging.version import Version
 ALIGNMENT_BYTES = 2 * 1024 * 1024
 BUFFER_BYTES = 2 * 1024 * 1024
 BUFFER_PATTERN = 0x5A
+HOST_DESTINATION_SENTINEL = -1
+HOST_TRANSFER_OFFSET_BYTES = 4096
+HOST_TRANSFER_BYTES = 64 * 1024
+HOST_TRANSFER_REPEAT_COUNT = 20
+HOST_TRANSFER_END_BYTES = HOST_TRANSFER_OFFSET_BYTES + HOST_TRANSFER_REPEAT_COUNT * HOST_TRANSFER_BYTES
+HOST_TCP_FORCE_ENV = "MC_FORCE_TCP"
+HOST_TCP_FORCE_VALUE = "1"
+HOST_TCP_RUNTIME_MARKER = "MC_FORCE_TCP is set, using TCP transport only"
 MIXED_TRANSFER_OFFSET_BYTES = 4096
 MIXED_TRANSFER_BYTES = 256 * 1024
 MIXED_DESTINATION_SENTINEL = -1
@@ -149,6 +158,28 @@ def _allocate_aligned_buffer(
     buffer = raw[offset : offset + BUFFER_BYTES]
     if buffer.data_ptr() % ALIGNMENT_BYTES != 0:
         raise RuntimeError(f"Buffer address {buffer.data_ptr():#x} is not 2 MiB aligned.")
+    buffer.fill_(fill_value)
+    return raw, buffer
+
+
+def _allocate_aligned_host_buffer(
+    torch_module,
+    *,
+    fill_value: int,
+    pinned: bool,
+):
+    """Allocate a stable 2 MiB-aligned Host registration region."""
+    raw = torch_module.empty(
+        BUFFER_BYTES + ALIGNMENT_BYTES,
+        dtype=torch_module.int8,
+        device="cpu",
+        pin_memory=pinned,
+    )
+    aligned_address = (raw.data_ptr() + ALIGNMENT_BYTES - 1) // ALIGNMENT_BYTES * ALIGNMENT_BYTES
+    offset = aligned_address - raw.data_ptr()
+    buffer = raw[offset : offset + BUFFER_BYTES]
+    if buffer.data_ptr() % ALIGNMENT_BYTES != 0:
+        raise RuntimeError(f"Host buffer address {buffer.data_ptr():#x} is not 2 MiB aligned.")
     buffer.fill_(fill_value)
     return raw, buffer
 
@@ -296,6 +327,66 @@ def _initialize_engine(device_index: int):
     return torch, engine, host
 
 
+def _initialize_host_engine():
+    """Initialize the Ascend Mooncake wheel in its TCP-only process mode."""
+    import torch
+    import torch_npu  # noqa: F401
+    from mooncake.engine import TransferEngine
+    from vllm.utils.network_utils import get_ip
+
+    if os.environ.get(HOST_TCP_FORCE_ENV) != HOST_TCP_FORCE_VALUE:
+        raise RuntimeError(
+            "The Ascend Mooncake wheel requires MC_FORCE_TCP=1 before "
+            "process startup for a TCP-only Host transport probe."
+        )
+    engine = TransferEngine()
+    host = get_ip()
+    result = engine.initialize(host, "P2PHANDSHAKE", "tcp", "")
+    if result != 0:
+        raise RuntimeError(f"Host TransferEngine TCP initialization failed: result={result}")
+    return torch, engine, host
+
+
+def _register_host_buffer(engine, buffer) -> None:
+    result = engine.register_memory(
+        buffer.data_ptr(),
+        BUFFER_BYTES,
+        "cpu",
+    )
+    if result != 0:
+        raise RuntimeError(f"Mooncake Host memory registration failed: result={result}")
+
+
+def _host_payload_value(transfer_index: int) -> int:
+    return transfer_index + 1
+
+
+def _validate_host_transfer_layout() -> None:
+    if HOST_TRANSFER_END_BYTES > BUFFER_BYTES:
+        raise RuntimeError("Host transfer windows exceed the registered buffer.")
+
+
+def _verify_host_transfer_buffer(torch_module, buffer) -> dict[str, Any]:
+    _validate_host_transfer_layout()
+    prefix_matches = bool(torch_module.all(buffer[:HOST_TRANSFER_OFFSET_BYTES] == HOST_DESTINATION_SENTINEL).item())
+    payload_matches = []
+    for transfer_index in range(HOST_TRANSFER_REPEAT_COUNT):
+        start = HOST_TRANSFER_OFFSET_BYTES + transfer_index * HOST_TRANSFER_BYTES
+        end = start + HOST_TRANSFER_BYTES
+        payload_matches.append(
+            bool(torch_module.all(buffer[start:end] == _host_payload_value(transfer_index)).item())
+        )
+    suffix_matches = bool(torch_module.all(buffer[HOST_TRANSFER_END_BYTES:] == HOST_DESTINATION_SENTINEL).item())
+    return {
+        "prefix_matches": prefix_matches,
+        "payload_matches": payload_matches,
+        "suffix_matches": suffix_matches,
+        "matches": prefix_matches and all(payload_matches) and suffix_matches,
+        "first_payload_byte": int(buffer[HOST_TRANSFER_OFFSET_BYTES].item()),
+        "last_payload_byte": int(buffer[HOST_TRANSFER_END_BYTES - 1].item()),
+    }
+
+
 def _unregister_buffers(
     engine,
     registered_pointers: list[int],
@@ -402,6 +493,64 @@ def _run_receiver() -> int:
         gc.collect()
         if unregister_result != 0:
             raise RuntimeError(f"Receiver memory unregistration failed: result={unregister_result}")
+
+
+def _run_host_receiver(*, pinned: bool) -> int:
+    _validate_host_transfer_layout()
+    torch, engine, host = _initialize_host_engine()
+    raw = buffer = None
+    registered = False
+    unregister_result = 0
+    try:
+        raw, buffer = _allocate_aligned_host_buffer(
+            torch,
+            fill_value=HOST_DESTINATION_SENTINEL,
+            pinned=pinned,
+        )
+        _register_host_buffer(engine, buffer)
+        registered = True
+        print(
+            READY_MARKER
+            + json.dumps(
+                {
+                    "host": host,
+                    "port": engine.get_rpc_port(),
+                    "address": buffer.data_ptr(),
+                    "size": BUFFER_BYTES,
+                    "pinned": pinned,
+                    "force_tcp": os.environ.get(HOST_TCP_FORCE_ENV),
+                }
+            ),
+            flush=True,
+        )
+
+        command = sys.stdin.readline().strip()
+        if command != "VERIFY":
+            raise RuntimeError(f"Host receiver expected VERIFY command, received {command!r}.")
+
+        verification = _verify_host_transfer_buffer(torch, buffer)
+        print(
+            RESULT_MARKER
+            + json.dumps(
+                {
+                    **verification,
+                    "pinned": pinned,
+                }
+            ),
+            flush=True,
+        )
+        if not verification["matches"]:
+            raise RuntimeError("Host receiver buffer does not match the sent payloads and guards.")
+        return 0
+    finally:
+        if registered and buffer is not None:
+            unregister_result = engine.unregister_memory(buffer.data_ptr())
+        del engine
+        del buffer
+        del raw
+        gc.collect()
+        if unregister_result != 0:
+            raise RuntimeError(f"Host receiver memory unregistration failed: result={unregister_result}")
 
 
 def _run_mixed_receiver() -> int:
@@ -697,6 +846,72 @@ def _run_sender(
         gc.collect()
         if unregister_result != 0:
             raise RuntimeError(f"Sender memory unregistration failed: result={unregister_result}")
+
+
+def _run_host_sender(
+    *,
+    target_host: str,
+    target_port: int,
+    target_address: int,
+    pinned: bool,
+) -> int:
+    _validate_host_transfer_layout()
+    torch, engine, _ = _initialize_host_engine()
+    raw = buffer = None
+    registered = False
+    unregister_result = 0
+    transfer_results = []
+    try:
+        raw, buffer = _allocate_aligned_host_buffer(
+            torch,
+            fill_value=0,
+            pinned=pinned,
+        )
+        for transfer_index in range(HOST_TRANSFER_REPEAT_COUNT):
+            start = HOST_TRANSFER_OFFSET_BYTES + transfer_index * HOST_TRANSFER_BYTES
+            end = start + HOST_TRANSFER_BYTES
+            buffer[start:end].fill_(_host_payload_value(transfer_index))
+        _register_host_buffer(engine, buffer)
+        registered = True
+
+        session = f"{target_host}:{target_port}"
+        for transfer_index in range(HOST_TRANSFER_REPEAT_COUNT):
+            offset = HOST_TRANSFER_OFFSET_BYTES + transfer_index * HOST_TRANSFER_BYTES
+            result = engine.batch_transfer_sync_write(
+                session,
+                [buffer.data_ptr() + offset],
+                [target_address + offset],
+                [HOST_TRANSFER_BYTES],
+            )
+            if result < 0:
+                raise RuntimeError(
+                    "Mooncake Host-to-Host TCP transfer failed: "
+                    f"session={session}, transfer_index={transfer_index}, result={result}"
+                )
+            transfer_results.append(result)
+        print(
+            RESULT_MARKER
+            + json.dumps(
+                {
+                    "transfer_results": transfer_results,
+                    "source_address": buffer.data_ptr(),
+                    "target_address": target_address,
+                    "pinned": pinned,
+                    "force_tcp": os.environ.get(HOST_TCP_FORCE_ENV),
+                }
+            ),
+            flush=True,
+        )
+        return 0
+    finally:
+        if registered and buffer is not None:
+            unregister_result = engine.unregister_memory(buffer.data_ptr())
+        del engine
+        del buffer
+        del raw
+        gc.collect()
+        if unregister_result != 0:
+            raise RuntimeError(f"Host sender memory unregistration failed: result={unregister_result}")
 
 
 def _run_mixed_sender(
@@ -1255,6 +1470,117 @@ def test_mooncake_npu_to_npu_transfer():
             receiver_output.join()
 
 
+@pytest.mark.parametrize(
+    ("memory_kind", "pinned"),
+    (
+        pytest.param("regular", False, id="regular-host"),
+        pytest.param("pinned", True, id="pinned-host"),
+    ),
+)
+def test_mooncake_host_to_host_tcp_transfer(memory_kind: str, pinned: bool):
+    """Verify the Ascend wheel's TCP-only Host transport capability."""
+    _require_native_mooncake()
+    command = [sys.executable, str(Path(__file__).resolve())]
+    child_environment = os.environ.copy()
+    child_environment[HOST_TCP_FORCE_ENV] = HOST_TCP_FORCE_VALUE
+    receiver = subprocess.Popen(
+        [
+            *command,
+            "--role",
+            "host_receiver",
+            "--host-memory-kind",
+            memory_kind,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=child_environment,
+    )
+    if receiver.stdin is None or receiver.stdout is None:
+        receiver.terminate()
+        receiver.wait(timeout=5)
+        raise RuntimeError("Failed to create Host receiver control pipes.")
+
+    receiver_output = _ProcessOutput(receiver.stdout)
+    try:
+        ready = receiver_output.wait_for_marker(
+            READY_MARKER,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        assert ready["pinned"] is pinned
+        assert ready["force_tcp"] == HOST_TCP_FORCE_VALUE
+        sender = subprocess.run(
+            [
+                *command,
+                "--role",
+                "host_sender",
+                "--host-memory-kind",
+                memory_kind,
+                "--target-host",
+                str(ready["host"]),
+                "--target-port",
+                str(ready["port"]),
+                "--target-address",
+                str(ready["address"]),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+            env=child_environment,
+        )
+        assert sender.returncode == 0, (
+            "Mooncake Host sender failed.\n"
+            f"stdout:\n{sender.stdout}\n"
+            f"stderr:\n{sender.stderr}"
+        )
+
+        receiver.stdin.write("VERIFY\n")
+        receiver.stdin.flush()
+        result = receiver_output.wait_for_marker(
+            RESULT_MARKER,
+            timeout=PROCESS_TIMEOUT_SECONDS,
+        )
+        receiver.wait(timeout=PROCESS_TIMEOUT_SECONDS)
+        receiver_output.join()
+        assert receiver.returncode == 0, (
+            "Mooncake Host receiver failed.\n"
+            f"output:\n{receiver_output.output}"
+        )
+        assert result["matches"], (
+            "Mooncake Host receiver observed corrupted data.\n"
+            f"result={result}\noutput:\n{receiver_output.output}"
+        )
+        assert all(result["payload_matches"])
+        sender_output = sender.stdout + sender.stderr
+        assert HOST_TCP_RUNTIME_MARKER in receiver_output.output, (
+            "Mooncake Host receiver did not emit the expected TCP-only "
+            f"runtime marker.\noutput:\n{receiver_output.output}"
+        )
+        assert HOST_TCP_RUNTIME_MARKER in sender_output, (
+            "Mooncake Host sender did not emit the expected TCP-only "
+            f"runtime marker.\noutput:\n{sender_output}"
+        )
+        print(
+            "Mooncake Host-to-Host TCP path verified: "
+            + json.dumps(
+                {
+                    "memory_kind": memory_kind,
+                    "repeat_count": HOST_TRANSFER_REPEAT_COUNT,
+                    "transfer_bytes": HOST_TRANSFER_BYTES,
+                    "verification": result,
+                },
+                sort_keys=True,
+            )
+        )
+    finally:
+        if receiver.poll() is None:
+            _stop_process(receiver, receiver_output)
+        else:
+            receiver_output.join()
+
+
 def test_mooncake_sparse_offload_staged_memory_transfer():
     """Verify NPU staging followed by a local write into swapped Full KV."""
     _require_native_mooncake()
@@ -1521,6 +1847,8 @@ def _parse_args() -> argparse.Namespace:
         choices=(
             "receiver",
             "sender",
+            "host_receiver",
+            "host_sender",
             "mixed_receiver",
             "mixed_sender",
             "staged_receiver",
@@ -1537,6 +1865,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--target-metadata")
     parser.add_argument("--target-side-channel-port", type=int)
     parser.add_argument("--target-te-port", type=int)
+    parser.add_argument(
+        "--host-memory-kind",
+        choices=("regular", "pinned"),
+        default="regular",
+    )
     return parser.parse_args()
 
 
@@ -1544,6 +1877,19 @@ if __name__ == "__main__":
     args = _parse_args()
     if args.role == "receiver":
         raise SystemExit(_run_receiver())
+    if args.role == "host_receiver":
+        raise SystemExit(_run_host_receiver(pinned=args.host_memory_kind == "pinned"))
+    if args.role == "host_sender":
+        if args.target_host is None or args.target_port is None or args.target_address is None:
+            raise SystemExit("Host sender requires --target-host, --target-port, and --target-address")
+        raise SystemExit(
+            _run_host_sender(
+                target_host=args.target_host,
+                target_port=args.target_port,
+                target_address=args.target_address,
+                pinned=args.host_memory_kind == "pinned",
+            )
+        )
     if args.role == "mixed_receiver":
         raise SystemExit(_run_mixed_receiver())
     if args.role == "staged_receiver":

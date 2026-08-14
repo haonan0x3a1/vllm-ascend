@@ -43,6 +43,30 @@ bash run.sh preflight
 `config.env` 分别设置卡号。它只能验证 NPU 可见性，不能判断共享卡的实际所有权；
 还必须确认 `npu-smi info` 中配置的 16 张卡没有其他人的进程。
 
+## Host 传输可行性门槛
+
+当前已验证基线使用 Mooncake Ascend transport 将逐层缓存传入 Decode NPU
+staging。为了评估 Full KV 改走 `P Host DDR -> D Host DDR` 是否能减少对 Decode
+NPU 的干扰，先单独验证当前 Ascend Mooncake wheel 的 TCP Host transport：
+
+```bash
+bash run.sh probe-host-transfer
+```
+
+该命令不启动模型，分别使用普通 Host 内存和 pinned Host 内存运行两进程传输，
+每种内存连续传输 20 个带 guard 的 payload，并检查注册、反注册和进程析构。
+测试会在子进程启动前设置 `MC_FORCE_TCP=1`，并要求 Mooncake 原生日志明确出现
+`MC_FORCE_TCP is set, using TCP transport only`，避免把 Ascend transport 误认为
+Host TCP。该选择机制来自
+[Mooncake v0.3.12.post1 TransferEngine 初始化逻辑](https://github.com/kvcache-ai/Mooncake/blob/v0.3.12.post1/mooncake-transfer-engine/src/transfer_engine_impl.cpp#L205-L233)。
+脚本只有看到 `2 passed` 才返回成功，`2 skipped` 不算通过；完整输出保存在
+`LOG_DIR/dsv32-mooncake-host-transfer-probe.log`，且不得出现 segfault/double free。
+
+这只是新路径的底层 Stop/Go 门槛，不代表 Connector 或真实模型已经切换到 Host
+relay。通过后还要依次验证本地 NPU-to-Host、Host-to-swapped/Gather，以及 Full KV
+Host transport 与 Indexer NPU transport 的组合生命周期；任一步失败都不应改动
+当前默认的 NPU staging 路径。
+
 使用三个终端，按顺序启动：
 
 ```bash

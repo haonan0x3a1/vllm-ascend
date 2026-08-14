@@ -26,6 +26,7 @@ Usage: bash run.sh <command> [role]
 
 Commands:
   preflight          Validate paths, runtime APIs, device mapping, and ports.
+  probe-host-transfer  Validate Mooncake TCP Host-to-Host transport on this runtime.
   decode             Start the Decode service in the foreground.
   prefill            Start the Prefill service in the foreground.
   proxy              Start the P/D proxy in the foreground.
@@ -73,8 +74,11 @@ done
 PREFILL_LOG="$LOG_DIR/dsv32-pd-real61-4k-prefill-tp8.log"
 DECODE_LOG="$LOG_DIR/dsv32-pd-real61-4k-decode-tp8.log"
 PROXY_LOG="$LOG_DIR/dsv32-pd-real61-4k-proxy.log"
+HOST_TRANSFER_LOG="$LOG_DIR/dsv32-mooncake-host-transfer-probe.log"
 VALIDATION_OUTPUT="$OUTPUT_DIR/dsv32-pd-real61-4k-final-suite.json"
 PROXY_SCRIPT="$REPO_DIR/examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_example.py"
+HOST_TRANSFER_TEST="tests/ut/distributed/kv_transfer/a3_2/"
+HOST_TRANSFER_TEST+="test_mooncake_transfer_engine_npu.py::test_mooncake_host_to_host_tcp_transfer"
 
 prepare_environment() {
     if [[ ! -r "$CANN_ENV" ]]; then
@@ -234,6 +238,19 @@ case "$ACTION" in
             --decode-api-port "$DECODE_API_PORT" \
             --prefill-kv-port-base "$PREFILL_KV_PORT_BASE" \
             --decode-kv-port-base "$DECODE_KV_PORT_BASE"
+        ;;
+    probe-host-transfer)
+        (
+            unset ASCEND_RT_VISIBLE_DEVICES
+            cd "$REPO_DIR"
+            "$MOONCAKE_PYTHON" -m pytest -sv "$HOST_TRANSFER_TEST" \
+                2>&1 | tee "$HOST_TRANSFER_LOG"
+            if ! grep -Eq '(^|[^0-9])2 passed([^0-9]|$)' "$HOST_TRANSFER_LOG"; then
+                echo "Host transfer probe did not complete both cases: $HOST_TRANSFER_LOG" >&2
+                exit 1
+            fi
+            echo "Host transfer probe evidence: $HOST_TRANSFER_LOG"
+        )
         ;;
     decode|prefill)
         serve_role "$ACTION"
