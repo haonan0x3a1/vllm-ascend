@@ -52,6 +52,17 @@ HOST_TRANSFER_END_BYTES = HOST_TRANSFER_OFFSET_BYTES + HOST_TRANSFER_REPEAT_COUN
 HOST_TCP_FORCE_ENV = "MC_FORCE_TCP"
 HOST_TCP_FORCE_VALUE = "1"
 HOST_TCP_RUNTIME_MARKER = "MC_FORCE_TCP is set, using TCP transport only"
+ASCEND_RUNTIME_MARKER = "install AscendDirectTransport"
+HYBRID_INDEXER_SENTINEL = -1
+HYBRID_INDEXER_TRANSFER_BYTES = 256 * 1024
+HYBRID_INDEXER_FIRST_OFFSET_BYTES = 4096
+HYBRID_INDEXER_GUARD_BYTES = 4096
+HYBRID_INDEXER_SECOND_OFFSET_BYTES = (
+    HYBRID_INDEXER_FIRST_OFFSET_BYTES + HYBRID_INDEXER_TRANSFER_BYTES + HYBRID_INDEXER_GUARD_BYTES
+)
+HYBRID_INDEXER_END_BYTES = HYBRID_INDEXER_SECOND_OFFSET_BYTES + HYBRID_INDEXER_TRANSFER_BYTES
+HYBRID_INDEXER_FIRST_PATTERN = 0x2A
+HYBRID_INDEXER_SECOND_PATTERN = 0x4B
 MIXED_TRANSFER_OFFSET_BYTES = 4096
 MIXED_TRANSFER_BYTES = 256 * 1024
 MIXED_DESTINATION_SENTINEL = -1
@@ -73,6 +84,7 @@ CONNECTOR_BLOCK_VALUES = (
 )
 MIN_MOONCAKE_VERSION = Version("0.3.12.post1")
 PROCESS_TIMEOUT_SECONDS = 60
+HYBRID_PROCESS_TIMEOUT_SECONDS = 120
 READY_MARKER = "MOONCAKE_NPU_SMOKE_READY="
 RESULT_MARKER = "MOONCAKE_NPU_SMOKE_RESULT="
 
@@ -328,7 +340,7 @@ def _initialize_engine(device_index: int):
 
 
 def _initialize_host_engine():
-    """Initialize the Ascend Mooncake wheel in its TCP-only process mode."""
+    """Initialize one engine from the Ascend wheel in TCP-only mode."""
     import torch
     import torch_npu  # noqa: F401
     from mooncake.engine import TransferEngine
@@ -337,7 +349,7 @@ def _initialize_host_engine():
     if os.environ.get(HOST_TCP_FORCE_ENV) != HOST_TCP_FORCE_VALUE:
         raise RuntimeError(
             "The Ascend Mooncake wheel requires MC_FORCE_TCP=1 before "
-            "process startup for a TCP-only Host transport probe."
+            "engine initialization for a TCP-only Host transport probe."
         )
     engine = TransferEngine()
     host = get_ip()
@@ -345,6 +357,31 @@ def _initialize_host_engine():
     if result != 0:
         raise RuntimeError(f"Host TransferEngine TCP initialization failed: result={result}")
     return torch, engine, host
+
+
+def _initialize_coexisting_engines(device_index: int):
+    """Create an Ascend TE, then a TCP-only TE in the same process."""
+    if HOST_TCP_FORCE_ENV in os.environ:
+        raise RuntimeError(
+            "Hybrid probe must start without MC_FORCE_TCP so the first "
+            "TransferEngine remains on the Ascend transport."
+        )
+    torch, ascend_engine, host = _initialize_engine(device_index)
+    try:
+        os.environ[HOST_TCP_FORCE_ENV] = HOST_TCP_FORCE_VALUE
+        _, host_engine, host_engine_host = _initialize_host_engine()
+    finally:
+        os.environ.pop(HOST_TCP_FORCE_ENV, None)
+    if host_engine_host != host:
+        raise RuntimeError(
+            "Ascend and Host TransferEngines resolved different local hosts: "
+            f"ascend={host!r}, host={host_engine_host!r}."
+        )
+    ascend_port = int(ascend_engine.get_rpc_port())
+    host_port = int(host_engine.get_rpc_port())
+    if ascend_port == host_port:
+        raise RuntimeError(f"Ascend and Host TransferEngines reused RPC port {ascend_port}.")
+    return torch, ascend_engine, host_engine, host
 
 
 def _register_host_buffer(engine, buffer) -> None:
@@ -385,6 +422,59 @@ def _verify_host_transfer_buffer(torch_module, buffer) -> dict[str, Any]:
         "first_payload_byte": int(buffer[HOST_TRANSFER_OFFSET_BYTES].item()),
         "last_payload_byte": int(buffer[HOST_TRANSFER_END_BYTES - 1].item()),
     }
+
+
+def _verify_hybrid_indexer_buffer(torch_module, buffer) -> dict[str, Any]:
+    if HYBRID_INDEXER_END_BYTES > BUFFER_BYTES:
+        raise RuntimeError("Hybrid Indexer transfer windows exceed the registered buffer.")
+    received = buffer.cpu()
+    first_end = HYBRID_INDEXER_FIRST_OFFSET_BYTES + HYBRID_INDEXER_TRANSFER_BYTES
+    second_end = HYBRID_INDEXER_SECOND_OFFSET_BYTES + HYBRID_INDEXER_TRANSFER_BYTES
+    prefix_matches = bool(
+        torch_module.all(received[:HYBRID_INDEXER_FIRST_OFFSET_BYTES] == HYBRID_INDEXER_SENTINEL).item()
+    )
+    first_matches = bool(
+        torch_module.all(
+            received[HYBRID_INDEXER_FIRST_OFFSET_BYTES:first_end] == HYBRID_INDEXER_FIRST_PATTERN
+        ).item()
+    )
+    middle_guard_matches = bool(
+        torch_module.all(received[first_end:HYBRID_INDEXER_SECOND_OFFSET_BYTES] == HYBRID_INDEXER_SENTINEL).item()
+    )
+    second_matches = bool(
+        torch_module.all(
+            received[HYBRID_INDEXER_SECOND_OFFSET_BYTES:second_end] == HYBRID_INDEXER_SECOND_PATTERN
+        ).item()
+    )
+    suffix_matches = bool(torch_module.all(received[second_end:] == HYBRID_INDEXER_SENTINEL).item())
+    return {
+        "prefix_matches": prefix_matches,
+        "first_matches": first_matches,
+        "middle_guard_matches": middle_guard_matches,
+        "second_matches": second_matches,
+        "suffix_matches": suffix_matches,
+        "matches": (
+            prefix_matches
+            and first_matches
+            and middle_guard_matches
+            and second_matches
+            and suffix_matches
+        ),
+    }
+
+
+def _extract_json_marker(output: str, marker: str) -> dict[str, Any]:
+    matches = [
+        json.loads(line.removeprefix(marker))
+        for line in output.splitlines()
+        if line.startswith(marker)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Expected exactly one {marker!r} record, found {len(matches)}.\n"
+            f"Process output:\n{output}"
+        )
+    return matches[0]
 
 
 def _unregister_buffers(
@@ -551,6 +641,96 @@ def _run_host_receiver(*, pinned: bool) -> int:
         gc.collect()
         if unregister_result != 0:
             raise RuntimeError(f"Host receiver memory unregistration failed: result={unregister_result}")
+
+
+def _run_hybrid_receiver() -> int:
+    """Keep Ascend and TCP engines alive while receiving both memory paths."""
+    _validate_host_transfer_layout()
+    torch, ascend_engine, host_engine, host = _initialize_coexisting_engines(device_index=1)
+    indexer_raw = indexer_buffer = host_raw = host_buffer = None
+    indexer_registered = False
+    host_registered = False
+    indexer_unregister_result = 0
+    host_unregister_result = 0
+    try:
+        indexer_raw, indexer_buffer = _allocate_aligned_buffer(
+            torch,
+            device_index=1,
+            fill_value=HYBRID_INDEXER_SENTINEL,
+        )
+        host_raw, host_buffer = _allocate_aligned_host_buffer(
+            torch,
+            fill_value=HOST_DESTINATION_SENTINEL,
+            pinned=True,
+        )
+        torch.npu.synchronize()
+        _register_buffer(
+            ascend_engine,
+            indexer_buffer,
+            memory_kind="npu",
+            device_index=1,
+        )
+        indexer_registered = True
+        _register_host_buffer(host_engine, host_buffer)
+        host_registered = True
+
+        print(
+            READY_MARKER
+            + json.dumps(
+                {
+                    "host": host,
+                    "ascend_port": ascend_engine.get_rpc_port(),
+                    "host_port": host_engine.get_rpc_port(),
+                    "indexer_address": indexer_buffer.data_ptr(),
+                    "host_address": host_buffer.data_ptr(),
+                    "registration_size": BUFFER_BYTES,
+                    "force_tcp_after_init": os.environ.get(HOST_TCP_FORCE_ENV),
+                }
+            ),
+            flush=True,
+        )
+
+        command = sys.stdin.readline().strip()
+        if command != "VERIFY":
+            raise RuntimeError(f"Hybrid receiver expected VERIFY command, received {command!r}.")
+
+        torch.npu.synchronize()
+        indexer_verification = _verify_hybrid_indexer_buffer(torch, indexer_buffer)
+        host_verification = _verify_host_transfer_buffer(torch, host_buffer)
+        matches = indexer_verification["matches"] and host_verification["matches"]
+        print(
+            RESULT_MARKER
+            + json.dumps(
+                {
+                    "matches": matches,
+                    "indexer_verification": indexer_verification,
+                    "host_verification": host_verification,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        if not matches:
+            raise RuntimeError("Hybrid receiver observed corrupted NPU or Host data.")
+        return 0
+    finally:
+        torch.npu.synchronize()
+        if host_registered and host_buffer is not None:
+            host_unregister_result = host_engine.unregister_memory(host_buffer.data_ptr())
+        if indexer_registered and indexer_buffer is not None:
+            indexer_unregister_result = ascend_engine.unregister_memory(indexer_buffer.data_ptr())
+        del host_engine
+        del ascend_engine
+        del host_buffer
+        del host_raw
+        del indexer_buffer
+        del indexer_raw
+        gc.collect()
+        if host_unregister_result != 0 or indexer_unregister_result != 0:
+            raise RuntimeError(
+                "Hybrid receiver memory unregistration failed: "
+                f"host={host_unregister_result}, indexer={indexer_unregister_result}"
+            )
 
 
 def _run_mixed_receiver() -> int:
@@ -912,6 +1092,134 @@ def _run_host_sender(
         gc.collect()
         if unregister_result != 0:
             raise RuntimeError(f"Host sender memory unregistration failed: result={unregister_result}")
+
+
+def _run_hybrid_sender(
+    *,
+    target_host: str,
+    target_ascend_port: int,
+    target_host_port: int,
+    target_indexer_address: int,
+    target_host_address: int,
+) -> int:
+    """Transfer Indexer A, Host Full KV, then Indexer B with coexisting TEs."""
+    _validate_host_transfer_layout()
+    torch, ascend_engine, host_engine, _ = _initialize_coexisting_engines(device_index=0)
+    indexer_raw = indexer_buffer = host_raw = host_buffer = None
+    indexer_registered = False
+    host_registered = False
+    indexer_unregister_result = 0
+    host_unregister_result = 0
+    host_transfer_results = []
+    try:
+        indexer_raw, indexer_buffer = _allocate_aligned_buffer(
+            torch,
+            device_index=0,
+            fill_value=HYBRID_INDEXER_SENTINEL,
+        )
+        first_end = HYBRID_INDEXER_FIRST_OFFSET_BYTES + HYBRID_INDEXER_TRANSFER_BYTES
+        second_end = HYBRID_INDEXER_SECOND_OFFSET_BYTES + HYBRID_INDEXER_TRANSFER_BYTES
+        indexer_buffer[HYBRID_INDEXER_FIRST_OFFSET_BYTES:first_end].fill_(
+            HYBRID_INDEXER_FIRST_PATTERN
+        )
+        indexer_buffer[HYBRID_INDEXER_SECOND_OFFSET_BYTES:second_end].fill_(
+            HYBRID_INDEXER_SECOND_PATTERN
+        )
+        host_raw, host_buffer = _allocate_aligned_host_buffer(
+            torch,
+            fill_value=0,
+            pinned=True,
+        )
+        for transfer_index in range(HOST_TRANSFER_REPEAT_COUNT):
+            start = HOST_TRANSFER_OFFSET_BYTES + transfer_index * HOST_TRANSFER_BYTES
+            end = start + HOST_TRANSFER_BYTES
+            host_buffer[start:end].fill_(_host_payload_value(transfer_index))
+
+        torch.npu.synchronize()
+        _register_buffer(
+            ascend_engine,
+            indexer_buffer,
+            memory_kind="npu",
+            device_index=0,
+        )
+        indexer_registered = True
+        _register_host_buffer(host_engine, host_buffer)
+        host_registered = True
+
+        ascend_session = f"{target_host}:{target_ascend_port}"
+        host_session = f"{target_host}:{target_host_port}"
+        first_indexer_result = ascend_engine.batch_transfer_sync_write(
+            ascend_session,
+            [indexer_buffer.data_ptr() + HYBRID_INDEXER_FIRST_OFFSET_BYTES],
+            [target_indexer_address + HYBRID_INDEXER_FIRST_OFFSET_BYTES],
+            [HYBRID_INDEXER_TRANSFER_BYTES],
+        )
+        if first_indexer_result < 0:
+            raise RuntimeError(
+                "First hybrid Ascend transfer failed: "
+                f"session={ascend_session}, result={first_indexer_result}"
+            )
+
+        for transfer_index in range(HOST_TRANSFER_REPEAT_COUNT):
+            offset = HOST_TRANSFER_OFFSET_BYTES + transfer_index * HOST_TRANSFER_BYTES
+            result = host_engine.batch_transfer_sync_write(
+                host_session,
+                [host_buffer.data_ptr() + offset],
+                [target_host_address + offset],
+                [HOST_TRANSFER_BYTES],
+            )
+            if result < 0:
+                raise RuntimeError(
+                    "Hybrid Host transfer failed: "
+                    f"session={host_session}, transfer_index={transfer_index}, result={result}"
+                )
+            host_transfer_results.append(result)
+
+        second_indexer_result = ascend_engine.batch_transfer_sync_write(
+            ascend_session,
+            [indexer_buffer.data_ptr() + HYBRID_INDEXER_SECOND_OFFSET_BYTES],
+            [target_indexer_address + HYBRID_INDEXER_SECOND_OFFSET_BYTES],
+            [HYBRID_INDEXER_TRANSFER_BYTES],
+        )
+        if second_indexer_result < 0:
+            raise RuntimeError(
+                "Second hybrid Ascend transfer failed after TCP use: "
+                f"session={ascend_session}, result={second_indexer_result}"
+            )
+
+        print(
+            RESULT_MARKER
+            + json.dumps(
+                {
+                    "first_indexer_result": first_indexer_result,
+                    "host_transfer_results": host_transfer_results,
+                    "second_indexer_result": second_indexer_result,
+                    "ascend_port": ascend_engine.get_rpc_port(),
+                    "host_port": host_engine.get_rpc_port(),
+                    "force_tcp_after_init": os.environ.get(HOST_TCP_FORCE_ENV),
+                }
+            ),
+            flush=True,
+        )
+        return 0
+    finally:
+        torch.npu.synchronize()
+        if host_registered and host_buffer is not None:
+            host_unregister_result = host_engine.unregister_memory(host_buffer.data_ptr())
+        if indexer_registered and indexer_buffer is not None:
+            indexer_unregister_result = ascend_engine.unregister_memory(indexer_buffer.data_ptr())
+        del host_engine
+        del ascend_engine
+        del host_buffer
+        del host_raw
+        del indexer_buffer
+        del indexer_raw
+        gc.collect()
+        if host_unregister_result != 0 or indexer_unregister_result != 0:
+            raise RuntimeError(
+                "Hybrid sender memory unregistration failed: "
+                f"host={host_unregister_result}, indexer={indexer_unregister_result}"
+            )
 
 
 def _run_mixed_sender(
@@ -1581,6 +1889,120 @@ def test_mooncake_host_to_host_tcp_transfer(memory_kind: str, pinned: bool):
             receiver_output.join()
 
 
+def test_mooncake_ascend_and_tcp_engines_coexist():
+    """Verify one worker can retain independent Ascend and TCP engines."""
+    _require_native_mooncake()
+    command = [sys.executable, str(Path(__file__).resolve())]
+    child_environment = os.environ.copy()
+    child_environment.pop(HOST_TCP_FORCE_ENV, None)
+    receiver = subprocess.Popen(
+        [*command, "--role", "hybrid_receiver"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=child_environment,
+    )
+    if receiver.stdin is None or receiver.stdout is None:
+        receiver.terminate()
+        receiver.wait(timeout=5)
+        raise RuntimeError("Failed to create hybrid receiver control pipes.")
+
+    receiver_output = _ProcessOutput(receiver.stdout)
+    try:
+        ready = receiver_output.wait_for_marker(
+            READY_MARKER,
+            timeout=HYBRID_PROCESS_TIMEOUT_SECONDS,
+        )
+        assert ready["ascend_port"] != ready["host_port"]
+        assert ready["force_tcp_after_init"] is None
+        sender = subprocess.run(
+            [
+                *command,
+                "--role",
+                "hybrid_sender",
+                "--target-host",
+                str(ready["host"]),
+                "--target-ascend-port",
+                str(ready["ascend_port"]),
+                "--target-host-port",
+                str(ready["host_port"]),
+                "--target-indexer-address",
+                str(ready["indexer_address"]),
+                "--target-host-address",
+                str(ready["host_address"]),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=HYBRID_PROCESS_TIMEOUT_SECONDS,
+            env=child_environment,
+        )
+        sender_output = sender.stdout + sender.stderr
+        assert sender.returncode == 0, (
+            "Mooncake hybrid sender failed.\n"
+            f"stdout:\n{sender.stdout}\n"
+            f"stderr:\n{sender.stderr}"
+        )
+        sender_result = _extract_json_marker(sender.stdout, RESULT_MARKER)
+        assert sender_result["ascend_port"] != sender_result["host_port"]
+        assert sender_result["force_tcp_after_init"] is None
+        assert len(sender_result["host_transfer_results"]) == HOST_TRANSFER_REPEAT_COUNT
+
+        receiver.stdin.write("VERIFY\n")
+        receiver.stdin.flush()
+        result = receiver_output.wait_for_marker(
+            RESULT_MARKER,
+            timeout=HYBRID_PROCESS_TIMEOUT_SECONDS,
+        )
+        receiver.wait(timeout=HYBRID_PROCESS_TIMEOUT_SECONDS)
+        receiver_output.join()
+        assert receiver.returncode == 0, (
+            "Mooncake hybrid receiver failed.\n"
+            f"output:\n{receiver_output.output}"
+        )
+        assert result["matches"], (
+            "Mooncake hybrid receiver observed corrupted data.\n"
+            f"result={result}\noutput:\n{receiver_output.output}"
+        )
+        assert ASCEND_RUNTIME_MARKER in receiver_output.output, (
+            "Hybrid receiver did not initialize an Ascend transport.\n"
+            f"output:\n{receiver_output.output}"
+        )
+        assert HOST_TCP_RUNTIME_MARKER in receiver_output.output, (
+            "Hybrid receiver did not initialize a TCP-only transport.\n"
+            f"output:\n{receiver_output.output}"
+        )
+        assert ASCEND_RUNTIME_MARKER in sender_output, (
+            "Hybrid sender did not initialize an Ascend transport.\n"
+            f"output:\n{sender_output}"
+        )
+        assert HOST_TCP_RUNTIME_MARKER in sender_output, (
+            "Hybrid sender did not initialize a TCP-only transport.\n"
+            f"output:\n{sender_output}"
+        )
+        print(
+            "Mooncake Ascend/TCP dual-engine coexistence verified: "
+            + json.dumps(
+                {
+                    "sequence": [
+                        "ascend-indexer-a",
+                        "tcp-host-full-kv",
+                        "ascend-indexer-b",
+                    ],
+                    "sender": sender_result,
+                    "receiver": result,
+                },
+                sort_keys=True,
+            )
+        )
+    finally:
+        if receiver.poll() is None:
+            _stop_process(receiver, receiver_output)
+        else:
+            receiver_output.join()
+
+
 def test_mooncake_sparse_offload_staged_memory_transfer():
     """Verify NPU staging followed by a local write into swapped Full KV."""
     _require_native_mooncake()
@@ -1849,6 +2271,8 @@ def _parse_args() -> argparse.Namespace:
             "sender",
             "host_receiver",
             "host_sender",
+            "hybrid_receiver",
+            "hybrid_sender",
             "mixed_receiver",
             "mixed_sender",
             "staged_receiver",
@@ -1865,6 +2289,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--target-metadata")
     parser.add_argument("--target-side-channel-port", type=int)
     parser.add_argument("--target-te-port", type=int)
+    parser.add_argument("--target-ascend-port", type=int)
+    parser.add_argument("--target-host-port", type=int)
+    parser.add_argument("--target-indexer-address", type=int)
+    parser.add_argument("--target-host-address", type=int)
     parser.add_argument(
         "--host-memory-kind",
         choices=("regular", "pinned"),
@@ -1888,6 +2316,29 @@ if __name__ == "__main__":
                 target_port=args.target_port,
                 target_address=args.target_address,
                 pinned=args.host_memory_kind == "pinned",
+            )
+        )
+    if args.role == "hybrid_receiver":
+        raise SystemExit(_run_hybrid_receiver())
+    if args.role == "hybrid_sender":
+        if (
+            args.target_host is None
+            or args.target_ascend_port is None
+            or args.target_host_port is None
+            or args.target_indexer_address is None
+            or args.target_host_address is None
+        ):
+            raise SystemExit(
+                "hybrid sender requires --target-host, --target-ascend-port, "
+                "--target-host-port, --target-indexer-address, and --target-host-address"
+            )
+        raise SystemExit(
+            _run_hybrid_sender(
+                target_host=args.target_host,
+                target_ascend_port=args.target_ascend_port,
+                target_host_port=args.target_host_port,
+                target_indexer_address=args.target_indexer_address,
+                target_host_address=args.target_host_address,
             )
         )
     if args.role == "mixed_receiver":

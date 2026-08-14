@@ -67,6 +67,35 @@ relay。通过后还要依次验证本地 NPU-to-Host、Host-to-swapped/Gather�
 Host transport 与 Indexer NPU transport 的组合生命周期；任一步失败都不应改动
 当前默认的 NPU staging 路径。
 
+Host-to-Host 两种内存均通过后，继续验证同一个 worker 进程里的双引擎生命周期：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=8,9 bash run.sh probe-hybrid-transfer
+```
+
+其中 `8,9` 只是示例；每次运行前必须用 `npu-smi info` 选择两张当时确实空闲的
+物理卡。脚本要求显式传入且恰好两张卡，不会清除该映射或擅自触碰物理 0、1 卡；
+测试内部看到的逻辑 `npu:0/1` 分别映射到这两张物理卡。
+
+该命令先创建原有 Mooncake Ascend engine，再临时设置 `MC_FORCE_TCP=1` 创建独立的
+Host TCP engine，随后立刻恢复进程环境。它依次执行：
+
+```text
+Ascend Indexer payload A
+  -> TCP pinned-Host Full-KV payloads
+  -> Ascend Indexer payload B
+```
+
+第二次 Ascend 传输位于 TCP 传输之后，用来确认新增 Host engine 没有破坏原 NPU
+engine。发送端和接收端都必须分别出现 Ascend 与 TCP-only 原生日志，使用不同 RPC
+端口，通过 payload/guard 校验，并在反注册和析构后正常退出。脚本只有看到 `1 passed`
+才返回成功，证据保存在
+`LOG_DIR/dsv32-mooncake-hybrid-transfer-probe.log`。
+
+这个测试通过也只确定“双引擎可共存”的实现前提；下一门槛仍是生产内存链路
+`P NPU -> P pinned Host -> D pinned Host -> D swapped Full KV -> Gather`。在该链路通过
+以前，不应把 Host relay 接入生产 Connector。
+
 使用三个终端，按顺序启动：
 
 ```bash
