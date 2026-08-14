@@ -96,6 +96,31 @@ engine。发送端和接收端都必须分别出现 Ascend 与 TCP-only 原生�
 `P NPU -> P pinned Host -> D pinned Host -> D swapped Full KV -> Gather`。在该链路通过
 以前，不应把 Host relay 接入生产 Connector。
 
+双引擎门槛通过后，运行最后一个独立硬件探针：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=8,9 bash run.sh probe-host-relay
+```
+
+同样要把 `8,9` 换成当时空闲的两张物理卡。该测试只运行 BF16 和真实
+DeepSeek-V3.2 Full-KV 维度：NoPE `[4,128,1,512]`、RoPE `[4,128,1,64]`。
+它只复制非恒等逻辑映射 `[[2,1]]` 使用的物理块 2、1，并在一个用例内验证：
+
+```text
+Prefill NPU staging
+  -> Prefill pinned Host
+  -> Mooncake TCP Host-to-Host
+  -> Decode pinned Host
+  -> Decode framework swapped Full KV
+  -> CANN Gather
+  -> Decode selected NPU KV
+```
+
+测试还会确认物理块 0、3 与 relay guard 未被修改，检查 Host/Ascend 双引擎的
+原生日志、内存反注册和进程析构。脚本只有看到 `1 passed` 才返回成功，证据保存在
+`LOG_DIR/dsv32-mooncake-host-relay-probe.log`。这是 Host relay 接入生产 Connector 前
+的最后一个独立探针；通过后不再增加微型门槛，直接进入 Connector 集成。
+
 使用三个终端，按顺序启动：
 
 ```bash

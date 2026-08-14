@@ -28,6 +28,7 @@ Commands:
   preflight             Validate paths, runtime APIs, device mapping, and ports.
   probe-host-transfer   Validate Mooncake TCP Host-to-Host transport.
   probe-hybrid-transfer Validate coexisting Ascend and TCP Mooncake engines.
+  probe-host-relay      Validate the BF16 Host relay through swapped KV and Gather.
   decode                Start the Decode service in the foreground.
   prefill               Start the Prefill service in the foreground.
   proxy                 Start the P/D proxy in the foreground.
@@ -77,12 +78,25 @@ DECODE_LOG="$LOG_DIR/dsv32-pd-real61-4k-decode-tp8.log"
 PROXY_LOG="$LOG_DIR/dsv32-pd-real61-4k-proxy.log"
 HOST_TRANSFER_LOG="$LOG_DIR/dsv32-mooncake-host-transfer-probe.log"
 HYBRID_TRANSFER_LOG="$LOG_DIR/dsv32-mooncake-hybrid-transfer-probe.log"
+HOST_RELAY_LOG="$LOG_DIR/dsv32-mooncake-host-relay-probe.log"
 VALIDATION_OUTPUT="$OUTPUT_DIR/dsv32-pd-real61-4k-final-suite.json"
 PROXY_SCRIPT="$REPO_DIR/examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_example.py"
 HOST_TRANSFER_TEST="tests/ut/distributed/kv_transfer/a3_2/"
 HOST_TRANSFER_TEST+="test_mooncake_transfer_engine_npu.py::test_mooncake_host_to_host_tcp_transfer"
 HYBRID_TRANSFER_TEST="tests/ut/distributed/kv_transfer/a3_2/"
 HYBRID_TRANSFER_TEST+="test_mooncake_transfer_engine_npu.py::test_mooncake_ascend_and_tcp_engines_coexist"
+HOST_RELAY_TEST="tests/ut/distributed/kv_transfer/a3_2/"
+HOST_RELAY_TEST+="test_mooncake_host_relay_npu.py::test_mooncake_host_relay_to_swapped_gather"
+
+require_two_probe_devices() {
+    local command_name=$1
+    if [[ ! "${ASCEND_RT_VISIBLE_DEVICES:-}" =~ ^[0-9]+,[0-9]+$ ]]; then
+        echo "$command_name requires exactly two explicitly selected free NPUs." >&2
+        echo "Example: ASCEND_RT_VISIBLE_DEVICES=8,9 bash run.sh $command_name" >&2
+        exit 1
+    fi
+    echo "$command_name physical NPUs: $ASCEND_RT_VISIBLE_DEVICES"
+}
 
 prepare_environment() {
     if [[ ! -r "$CANN_ENV" ]]; then
@@ -258,12 +272,7 @@ case "$ACTION" in
         ;;
     probe-hybrid-transfer)
         (
-            if [[ ! "${ASCEND_RT_VISIBLE_DEVICES:-}" =~ ^[0-9]+,[0-9]+$ ]]; then
-                echo "Hybrid transfer probe requires exactly two explicitly selected free NPUs." >&2
-                echo "Example: ASCEND_RT_VISIBLE_DEVICES=8,9 bash run.sh probe-hybrid-transfer" >&2
-                exit 1
-            fi
-            echo "Hybrid transfer probe physical NPUs: $ASCEND_RT_VISIBLE_DEVICES"
+            require_two_probe_devices probe-hybrid-transfer
             unset MC_FORCE_TCP
             cd "$REPO_DIR"
             "$MOONCAKE_PYTHON" -m pytest -sv "$HYBRID_TRANSFER_TEST" \
@@ -273,6 +282,20 @@ case "$ACTION" in
                 exit 1
             fi
             echo "Hybrid transfer probe evidence: $HYBRID_TRANSFER_LOG"
+        )
+        ;;
+    probe-host-relay)
+        (
+            require_two_probe_devices probe-host-relay
+            unset MC_FORCE_TCP
+            cd "$REPO_DIR"
+            "$MOONCAKE_PYTHON" -m pytest -sv "$HOST_RELAY_TEST" \
+                2>&1 | tee "$HOST_RELAY_LOG"
+            if ! grep -Eq '(^|[^0-9])1 passed([^0-9]|$)' "$HOST_RELAY_LOG"; then
+                echo "Host relay probe did not pass: $HOST_RELAY_LOG" >&2
+                exit 1
+            fi
+            echo "Host relay probe evidence: $HOST_RELAY_LOG"
         )
         ;;
     decode|prefill)
