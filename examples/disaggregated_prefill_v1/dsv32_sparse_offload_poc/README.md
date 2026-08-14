@@ -63,9 +63,9 @@ Host TCP。该选择机制来自
 `LOG_DIR/dsv32-mooncake-host-transfer-probe.log`，且不得出现 segfault/double free。
 
 这只是新路径的底层 Stop/Go 门槛，不代表 Connector 或真实模型已经切换到 Host
-relay。通过后还要依次验证本地 NPU-to-Host、Host-to-swapped/Gather，以及 Full KV
-Host transport 与 Indexer NPU transport 的组合生命周期；任一步失败都不应改动
-当前默认的 NPU staging 路径。
+relay。通过后还要依次验证本地 NPU-to-Host、Host-to-NPU-to-swapped/Gather，
+以及 Full KV Host transport 与 Indexer NPU transport 的组合生命周期；任一步失败
+都不应改动当前默认的 NPU staging 路径。
 
 Host-to-Host 两种内存均通过后，继续验证同一个 worker 进程里的双引擎生命周期：
 
@@ -111,13 +111,17 @@ Prefill NPU staging
   -> Prefill pinned Host
   -> Mooncake TCP Host-to-Host
   -> Decode pinned Host
+  -> Decode ordinary NPU staging
   -> Decode framework swapped Full KV
   -> CANN Gather
   -> Decode selected NPU KV
 ```
 
 测试还会确认物理块 0、3 与 relay guard 未被修改，检查 Host/Ascend 双引擎的
-原生日志、内存反注册和进程析构。脚本只有看到 `1 passed` 才返回成功，证据保存在
+原生日志、内存反注册和进程析构。Decode 侧使用普通 NPU staging 作为 Host buffer
+到 swapped Full KV 的本地桥接，与生产 Connector 已验证的 basic-slice persistence
+路径保持一致；不直接把 pinned Host 地址写入 swapped/SVM alias。脚本只有看到
+`1 passed` 才返回成功，证据保存在
 `LOG_DIR/dsv32-mooncake-host-relay-probe.log`。这是 Host relay 接入生产 Connector 前
 的最后一个独立探针；通过后不再增加微型门槛，直接进入 Connector 集成。
 

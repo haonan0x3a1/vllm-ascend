@@ -65,6 +65,7 @@ TOUCHED_BLOCKS = (2, 1)
 LOGICAL_BLOCK_START = {2: 0, 1: BLOCK_SIZE}
 RELAY_TRANSFER_BYTES = len(TOUCHED_BLOCKS) * (NOPE_BLOCK_BYTES + ROPE_BLOCK_BYTES)
 HOST_RELAY_PROCESS_TIMEOUT_SECONDS = 180
+HOST_RELAY_STAGE_MARKER = "MOONCAKE_HOST_RELAY_STAGE="
 
 
 def _validate_relay_layout() -> None:
@@ -236,13 +237,68 @@ def _allocate_framework_swapped_cache(
     return raw_storage, tensor
 
 
-def _copy_relay_blocks_to_swapped(torch_module, relay_kv, swapped_kv) -> None:
+def _persist_relay_blocks_via_npu_staging(
+    torch_module,
+    relay_kv,
+    staging_kv,
+    swapped_kv,
+) -> dict[str, bool]:
+    """Bridge Host relay data into swapped Full KV via ordinary NPU memory.
+
+    ``empty_with_swapped_memory`` exposes an NPU/SVM alias, not the original
+    Host allocation address.  The production connector therefore persists
+    ordinary NPU staging into swapped Full KV with basic-slice copies.  Keep
+    that supported boundary here instead of issuing a Host-to-swapped copy.
+    """
     relay_nope, relay_rope = relay_kv
+    staging_nope, staging_rope = staging_kv
     swapped_nope, swapped_rope = swapped_kv
     for block_id in TOUCHED_BLOCKS:
-        swapped_nope[block_id].copy_(relay_nope[block_id], non_blocking=False)
-        swapped_rope[block_id].copy_(relay_rope[block_id], non_blocking=False)
+        staging_nope[block_id].copy_(relay_nope[block_id], non_blocking=False)
+        staging_rope[block_id].copy_(relay_rope[block_id], non_blocking=False)
     torch_module.npu.synchronize()
+
+    verification = {}
+    for block_id in TOUCHED_BLOCKS:
+        verification[f"nope_block_{block_id}"] = bool(
+            torch_module.equal(
+                staging_nope[block_id].cpu(),
+                _expected_block(
+                    torch_module,
+                    block_id=block_id,
+                    width=KV_LORA_RANK,
+                    rope=False,
+                ),
+            )
+        )
+        verification[f"rope_block_{block_id}"] = bool(
+            torch_module.equal(
+                staging_rope[block_id].cpu(),
+                _expected_block(
+                    torch_module,
+                    block_id=block_id,
+                    width=ROPE_HEAD_DIM,
+                    rope=True,
+                ),
+            )
+        )
+    if not all(verification.values()):
+        raise RuntimeError(
+            "Decode pinned Host to ordinary NPU staging verification failed: "
+            f"{verification}"
+        )
+
+    for block_id in TOUCHED_BLOCKS:
+        swapped_nope[block_id].copy_(
+            staging_nope[block_id],
+            non_blocking=False,
+        )
+        swapped_rope[block_id].copy_(
+            staging_rope[block_id],
+            non_blocking=False,
+        )
+    torch_module.npu.synchronize()
+    return verification
 
 
 def _swapped_verification(torch_module, swapped_kv) -> dict[str, bool]:
@@ -414,18 +470,31 @@ def _run_host_relay_receiver() -> int:
 
         relay_guards = _relay_guard_verification(torch, host_buffer)
         relay_payload = _relay_payload_verification(torch, relay_kv)
-        _copy_relay_blocks_to_swapped(
+        print(HOST_RELAY_STAGE_MARKER + "host-received", flush=True)
+        npu_staging = _persist_relay_blocks_via_npu_staging(
             torch,
             relay_kv,
+            (prefill_nope, prefill_rope),
             (full_nope, full_rope),
         )
+        print(HOST_RELAY_STAGE_MARKER + "swapped-persisted", flush=True)
         swapped = _swapped_verification(torch, (full_nope, full_rope))
         gather = _gather_verification(torch, workspace)
-        matches = all((*relay_guards.values(), *relay_payload.values(), *swapped.values(), *gather.values()))
+        print(HOST_RELAY_STAGE_MARKER + "gather-completed", flush=True)
+        matches = all(
+            (
+                *relay_guards.values(),
+                *relay_payload.values(),
+                *npu_staging.values(),
+                *swapped.values(),
+                *gather.values(),
+            )
+        )
         result = {
             "matches": matches,
             "relay_guards": relay_guards,
             "relay_payload": relay_payload,
+            "npu_staging": npu_staging,
             "swapped": swapped,
             "gather": gather,
             "touched_blocks": TOUCHED_BLOCKS,
@@ -597,10 +666,19 @@ def test_mooncake_host_relay_to_swapped_gather():
 
         receiver.stdin.write("VERIFY\n")
         receiver.stdin.flush()
-        result = receiver_output.wait_for_marker(
-            RESULT_MARKER,
-            timeout=HOST_RELAY_PROCESS_TIMEOUT_SECONDS,
-        )
+        try:
+            result = receiver_output.wait_for_marker(
+                RESULT_MARKER,
+                timeout=HOST_RELAY_PROCESS_TIMEOUT_SECONDS,
+            )
+        except RuntimeError as exc:
+            receiver.wait(timeout=5)
+            receiver_output.join()
+            raise RuntimeError(
+                "Mooncake Host relay receiver exited before verification "
+                f"completed: returncode={receiver.returncode}.\n"
+                f"output:\n{receiver_output.output}"
+            ) from exc
         receiver.wait(timeout=HOST_RELAY_PROCESS_TIMEOUT_SECONDS)
         receiver_output.join()
         assert receiver.returncode == 0, (
