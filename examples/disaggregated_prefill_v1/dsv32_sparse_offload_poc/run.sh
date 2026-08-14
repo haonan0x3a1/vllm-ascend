@@ -56,6 +56,13 @@ fi
 # shellcheck disable=SC1090
 source "$CONFIG_PATH"
 
+SPARSE_KV_TRANSFER_MODE=${SPARSE_KV_TRANSFER_MODE:-npu_staging}
+if [[ "$SPARSE_KV_TRANSFER_MODE" != "npu_staging" \
+    && "$SPARSE_KV_TRANSFER_MODE" != "host_relay" ]]; then
+    echo "SPARSE_KV_TRANSFER_MODE must be npu_staging or host_relay, got: $SPARSE_KV_TRANSFER_MODE" >&2
+    exit 1
+fi
+
 required_variables=(
     WORKSPACE_DIR REPO_DIR MODEL_PATH LOG_DIR OUTPUT_DIR CANN_ENV CUSTOM_OPP_ENV
     MOONCAKE_PYTHON HOST_IP PROXY_PORT PREFILL_API_PORT DECODE_API_PORT
@@ -73,13 +80,13 @@ for variable in "${required_variables[@]}"; do
     fi
 done
 
-PREFILL_LOG="$LOG_DIR/dsv32-pd-real61-4k-prefill-tp8.log"
-DECODE_LOG="$LOG_DIR/dsv32-pd-real61-4k-decode-tp8.log"
-PROXY_LOG="$LOG_DIR/dsv32-pd-real61-4k-proxy.log"
+PREFILL_LOG="$LOG_DIR/dsv32-pd-real61-4k-$SPARSE_KV_TRANSFER_MODE-prefill-tp8.log"
+DECODE_LOG="$LOG_DIR/dsv32-pd-real61-4k-$SPARSE_KV_TRANSFER_MODE-decode-tp8.log"
+PROXY_LOG="$LOG_DIR/dsv32-pd-real61-4k-$SPARSE_KV_TRANSFER_MODE-proxy.log"
 HOST_TRANSFER_LOG="$LOG_DIR/dsv32-mooncake-host-transfer-probe.log"
 HYBRID_TRANSFER_LOG="$LOG_DIR/dsv32-mooncake-hybrid-transfer-probe.log"
 HOST_RELAY_LOG="$LOG_DIR/dsv32-mooncake-host-relay-probe.log"
-VALIDATION_OUTPUT="$OUTPUT_DIR/dsv32-pd-real61-4k-final-suite.json"
+VALIDATION_OUTPUT="$OUTPUT_DIR/dsv32-pd-real61-4k-$SPARSE_KV_TRANSFER_MODE-final-suite.json"
 PROXY_SCRIPT="$REPO_DIR/examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_example.py"
 HOST_TRANSFER_TEST="tests/ut/distributed/kv_transfer/a3_2/"
 HOST_TRANSFER_TEST+="test_mooncake_transfer_engine_npu.py::test_mooncake_host_to_host_tcp_transfer"
@@ -122,6 +129,9 @@ prepare_environment() {
     unset VLLM_USE_V1
     unset VLLM_ASCEND_ENABLE_MLAPO
     unset VLLM_ASCEND_ENABLE_FLASHCOMM1
+    # Host relay creates its TCP-only engine after the existing Ascend engine.
+    # Exporting this process-wide would silently turn the first engine into TCP.
+    unset MC_FORCE_TCP
 
     export NO_PROXY="localhost,127.0.0.1,::1,$HOST_IP"
     export no_proxy="$NO_PROXY"
@@ -146,7 +156,7 @@ build_kv_transfer_config() {
 import json
 import sys
 
-role, port_base, engine_id, tp_size = sys.argv[1:]
+role, port_base, engine_id, tp_size, transfer_mode = sys.argv[1:]
 print(json.dumps({
     "kv_connector": "MooncakeLayerwiseConnector",
     "kv_role": role,
@@ -155,9 +165,10 @@ print(json.dumps({
     "kv_connector_extra_config": {
         "prefill": {"dp_size": 1, "tp_size": int(tp_size)},
         "decode": {"dp_size": 1, "tp_size": int(tp_size)},
+        "sparse_kv_transfer_mode": transfer_mode,
     },
 }, separators=(",", ":")))
-' "$role" "$port_base" "$engine_id" "$TP_SIZE"
+' "$role" "$port_base" "$engine_id" "$TP_SIZE" "$SPARSE_KV_TRANSFER_MODE"
 }
 
 build_additional_config() {
@@ -339,6 +350,7 @@ case "$ACTION" in
             --decode-devices "$DECODE_DEVICES" \
             --prefill-kv-port-base "$PREFILL_KV_PORT_BASE" \
             --decode-kv-port-base "$DECODE_KV_PORT_BASE" \
+            --transfer-mode "$SPARSE_KV_TRANSFER_MODE" \
             --validation-output "$VALIDATION_OUTPUT" \
             --prefill-log "$PREFILL_LOG" \
             --decode-log "$DECODE_LOG" \

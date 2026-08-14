@@ -406,7 +406,10 @@ def sha256_file(path: Path) -> str:
 
 def collect(args: argparse.Namespace) -> int:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    evidence_dir = Path(args.output_dir) / f"dsv32-pd-real61-4k-{timestamp}"
+    evidence_dir = (
+        Path(args.output_dir)
+        / f"dsv32-pd-real61-4k-{args.transfer_mode}-{timestamp}"
+    )
     evidence_dir.mkdir(parents=True, exist_ok=False)
 
     for value in (
@@ -472,6 +475,7 @@ def collect(args: argparse.Namespace) -> int:
         "decode_devices": args.decode_devices,
         "prefill_kv_port_base": args.prefill_kv_port_base,
         "decode_kv_port_base": args.decode_kv_port_base,
+        "sparse_kv_transfer_mode": args.transfer_mode,
     }
     (evidence_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
@@ -532,6 +536,11 @@ def build_parser() -> argparse.ArgumentParser:
     collect_parser.add_argument("--decode-devices", required=True)
     collect_parser.add_argument("--prefill-kv-port-base", type=int, required=True)
     collect_parser.add_argument("--decode-kv-port-base", type=int, required=True)
+    collect_parser.add_argument(
+        "--transfer-mode",
+        choices=("npu_staging", "host_relay"),
+        required=True,
+    )
     collect_parser.add_argument("--validation-output", required=True)
     collect_parser.add_argument("--prefill-log", required=True)
     collect_parser.add_argument("--decode-log", required=True)

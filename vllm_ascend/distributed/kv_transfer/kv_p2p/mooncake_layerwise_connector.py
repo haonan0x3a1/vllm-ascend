@@ -55,7 +55,11 @@ from vllm.v1.worker.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
-from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
+from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (
+    MOONCAKE_FORCE_TCP_ENV,
+    create_host_transfer_engine,
+    global_te,
+)
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     RegisterRegions,
     align_memory,
@@ -84,6 +88,13 @@ DONE_SENDING_MSG = b"done_sending_msg"
 FAILED_SENDING_MSG = b"failed_sending_msg"
 LAYER_STAGED_MSG = b"layer_staged_msg"
 SPARSE_HOST_CACHE_TENSOR_COUNT = 2
+SPARSE_KV_TRANSFER_MODE_NPU_STAGING = "npu_staging"
+SPARSE_KV_TRANSFER_MODE_HOST_RELAY = "host_relay"
+SPARSE_KV_TRANSFER_MODES = {
+    SPARSE_KV_TRANSFER_MODE_NPU_STAGING,
+    SPARSE_KV_TRANSFER_MODE_HOST_RELAY,
+}
+MOONCAKE_MEMORY_ALIGNMENT = 2 * 1024 * 1024
 
 
 @dataclass
@@ -97,6 +108,8 @@ class LayerMetadata:
 class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     te_rpc_port: int
     layer_metadata: dict[str, LayerMetadata]
+    host_te_rpc_port: int | None = None
+    host_layer_metadata: dict[str, LayerMetadata] | None = None
 
 
 @dataclass
@@ -122,6 +135,8 @@ class ReqMeta:
     local_computed_tokens: int = 0
     local_transed_tokens: int = 0
     do_virtual: bool = False
+    remote_host_te_rpc_port: int | None = None
+    remote_host_layer_metadata: dict[str, LayerMetadata] | None = None
 
 
 @dataclass
@@ -227,6 +242,10 @@ class KVCacheSendingLayerThread(threading.Thread):
         enable_kv_quant: bool,
         enable_c8_quant: bool,
         resharding_stream: torch.npu.Stream,
+        host_engine: TransferEngine | None = None,
+        host_layer_metadata: dict[str, LayerMetadata] | None = None,
+        sparse_host_staging_kv: tuple[torch.Tensor, ...] | None = None,
+        sparse_host_relay_kv: tuple[torch.Tensor, ...] | None = None,
         callback_func: Callable[..., None] = lambda x: None,
         layer_callback_func: Callable[..., None] | None = None,
     ):
@@ -265,9 +284,31 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.v_buffer = v_buffer
         self.enable_kv_quant = enable_kv_quant
         self.enable_c8_quant = enable_c8_quant
+        self.host_engine = host_engine
+        self.host_layer_metadata = host_layer_metadata
+        self.sparse_host_staging_kv = sparse_host_staging_kv
+        self.sparse_host_relay_kv = sparse_host_relay_kv
         self.ready_event = ready_event
         self.callback_func = callback_func
         self.layer_callback_func = layer_callback_func
+
+        host_relay_state = (
+            self.host_engine,
+            self.host_layer_metadata,
+            self.sparse_host_relay_kv,
+        )
+        if any(value is not None for value in host_relay_state) and (
+            not all(value is not None for value in host_relay_state)
+            or self.sparse_host_staging_kv is None
+        ):
+            raise ValueError(
+                "Mooncake sparse Host relay requires the Host engine, Host "
+                "metadata, NPU staging, and pinned Host relay buffers together."
+            )
+
+    @property
+    def uses_sparse_host_relay(self) -> bool:
+        return self.host_engine is not None
 
     def run(self):
         local_rank = get_world_group().local_rank
@@ -454,7 +495,201 @@ class KVCacheSendingLayerThread(threading.Thread):
                         length_list.append(block_len)
         return (src_list, dst_list, length_list)
 
+    @staticmethod
+    def _append_sparse_host_block_transfers(
+        transfer_meta: TransferMeta,
+        *,
+        local_metadata: LayerMetadata,
+        remote_metadata: LayerMetadata,
+        local_block_ids: list[int],
+        remote_block_ids: list[int],
+        tensor_indices: range,
+    ) -> None:
+        grouped_remote_block_ids, grouped_local_block_ids = group_concurrent_contiguous(
+            remote_block_ids,
+            local_block_ids,
+        )
+        for tensor_index in tensor_indices:
+            local_block_len = local_metadata.block_len[tensor_index]
+            remote_block_len = remote_metadata.block_len[tensor_index]
+            if local_block_len != remote_block_len:
+                raise ValueError(
+                    "Sparse Host relay requires identical P/D tensor block "
+                    f"sizes, got local={local_block_len}, "
+                    f"remote={remote_block_len}, tensor_index={tensor_index}."
+                )
+            local_base = local_metadata.kv_caches_base_addr[tensor_index]
+            remote_base = remote_metadata.kv_caches_base_addr[tensor_index]
+            for grouped_remote, grouped_local in zip(
+                grouped_remote_block_ids,
+                grouped_local_block_ids,
+            ):
+                transfer_meta.src.append(local_base + grouped_local[0] * local_block_len)
+                transfer_meta.dst.append(remote_base + grouped_remote[0] * remote_block_len)
+                transfer_meta.length.append(len(grouped_local) * local_block_len)
+
+    def _copy_sparse_host_blocks_to_relay(
+        self,
+        send_task: SendTask,
+        layer_group_idx: int,
+    ) -> None:
+        assert self.sparse_host_staging_kv is not None
+        assert self.sparse_host_relay_kv is not None
+        block_ids = sorted(
+            {
+                block_id
+                for req_meta in send_task.send_request.values()
+                for block_id in req_meta.local_block_ids[layer_group_idx]
+            }
+        )
+        num_blocks = self.sparse_host_staging_kv[0].shape[0]
+        for block_id in block_ids:
+            if block_id < 0 or block_id >= num_blocks:
+                raise ValueError(
+                    f"Local block id {block_id} is outside sparse Host "
+                    f"relay capacity [0, {num_blocks})."
+                )
+            for staging, relay in zip(
+                self.sparse_host_staging_kv,
+                self.sparse_host_relay_kv,
+            ):
+                relay[block_id].copy_(staging[block_id], non_blocking=False)
+        torch.npu.synchronize()
+
+    @staticmethod
+    def _execute_sparse_host_transfer_sessions(
+        *,
+        engine: TransferEngine,
+        session_meta: dict[str, TransferMeta],
+        layer_idx: int,
+        transport_name: str,
+    ) -> None:
+        for session_id, transfer_meta in session_meta.items():
+            if not transfer_meta.src:
+                continue
+            start_time = time.perf_counter()
+            ret = engine.batch_transfer_sync_write(
+                session_id,
+                transfer_meta.src,
+                transfer_meta.dst,
+                transfer_meta.length,
+            )
+            if ret < 0:
+                raise RuntimeError(
+                    f"Mooncake {transport_name} transfer failed for requests "
+                    f"{transfer_meta.req_ids}: destination={session_id}, ret={ret}."
+                )
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            logger.debug(
+                "Layer%d sparse KV %s transfer %dKB to [%s] took %.3f ms.",
+                layer_idx,
+                transport_name,
+                sum(transfer_meta.length) // 1024,
+                session_id,
+                elapsed_ms,
+            )
+
+    def _transfer_sparse_host_relay(self, send_task: SendTask) -> None:
+        """Transfer Full KV through Host TCP and Indexer through Ascend."""
+        assert self.host_engine is not None
+        assert self.host_layer_metadata is not None
+        layer_name = send_task.layer_name
+        layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
+
+        if send_task.wait_event is None:
+            raise RuntimeError("Sparse Host relay requires a producer visibility event.")
+        send_task.wait_event.synchronize()
+        self._copy_sparse_host_blocks_to_relay(send_task, layer_group_idx)
+
+        host_sessions: dict[str, TransferMeta] = {}
+        ascend_sessions: dict[str, TransferMeta] = {}
+        for req_id, req_meta in send_task.send_request.items():
+            if req_meta.remote_host is None:
+                raise RuntimeError(f"Sparse Host relay request {req_id} has no remote host.")
+            if req_meta.remote_host_te_rpc_port is None or req_meta.remote_host_layer_metadata is None:
+                raise RuntimeError(
+                    f"Sparse Host relay request {req_id} has no remote Host "
+                    "TransferEngine metadata."
+                )
+            if req_meta.remote_te_rpc_port is None or req_meta.remote_layer_metadata is None:
+                raise RuntimeError(
+                    f"Sparse Host relay request {req_id} has no remote Ascend "
+                    "TransferEngine metadata."
+                )
+
+            local_block_ids = req_meta.local_block_ids[layer_group_idx]
+            remote_block_ids = req_meta.remote_block_ids[layer_group_idx]
+            host_session_id = f"{req_meta.remote_host}:{req_meta.remote_host_te_rpc_port}"
+            ascend_session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
+            host_transfer = host_sessions.setdefault(
+                host_session_id,
+                TransferMeta(src=[], dst=[], length=[], req_ids=[]),
+            )
+            ascend_transfer = ascend_sessions.setdefault(
+                ascend_session_id,
+                TransferMeta(src=[], dst=[], length=[], req_ids=[]),
+            )
+            host_transfer.req_ids.append(req_id)
+            ascend_transfer.req_ids.append(req_id)
+
+            self._append_sparse_host_block_transfers(
+                host_transfer,
+                local_metadata=self.host_layer_metadata[layer_name],
+                remote_metadata=req_meta.remote_host_layer_metadata[layer_name],
+                local_block_ids=local_block_ids,
+                remote_block_ids=remote_block_ids,
+                tensor_indices=range(SPARSE_HOST_CACHE_TENSOR_COUNT),
+            )
+            local_ascend_metadata = self.layer_metadata[layer_name]
+            remote_ascend_metadata = req_meta.remote_layer_metadata[layer_name]
+            self._append_sparse_host_block_transfers(
+                ascend_transfer,
+                local_metadata=local_ascend_metadata,
+                remote_metadata=remote_ascend_metadata,
+                local_block_ids=local_block_ids,
+                remote_block_ids=remote_block_ids,
+                tensor_indices=range(
+                    SPARSE_HOST_CACHE_TENSOR_COUNT,
+                    len(local_ascend_metadata.kv_caches_base_addr),
+                ),
+            )
+
+        self._execute_sparse_host_transfer_sessions(
+            engine=self.host_engine,
+            session_meta=host_sessions,
+            layer_idx=send_task.layer_idx,
+            transport_name="Host Full-KV",
+        )
+        self._execute_sparse_host_transfer_sessions(
+            engine=self.engine,
+            session_meta=ascend_sessions,
+            layer_idx=send_task.layer_idx,
+            transport_name="Ascend Indexer",
+        )
+
+        if self.layer_callback_func is not None:
+            for req_id, req_meta in send_task.send_request.items():
+                self.layer_callback_func(
+                    req_id,
+                    req_meta,
+                    layer_name,
+                    layer_group_idx,
+                )
+        if send_task.layer_idx == (self.total_layers - 1):
+            for req_id, req_meta in send_task.send_request.items():
+                if req_meta.chunk_finish:
+                    self.callback_func(
+                        req_id,
+                        req_meta,
+                        layer_group_idx,
+                        trans_flag=True,
+                    )
+
     def _transfer_kv_cache(self, send_task: SendTask):
+        if self.uses_sparse_host_relay:
+            self._transfer_sparse_host_relay(send_task)
+            return
+
         layer_name = send_task.layer_name
         layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
         key = send_task.k_cache
@@ -562,6 +797,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         ready_event: threading.Event,
         sparse_host_final_kv_caches: dict[str, tuple[torch.Tensor, ...]] | None = None,
         sparse_host_staging_kv: tuple[torch.Tensor, ...] | None = None,
+        sparse_host_relay_kv: tuple[torch.Tensor, ...] | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingLayerThread")
         self.tp_rank = tp_rank
@@ -578,10 +814,15 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.metadata = metadata
         self.sparse_host_final_kv_caches = sparse_host_final_kv_caches
         self.sparse_host_staging_kv = sparse_host_staging_kv
+        self.sparse_host_relay_kv = sparse_host_relay_kv
 
     @property
     def uses_sparse_host_staging(self) -> bool:
         return self.sparse_host_final_kv_caches is not None and self.sparse_host_staging_kv is not None
+
+    @property
+    def uses_sparse_host_relay(self) -> bool:
+        return self.uses_sparse_host_staging and self.sparse_host_relay_kv is not None
 
     def persist_staged_layer(
         self,
@@ -614,6 +855,21 @@ class KVCacheRecvingLayerThread(threading.Thread):
                 raise ValueError(
                     f"Remote block id {block_id} is outside sparse Host staging capacity [0, {num_blocks})."
                 )
+
+        if self.uses_sparse_host_relay:
+            assert self.sparse_host_relay_kv is not None
+            for block_id in block_ids:
+                for relay, staging in zip(
+                    self.sparse_host_relay_kv,
+                    staging_kv,
+                ):
+                    staging[block_id].copy_(
+                        relay[block_id],
+                        non_blocking=False,
+                    )
+            torch.npu.synchronize()
+
+        for block_id in block_ids:
             for staging, final in zip(staging_kv, final_full_kv):
                 # Use the same basic-slice copy path already exercised by the
                 # sparse-offload NPU tests. Block-level index_copy_ is not a
@@ -782,6 +1038,8 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
             prompt_len=prompt_len,
             local_transed_tokens=local_transed_tokens,
             trans_count=[],
+            remote_host_te_rpc_port=kv_transfer_params.get("remote_host_te_rpc_port"),
+            remote_host_layer_metadata=kv_transfer_params.get("remote_host_layer_metadata"),
         )
 
 
@@ -1268,8 +1526,42 @@ class MooncakeLayerwiseConnectorWorker:
         self.handshake_port = self.side_channel_port + self.tp_rank
         self.sockets: dict = {}
         logger.info("Initializing Mooncake work %s", engine_id)
+        self.sparse_kv_transfer_mode = vllm_config.kv_transfer_config.get_from_extra_config(
+            "sparse_kv_transfer_mode",
+            SPARSE_KV_TRANSFER_MODE_NPU_STAGING,
+        )
+        if self.sparse_kv_transfer_mode not in SPARSE_KV_TRANSFER_MODES:
+            raise ValueError(
+                "MooncakeLayerwiseConnector sparse_kv_transfer_mode must be "
+                f"one of {sorted(SPARSE_KV_TRANSFER_MODES)}, got "
+                f"{self.sparse_kv_transfer_mode!r}."
+            )
+        self.uses_sparse_host_relay = (
+            self.sparse_kv_transfer_mode
+            == SPARSE_KV_TRANSFER_MODE_HOST_RELAY
+        )
+        logger.info(
+            "Mooncake sparse KV transfer mode: %s.",
+            self.sparse_kv_transfer_mode,
+        )
+        if self.uses_sparse_host_relay and MOONCAKE_FORCE_TCP_ENV in os.environ:
+            raise RuntimeError(
+                f"{MOONCAKE_FORCE_TCP_ENV} must not be exported when using "
+                "Mooncake sparse Host relay; the Connector initializes the "
+                "Ascend engine before its TCP-only Host engine."
+            )
         self.engine = global_te.get_transfer_engine(self.side_channel_host, device_name=None)
         self.te_rpc_port = self.engine.get_rpc_port()
+        self.host_engine: TransferEngine | None = None
+        self.host_te_rpc_port: int | None = None
+        if self.uses_sparse_host_relay:
+            self.host_engine = create_host_transfer_engine(self.side_channel_host)
+            self.host_te_rpc_port = self.host_engine.get_rpc_port()
+            if self.host_te_rpc_port == self.te_rpc_port:
+                raise RuntimeError(
+                    "Mooncake Ascend and Host TransferEngines returned the same "
+                    f"RPC port {self.te_rpc_port}."
+                )
 
         # Background thread for sending or receiving KV caches.
         self.kv_recv_layer_thread: KVCacheRecvingLayerThread | None = None
@@ -1296,6 +1588,8 @@ class MooncakeLayerwiseConnectorWorker:
         self.index_to_name = defaultdict(list)
         self.remote_layer_metadata: dict[str, dict[int, dict[str, LayerMetadata]]] = SizedDict()
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
+        self.remote_host_layer_metadata: dict[str, dict[int, dict[str, LayerMetadata]]] = SizedDict()
+        self.remote_host_te_port: dict[str, dict[int, int]] = SizedDict()
         self.remote_sockets_lock = threading.Lock()
         self.remote_sockets: dict[  # type: ignore
             str, deque[zmq.Socket]
@@ -1312,6 +1606,10 @@ class MooncakeLayerwiseConnectorWorker:
         self._recving_metadata: dict[str, ReqMeta] = {}
         self.sparse_host_staging_kv: tuple[torch.Tensor, ...] | None = None
         self.sparse_host_final_kv_caches: dict[str, tuple[torch.Tensor, ...]] | None = None
+        self.sparse_host_relay_owner: torch.Tensor | None = None
+        self.sparse_host_relay_storage: torch.Tensor | None = None
+        self.sparse_host_relay_kv: tuple[torch.Tensor, ...] | None = None
+        self.host_layer_metadata: dict[str, LayerMetadata] | None = None
 
     def register_sparse_kv_offload_staging(
         self,
@@ -1320,9 +1618,80 @@ class MooncakeLayerwiseConnectorWorker:
         """Select one shared NPU layer as the sparse Host transfer staging."""
         if len(staging_kv) != SPARSE_HOST_CACHE_TENSOR_COUNT:
             raise ValueError(f"sparse KV offload staging expects exactly two Full-KV tensors, got {len(staging_kv)}.")
-        if staging_kv[0].data_ptr() % (2 * 1024 * 1024) != 0:
+        if staging_kv[0].data_ptr() % MOONCAKE_MEMORY_ALIGNMENT != 0:
             raise ValueError("sparse KV offload Mooncake staging must start at a 2 MiB aligned NPU address.")
         self.sparse_host_staging_kv = staging_kv
+        if self.uses_sparse_host_relay:
+            self._allocate_sparse_host_relay(staging_kv)
+
+    def _allocate_sparse_host_relay(
+        self,
+        staging_kv: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Allocate one cross-layer pinned Host Full-KV relay buffer."""
+        if self.host_engine is None:
+            raise RuntimeError("Sparse Host relay requires an initialized Host TransferEngine.")
+        tensor_bytes = [tensor.numel() * tensor.element_size() for tensor in staging_kv]
+        total_bytes = sum(tensor_bytes)
+        owner = torch.empty(
+            total_bytes + MOONCAKE_MEMORY_ALIGNMENT,
+            dtype=torch.int8,
+            device="cpu",
+            pin_memory=True,
+        )
+        alignment_offset = (-owner.data_ptr()) % MOONCAKE_MEMORY_ALIGNMENT
+        storage = owner[alignment_offset : alignment_offset + total_bytes]
+        if storage.data_ptr() % MOONCAKE_MEMORY_ALIGNMENT != 0:
+            raise RuntimeError("Sparse Host relay buffer is not 2 MiB aligned.")
+
+        relay_tensors = []
+        byte_offset = 0
+        for staging, num_bytes in zip(staging_kv, tensor_bytes):
+            relay_tensors.append(
+                storage[byte_offset : byte_offset + num_bytes]
+                .view(staging.dtype)
+                .view(staging.shape)
+            )
+            byte_offset += num_bytes
+
+        ret_value = self.host_engine.register_memory(
+            storage.data_ptr(),
+            total_bytes,
+            "cpu",
+        )
+        if ret_value != 0:
+            raise RuntimeError(
+                "Mooncake Host relay memory registration failed with "
+                f"ret_value={ret_value}."
+            )
+        self.sparse_host_relay_owner = owner
+        self.sparse_host_relay_storage = storage
+        self.sparse_host_relay_kv = tuple(relay_tensors)
+        logger.info(
+            "Registered sparse Host relay buffer: size=%d, tensors=%d.",
+            total_bytes,
+            len(relay_tensors),
+        )
+
+    def _build_sparse_host_layer_metadata(
+        self,
+        layer2group_ids: dict[str, int],
+    ) -> dict[str, LayerMetadata]:
+        if self.sparse_host_relay_kv is None:
+            raise RuntimeError("Sparse Host relay tensors were not allocated before KV registration.")
+        host_layer_metadata = {}
+        for layer_name, layer_group_id in layer2group_ids.items():
+            single_layer_meta = LayerMetadata([], [], [], [])
+            for relay_tensor in self.sparse_host_relay_kv:
+                block_shape = relay_tensor.shape[1:]
+                single_layer_meta.tensor_group_idx.append(layer_group_id)
+                single_layer_meta.kv_caches_base_addr.append(relay_tensor.data_ptr())
+                single_layer_meta.block_len.append(
+                    relay_tensor.element_size() * math.prod(block_shape)
+                )
+                single_layer_meta.block_size_scale.append(1)
+            host_layer_metadata[layer_name] = single_layer_meta
+        return host_layer_metadata
 
     def _build_sparse_host_transfer_caches(
         self,
@@ -1398,6 +1767,11 @@ class MooncakeLayerwiseConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data."""
         self.kv_caches = kv_caches
+        if self.uses_sparse_host_relay and self.sparse_host_staging_kv is None:
+            raise RuntimeError(
+                "Sparse Host relay requires register_sparse_kv_offload_staging() "
+                "before register_kv_caches()."
+            )
         transfer_kv_caches: dict[str, Any] = kv_caches
         if self.sparse_host_staging_kv is not None:
             if self.pd_head_ratio != 1:
@@ -1511,10 +1885,17 @@ class MooncakeLayerwiseConnectorWorker:
         if self.total_layers < len(self.layer_metadata.keys()):
             self.total_layers = len(self.layer_metadata.keys())
 
+        if self.uses_sparse_host_relay:
+            self.host_layer_metadata = self._build_sparse_host_layer_metadata(
+                layer2group_ids
+            )
+
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
             te_rpc_port=self.te_rpc_port,
             layer_metadata=self.layer_metadata,
+            host_te_rpc_port=self.host_te_rpc_port,
+            host_layer_metadata=self.host_layer_metadata,
         )
         if self.vllm_config.kv_transfer_config.is_kv_producer:
             ready_event = threading.Event()
@@ -1538,6 +1919,10 @@ class MooncakeLayerwiseConnectorWorker:
                 enable_kv_quant=self.enable_kv_quant,
                 enable_c8_quant=self.enable_c8_quant,
                 resharding_stream=self.resharding_stream,
+                host_engine=self.host_engine,
+                host_layer_metadata=self.host_layer_metadata,
+                sparse_host_staging_kv=self.sparse_host_staging_kv,
+                sparse_host_relay_kv=self.sparse_host_relay_kv,
                 callback_func=self.send_done_send_signal,
                 layer_callback_func=(
                     self.send_layer_staged_signal if self.sparse_host_staging_kv is not None else None
@@ -1558,6 +1943,7 @@ class MooncakeLayerwiseConnectorWorker:
                 ready_event,
                 sparse_host_final_kv_caches=self.sparse_host_final_kv_caches,
                 sparse_host_staging_kv=self.sparse_host_staging_kv,
+                sparse_host_relay_kv=self.sparse_host_relay_kv,
             )
             self.kv_recv_layer_thread.start()
             ready_event.wait()
@@ -2054,10 +2440,16 @@ class MooncakeLayerwiseConnectorWorker:
             return sock
 
     def update_decoder_info(self, req_id, req_meta: ReqMeta):
-        if (
+        standard_metadata_missing = (
             req_meta.remote_engine_id not in self.remote_layer_metadata
             or req_meta.remote_port not in self.remote_layer_metadata[req_meta.remote_engine_id]
-        ):
+        )
+        host_metadata_missing = self.uses_sparse_host_relay and (
+            req_meta.remote_engine_id not in self.remote_host_layer_metadata
+            or req_meta.remote_port
+            not in self.remote_host_layer_metadata[req_meta.remote_engine_id]
+        )
+        if standard_metadata_missing or host_metadata_missing:
             try:
                 encoded_data = self.encoder.encode((GET_META_MSG, req_id))
                 sock = self._get_remote_socket(req_meta.remote_host, req_meta.remote_port)
@@ -2079,6 +2471,21 @@ class MooncakeLayerwiseConnectorWorker:
             )
             self.remote_layer_metadata[req_meta.remote_engine_id][req_meta.remote_port] = agent_meta.layer_metadata
             self.remote_te_port[req_meta.remote_engine_id][req_meta.remote_port] = agent_meta.te_rpc_port
+            if self.uses_sparse_host_relay:
+                if (
+                    agent_meta.host_te_rpc_port is None
+                    or agent_meta.host_layer_metadata is None
+                ):
+                    raise RuntimeError(
+                        "Remote Mooncake consumer did not advertise the Host "
+                        "TransferEngine metadata required by sparse Host relay."
+                    )
+                self.remote_host_layer_metadata[req_meta.remote_engine_id][
+                    req_meta.remote_port
+                ] = agent_meta.host_layer_metadata
+                self.remote_host_te_port[req_meta.remote_engine_id][
+                    req_meta.remote_port
+                ] = agent_meta.host_te_rpc_port
             logger.debug(
                 "Query to port and kv base addr for request %s from %s:%s success "
                 "agent_meta.layer_metadata=%r agent_meta.te_rpc_port=%r",
@@ -2102,6 +2509,13 @@ class MooncakeLayerwiseConnectorWorker:
                     logger.error("Mooncake transfer failed to create link. session_id=%s, ret=%d. ", session_id, ret)
         req_meta.remote_te_rpc_port = self.remote_te_port[req_meta.remote_engine_id][req_meta.remote_port]
         req_meta.remote_layer_metadata = self.remote_layer_metadata[req_meta.remote_engine_id][req_meta.remote_port]
+        if self.uses_sparse_host_relay:
+            req_meta.remote_host_te_rpc_port = self.remote_host_te_port[
+                req_meta.remote_engine_id
+            ][req_meta.remote_port]
+            req_meta.remote_host_layer_metadata = self.remote_host_layer_metadata[
+                req_meta.remote_engine_id
+            ][req_meta.remote_port]
         return req_meta
 
     def send_done_send_signal(self, req_id, req_meta, group_idx, trans_flag: bool = True):

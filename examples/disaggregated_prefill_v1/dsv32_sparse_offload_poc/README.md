@@ -125,6 +125,35 @@ Prefill NPU staging
 `LOG_DIR/dsv32-mooncake-host-relay-probe.log`。这是 Host relay 接入生产 Connector 前
 的最后一个独立探针；通过后不再增加微型门槛，直接进入 Connector 集成。
 
+## 选择生产传输路径
+
+`config.env` 中的 `SPARSE_KV_TRANSFER_MODE` 控制 Full KV 的逐层 P/D 路径：
+
+```bash
+# 已验证基线，也是缺省值
+SPARSE_KV_TRANSFER_MODE=npu_staging
+
+# 新的 Host relay 对照路径
+SPARSE_KV_TRANSFER_MODE=host_relay
+```
+
+`npu_staging` 保持原路径：Full KV 与 Indexer 都通过 Mooncake Ascend transport
+进入 Decode NPU staging，再把 Full KV 持久化到 Decode swapped Host cache。
+
+`host_relay` 使用两套共存的 Mooncake engine：
+
+```text
+Full KV: P NPU staging -> P pinned Host -> Mooncake TCP
+         -> D pinned Host -> D NPU staging -> D swapped Full KV
+Indexer: P NPU ---------------- Mooncake Ascend ----------------> D NPU
+```
+
+Decode 只有在 Host relay 已桥接到 swapped Full KV、Indexer 也已传完后才确认该层。
+两个模式复用相同的请求、block 映射、Gather 和 SFA 路径，便于后续做正确性及
+性能 A/B。`run.sh` 会主动清除外部 `MC_FORCE_TCP`；不要手工导出它，否则现有
+Ascend engine 可能被错误初始化成 TCP。两种模式使用带模式名的独立日志和结果
+文件，避免覆盖对照证据。
+
 使用三个终端，按顺序启动：
 
 ```bash
@@ -171,5 +200,7 @@ NPU 状态和传输生命周期归档到 `OUTPUT_DIR` 下的带时间戳目录�
 - 当前只支持单请求、Eager、`block_size=128`、BF16/FP16 KV。
 - 不支持 Prefix Cache、Sparse C8、MTP/Speculative Decode 或 DSA CP/PCP/DCP。
 - 逐层 staging 采用同步 ACK；尚未证明通信计算重叠或性能收益。
+- `host_relay` 当前使用 TCP 作为功能和性能基线；尚未证明跨节点 RDMA/RoCE/UB
+  Host transport，也不使用 Mooncake Store。
 - 如果端口被 Ray 等共享服务占用，应修改 `config.env` 选择完整空闲端口段，
   不要终止不属于本任务的进程。
