@@ -106,3 +106,6 @@ bash run.sh bench host 3072 1
 The summary reports `host_vs_baseline_pct` as
 `(host - baseline) / baseline * 100`. Positive values mean an increase. That is
 a regression for latency metrics but an improvement for throughput metrics.
+All request-level samples from the configured repetitions are pooled before
+means, medians, and p99 values are calculated; the runner does not average
+per-repetition percentiles.

@@ -159,6 +159,10 @@ def validate_result(result: dict[str, Any], source: Path) -> None:
         value = result.get(metric)
         if not isinstance(value, (int, float)):
             raise ValueError(f"{source}: missing numeric metric {metric!r}")
+    for field in ("ttfts", "itls", "output_lens"):
+        values = result.get(field)
+        if not isinstance(values, list) or len(values) != completed:
+            raise ValueError(f"{source}: detailed field {field!r} must contain {completed} request samples")
 
 
 def load_results(result_dir: Path) -> list[dict[str, Any]]:
@@ -177,8 +181,68 @@ def _comparison_key(result: dict[str, Any]) -> tuple[str, ...]:
     return tuple(str(result[key]) for key in PAIR_KEYS)
 
 
-def _mean_metrics(results: list[dict[str, Any]]) -> dict[str, float]:
-    return {metric: statistics.fmean(float(result[metric]) for result in results) for metric in SUMMARY_METRICS}
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        raise ValueError("Cannot calculate a percentile without samples.")
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * percentile / 100.0
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _distribution_metrics(prefix: str, values: list[float]) -> dict[str, float]:
+    return {
+        f"mean_{prefix}_ms": statistics.fmean(values),
+        f"median_{prefix}_ms": statistics.median(values),
+        f"p99_{prefix}_ms": _percentile(values, 99.0),
+    }
+
+
+def _pooled_metrics(results: list[dict[str, Any]]) -> dict[str, float]:
+    ttfts_ms = []
+    tpots_ms = []
+    itls_ms = []
+    e2els_ms = []
+    total_duration = 0.0
+    total_completed = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    for result in results:
+        total_duration += float(result["duration"])
+        total_completed += int(result["completed"])
+        total_input_tokens += int(result["total_input_tokens"])
+        total_output_tokens += int(result["total_output_tokens"])
+        for ttft, request_itls, output_len in zip(result["ttfts"], result["itls"], result["output_lens"]):
+            ttft = float(ttft)
+            request_itls = [float(value) for value in request_itls]
+            output_len = int(output_len)
+            ttfts_ms.append(ttft * 1000.0)
+            itls_ms.extend(value * 1000.0 for value in request_itls)
+            e2els_ms.append((ttft + sum(request_itls)) * 1000.0)
+            if output_len > 1:
+                tpots_ms.append(sum(request_itls) / (output_len - 1) * 1000.0)
+
+    if total_duration <= 0:
+        raise ValueError("Benchmark duration must be positive.")
+    metrics = {}
+    for prefix, values in (
+        ("ttft", ttfts_ms),
+        ("tpot", tpots_ms),
+        ("itl", itls_ms),
+        ("e2el", e2els_ms),
+    ):
+        metrics.update(_distribution_metrics(prefix, values))
+    metrics.update(
+        {
+            "request_throughput": total_completed / total_duration,
+            "output_throughput": total_output_tokens / total_duration,
+            "total_token_throughput": (total_input_tokens + total_output_tokens) / total_duration,
+        }
+    )
+    return metrics
 
 
 def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -201,8 +265,8 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
                 f"{len(baseline_runs)} != {len(host_runs)}"
             )
 
-        baseline = _mean_metrics(baseline_runs)
-        host = _mean_metrics(host_runs)
+        baseline = _pooled_metrics(baseline_runs)
+        host = _pooled_metrics(host_runs)
         delta = {
             metric: ((host[metric] - baseline[metric]) / baseline[metric] * 100.0) if baseline[metric] else None
             for metric in SUMMARY_METRICS

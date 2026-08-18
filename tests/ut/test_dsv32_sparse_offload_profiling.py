@@ -28,6 +28,8 @@ SPEC.loader.exec_module(PROFILE_TOOLS)
 
 
 def _result(mode: str, run_id: int, ttft: float, tpot: float, throughput: float):
+    output_lens = [2] * 5
+    total_output_tokens = sum(output_lens)
     result = {
         "campaign": "smoke-v1",
         "offload_mode": mode,
@@ -56,6 +58,12 @@ def _result(mode: str, run_id: int, ttft: float, tpot: float, throughput: float)
         "run_id": str(run_id),
         "completed": 5,
         "failed": 0,
+        "duration": total_output_tokens / throughput,
+        "total_input_tokens": 3072 * 5,
+        "total_output_tokens": total_output_tokens,
+        "ttfts": [ttft / 1000.0] * 5,
+        "itls": [[tpot / 1000.0] for _ in range(5)],
+        "output_lens": output_lens,
     }
     for metric in PROFILE_TOOLS.SUMMARY_METRICS:
         result[metric] = 1.0
@@ -107,6 +115,21 @@ def test_summarize_pairs_repetitions_and_computes_host_delta():
     assert comparison["host_mean"]["mean_ttft_ms"] == 132.0
     assert comparison["host_vs_baseline_pct"]["mean_ttft_ms"] == pytest.approx(20.0)
     assert comparison["host_vs_baseline_pct"]["output_throughput"] == pytest.approx(-25.0)
+
+
+def test_summarize_pools_request_samples_before_percentiles():
+    results = [
+        _result("baseline", 1, 100.0, 10.0, 4.0),
+        _result("baseline", 2, 1000.0, 10.0, 4.0),
+        _result("host", 1, 100.0, 10.0, 4.0),
+        _result("host", 2, 1000.0, 10.0, 4.0),
+    ]
+
+    summary = PROFILE_TOOLS.summarize_results(results)
+
+    baseline = summary["comparisons"][0]["baseline_mean"]
+    assert baseline["mean_ttft_ms"] == 550.0
+    assert baseline["p99_ttft_ms"] == 1000.0
 
 
 def test_summarize_rejects_missing_or_unbalanced_pairs():
