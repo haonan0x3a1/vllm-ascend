@@ -198,6 +198,7 @@ import sys
     bm_store_port_base,
     bm_hcom_port_base,
     bm_id,
+    bm_peer_join_timeout_seconds,
 ) = sys.argv[1:]
 extra_config = {
     "prefill": {"dp_size": 1, "tp_size": int(tp_size)},
@@ -214,6 +215,7 @@ if transfer_mode == "memfabric_bm":
         "pool_bytes": int(bm_pool_bytes),
         "bm_id": int(bm_id),
         "start_store_role": "kv_consumer",
+        "peer_join_timeout_seconds": float(bm_peer_join_timeout_seconds),
     }
 print(json.dumps({
     "kv_connector": "MooncakeLayerwiseConnector",
@@ -233,7 +235,8 @@ print(json.dumps({
         "$MEMFABRIC_BM_POOL_BYTES" \
         "$MEMFABRIC_BM_STORE_PORT_BASE" \
         "$MEMFABRIC_BM_HCOM_PORT_BASE" \
-        "$MEMFABRIC_BM_ID"
+        "$MEMFABRIC_BM_ID" \
+        "$ASCEND_TRANSFER_TIMEOUT"
 }
 
 build_additional_config() {

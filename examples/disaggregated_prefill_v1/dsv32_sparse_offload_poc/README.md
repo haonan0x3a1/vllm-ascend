@@ -380,6 +380,11 @@ bash run.sh prefill
 bash run.sh proxy
 ```
 
+Decode 先启动时，其 BM store 会在本地 rank `join` 后继续等待对应 Prefill TP rank。
+这个等待复用 `ASCEND_TRANSFER_TIMEOUT`（当前示例为 600 秒），覆盖 P/D 模型加载耗时
+不同造成的启动间隔。日志中的 `Waiting ... for the MemFabric BM peer` 是正常的
+建组等待；只有超时或对端初始化失败才是错误。
+
 可以从第四个终端检查服务：
 
 ```bash

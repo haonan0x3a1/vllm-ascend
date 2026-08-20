@@ -11,6 +11,8 @@ LOCAL_HOST/GVA view is retained for the later Host-to-Host data plane.
 from __future__ import annotations
 
 import ipaddress
+import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,7 @@ MEMFABRIC_BM_WORLD_SIZE = 2
 MEMFABRIC_BM_PREFILL_RANK = 0
 MEMFABRIC_BM_DECODE_RANK = 1
 MEMFABRIC_BM_HCOM_PORT_STRIDE = 4
+MEMFABRIC_BM_ADDRESS_POLL_INTERVAL_SECONDS = 0.5
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -86,6 +89,7 @@ class MemFabricBMRuntimeConfig:
     role: str
     tp_rank: int
     device_id: int
+    peer_join_timeout_seconds: float = 600.0
     log_level: int = 1
 
     @classmethod
@@ -111,6 +115,7 @@ class MemFabricBMRuntimeConfig:
             "pool_bytes",
             "bm_id",
             "start_store_role",
+            "peer_join_timeout_seconds",
             "log_level",
         }
         unknown_keys = sorted(set(raw) - supported_keys)
@@ -130,6 +135,9 @@ class MemFabricBMRuntimeConfig:
             role=str(role),
             tp_rank=tp_rank,
             device_id=device_id,
+            peer_join_timeout_seconds=float(
+                raw.get("peer_join_timeout_seconds", 600.0)
+            ),
             log_level=int(raw.get("log_level", 1)),
         )
         config.validate()
@@ -175,6 +183,14 @@ class MemFabricBMRuntimeConfig:
             )
         if self.bm_id < 0:
             raise ValueError(f"memfabric_bm.bm_id must be non-negative, got {self.bm_id}")
+        if (
+            not math.isfinite(self.peer_join_timeout_seconds)
+            or self.peer_join_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "memfabric_bm.peer_join_timeout_seconds must be a positive "
+                f"finite number, got {self.peer_join_timeout_seconds}"
+            )
         for name, port in (
             ("store", self.store_port),
             ("hcom", self.hcom_port),
@@ -291,6 +307,85 @@ class MemFabricBMFullKVAllocator:
                 )
             raise
 
+    def _wait_for_local_addresses(self) -> None:
+        """Wait until the other P/D rank has joined the two-rank BM group.
+
+        ``join()`` only joins the local rank. During real model startup the
+        Decode workers can reach this point well before Prefill finishes model
+        loading. MemFabric exposes the local GVA immediately in that state, but
+        LOCAL_HOST and LOCAL_DEVICE translations remain zero until the peer is
+        present. Keep the store-owning rank alive and retry the translations
+        instead of tearing down the group before its peer can initialize.
+        """
+        assert self._handle is not None
+        assert self._bm is not None
+
+        started_at = time.monotonic()
+        deadline = started_at + self.config.peer_join_timeout_seconds
+        waiting_logged = False
+        while True:
+            self.local_gva = self._handle.peer_rank_ptr(
+                self.config.rank_id,
+                self._bm.BmMemType.HOST,
+            )
+            if self.local_gva:
+                self.local_host_va = self._handle.gva_to_va(
+                    self.local_gva,
+                    self._bm.BmMemType.LOCAL_HOST,
+                )
+                self.local_device_va = self._handle.gva_to_va(
+                    self.local_gva,
+                    self._bm.BmMemType.LOCAL_DEVICE,
+                )
+            else:
+                self.local_host_va = 0
+                self.local_device_va = 0
+
+            if self.local_gva and self.local_host_va and self.local_device_va:
+                if waiting_logged:
+                    logger.info(
+                        "MemFabric BM peer became ready after %.1f seconds: "
+                        "role=%s, tp_rank=%d, rank_id=%d.",
+                        time.monotonic() - started_at,
+                        self.config.role,
+                        self.config.tp_rank,
+                        self.config.rank_id,
+                    )
+                return
+
+            now = time.monotonic()
+            if now >= deadline:
+                raise RuntimeError(
+                    "Timed out waiting for the MemFabric BM peer to expose "
+                    "the required local addresses: "
+                    f"timeout_seconds={self.config.peer_join_timeout_seconds}, "
+                    f"role={self.config.role}, tp_rank={self.config.tp_rank}, "
+                    f"rank_id={self.config.rank_id}, "
+                    f"gva=0x{self.local_gva:x}, "
+                    f"host=0x{self.local_host_va:x}, "
+                    f"device=0x{self.local_device_va:x}"
+                )
+            if not waiting_logged:
+                logger.info(
+                    "Waiting up to %.1f seconds for the MemFabric BM peer: "
+                    "role=%s, tp_rank=%d, rank_id=%d, "
+                    "gva=0x%x, host=0x%x, device=0x%x.",
+                    self.config.peer_join_timeout_seconds,
+                    self.config.role,
+                    self.config.tp_rank,
+                    self.config.rank_id,
+                    self.local_gva,
+                    self.local_host_va,
+                    self.local_device_va,
+                )
+                waiting_logged = True
+            time.sleep(
+                min(
+                    MEMFABRIC_BM_ADDRESS_POLL_INTERVAL_SECONDS,
+                    max(0.0, deadline - now),
+                )
+            )
+
     def _initialize_runtime(self) -> None:
         self._mf, self._bm = self._load_runtime()
         self._mf.set_log_level(self.config.log_level)
@@ -328,24 +423,7 @@ class MemFabricBMFullKVAllocator:
             raise RuntimeError(f"MemFabric BM join failed: result={join_result}")
         self._joined = True
 
-        self.local_gva = self._handle.peer_rank_ptr(
-            self.config.rank_id,
-            self._bm.BmMemType.HOST,
-        )
-        self.local_host_va = self._handle.gva_to_va(
-            self.local_gva,
-            self._bm.BmMemType.LOCAL_HOST,
-        )
-        self.local_device_va = self._handle.gva_to_va(
-            self.local_gva,
-            self._bm.BmMemType.LOCAL_DEVICE,
-        )
-        if not self.local_gva or not self.local_host_va or not self.local_device_va:
-            raise RuntimeError(
-                "MemFabric BM did not expose the required local addresses: "
-                f"gva=0x{self.local_gva:x}, host=0x{self.local_host_va:x}, "
-                f"device=0x{self.local_device_va:x}"
-            )
+        self._wait_for_local_addresses()
         if not (
             self.local_gva == self.local_host_va == self.local_device_va
         ):
