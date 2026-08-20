@@ -373,17 +373,21 @@ Ascend engine 可能被错误初始化成 TCP。两种模式使用带模式名�
 # 终端一
 bash run.sh decode
 
-# 终端二；先等待 Decode ready
+# 终端二
 bash run.sh prefill
 
 # 终端三；先等待 Prefill ready
 bash run.sh proxy
 ```
 
-Decode 先启动时，其 BM store 会在本地 rank `join` 后继续等待对应 Prefill TP rank。
-这个等待复用 `ASCEND_TRANSFER_TIMEOUT`（当前示例为 600 秒），覆盖 P/D 模型加载耗时
-不同造成的启动间隔。日志中的 `Waiting ... for the MemFabric BM peer` 是正常的
-建组等待；只有超时或对端初始化失败才是错误。
+`memfabric_bm` 模式下，不要等待 Decode API ready 后才启动 Prefill。Decode 先启动，
+看到 `Waiting ... for the MemFabric BM peer`（或者确认 Decode 已进入模型加载）后就应
+立即在终端二启动 Prefill；两端 BM 建组完成后才会继续到 API ready。这个等待复用
+`ASCEND_TRANSFER_TIMEOUT`（当前示例为 600 秒），覆盖 P/D 模型加载耗时不同造成的
+启动间隔。只有超时或对端初始化失败才是错误。
+
+`npu_staging` 和 `host_relay` 模式仍可按原基线流程等待 Decode ready 后再启动
+Prefill。
 
 可以从第四个终端检查服务：
 
