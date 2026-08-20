@@ -58,6 +58,34 @@ def test_preflight_clears_inherited_role_device_visibility():
     assert environment == {"KEEP_ME": "value"}
 
 
+def test_port_probe_matches_runtime_socket_reuse(monkeypatch):
+    calls = []
+
+    class FakeSocket:
+        def setsockopt(self, level, option, value):
+            calls.append(("setsockopt", level, option, value))
+
+        def bind(self, address):
+            calls.append(("bind", address))
+
+        def close(self):
+            calls.append(("close",))
+
+    monkeypatch.setattr(POC_TOOLS.socket, "socket", FakeSocket)
+
+    assert POC_TOOLS.can_bind(43172) == (True, None)
+    assert calls == [
+        (
+            "setsockopt",
+            POC_TOOLS.socket.SOL_SOCKET,
+            POC_TOOLS.socket.SO_REUSEADDR,
+            1,
+        ),
+        ("bind", ("0.0.0.0", 43172)),
+        ("close",),
+    ]
+
+
 def test_memfabric_same_host_ports_are_distinct_per_tp_role():
     ports = POC_TOOLS.memfabric_bm_required_ports(
         tp_size=2,

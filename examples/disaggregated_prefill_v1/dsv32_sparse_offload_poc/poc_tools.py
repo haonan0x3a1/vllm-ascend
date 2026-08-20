@@ -112,6 +112,10 @@ def parse_devices(value: str) -> tuple[int, ...]:
 def can_bind(port: int) -> tuple[bool, str | None]:
     sock = socket.socket()
     try:
+        # Match the rendezvous listeners used by the runtime.  Without this,
+        # a completed TCP connection left in TIME_WAIT can make preflight
+        # report a port as busy even though the runtime can safely reuse it.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("0.0.0.0", port))
     except OSError as exc:
         return False, str(exc)
