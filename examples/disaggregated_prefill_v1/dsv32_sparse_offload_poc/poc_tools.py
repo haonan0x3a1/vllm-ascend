@@ -182,14 +182,17 @@ def memfabric_bm_required_ports(
     store_port_base: int,
     hcom_port_base: int,
 ) -> tuple[int, ...]:
-    """Return same-host BM store and per-role HCOM listener ports."""
+    """Return BM store, HCOM, and peer-rendezvous listener ports."""
     store_ports = tuple(store_port_base + tp_rank for tp_rank in range(tp_size))
     hcom_ports = tuple(
         hcom_port_base + tp_rank * 4 + rank_id
         for tp_rank in range(tp_size)
         for rank_id in (0, 1)
     )
-    return (*store_ports, *hcom_ports)
+    rendezvous_ports = tuple(
+        hcom_port_base + tp_rank * 4 + 2 for tp_rank in range(tp_size)
+    )
+    return (*store_ports, *hcom_ports, *rendezvous_ports)
 
 
 def resolve_memfabric_bm_api(memfabric_hybrid: ModuleType) -> object:

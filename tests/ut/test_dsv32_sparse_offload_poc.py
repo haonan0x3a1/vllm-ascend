@@ -65,7 +65,16 @@ def test_memfabric_same_host_ports_are_distinct_per_tp_role():
         hcom_port_base=37400,
     )
 
-    assert ports == (37200, 37201, 37400, 37401, 37404, 37405)
+    assert ports == (
+        37200,
+        37201,
+        37400,
+        37401,
+        37404,
+        37405,
+        37402,
+        37406,
+    )
     assert len(ports) == len(set(ports))
 
 

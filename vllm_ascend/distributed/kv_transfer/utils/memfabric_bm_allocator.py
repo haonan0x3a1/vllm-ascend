@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ipaddress
 import math
+import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +29,11 @@ MEMFABRIC_BM_WORLD_SIZE = 2
 MEMFABRIC_BM_PREFILL_RANK = 0
 MEMFABRIC_BM_DECODE_RANK = 1
 MEMFABRIC_BM_HCOM_PORT_STRIDE = 4
-MEMFABRIC_BM_ADDRESS_POLL_INTERVAL_SECONDS = 0.5
+MEMFABRIC_BM_RENDEZVOUS_PORT_OFFSET = 2
+MEMFABRIC_BM_CONNECT_RETRY_INTERVAL_SECONDS = 0.2
+MEMFABRIC_BM_READY_PREFIX = "MEMFABRIC_BM_READY_V1"
+MEMFABRIC_BM_ACK = b"MEMFABRIC_BM_ACK_V1\n"
+MEMFABRIC_BM_MAX_CONTROL_MESSAGE_BYTES = 256
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -194,6 +199,7 @@ class MemFabricBMRuntimeConfig:
         for name, port in (
             ("store", self.store_port),
             ("hcom", self.hcom_port),
+            ("rendezvous", self.rendezvous_port),
         ):
             if not 1 <= port <= 65535:
                 raise ValueError(f"memfabric_bm {name} port is outside [1, 65535]: {port}")
@@ -217,6 +223,16 @@ class MemFabricBMRuntimeConfig:
             self.hcom_port_base
             + self.tp_rank * MEMFABRIC_BM_HCOM_PORT_STRIDE
             + self.rank_id
+        )
+
+    @property
+    def rendezvous_port(self) -> int:
+        # Offsets 0 and 1 are the Prefill and Decode HCOM listeners. Offset 2
+        # is reserved for a small control-plane barrier; offset 3 stays free.
+        return (
+            self.hcom_port_base
+            + self.tp_rank * MEMFABRIC_BM_HCOM_PORT_STRIDE
+            + MEMFABRIC_BM_RENDEZVOUS_PORT_OFFSET
         )
 
     @property
@@ -307,83 +323,143 @@ class MemFabricBMFullKVAllocator:
                 )
             raise
 
-    def _wait_for_local_addresses(self) -> None:
-        """Wait until the other P/D rank has joined the two-rank BM group.
+    @staticmethod
+    def _recv_control_message(connection: Any) -> bytes:
+        message = bytearray()
+        while len(message) < MEMFABRIC_BM_MAX_CONTROL_MESSAGE_BYTES:
+            chunk = connection.recv(
+                MEMFABRIC_BM_MAX_CONTROL_MESSAGE_BYTES - len(message)
+            )
+            if not chunk:
+                break
+            message.extend(chunk)
+            if b"\n" in chunk:
+                return bytes(message[: message.index(b"\n") + 1])
+        raise RuntimeError(
+            "MemFabric BM peer rendezvous received an incomplete control message"
+        )
 
-        ``join()`` only joins the local rank. During real model startup the
-        Decode workers can reach this point well before Prefill finishes model
-        loading. MemFabric exposes the local GVA immediately in that state, but
-        LOCAL_HOST and LOCAL_DEVICE translations remain zero until the peer is
-        present. Keep the store-owning rank alive and retry the translations
-        instead of tearing down the group before its peer can initialize.
-        """
+    def _ready_message(self, rank_id: int) -> bytes:
+        return (
+            f"{MEMFABRIC_BM_READY_PREFIX} {self.config.bm_id} "
+            f"{self.config.tp_rank} {rank_id}\n"
+        ).encode("ascii")
+
+    def _wait_for_peer_join(self) -> None:
+        """Barrier after both ranks join, without querying incomplete BM state."""
+        peer_rank_id = 1 - self.config.rank_id
+        timeout = self.config.peer_join_timeout_seconds
+        rendezvous_address = (self.config.store_host, self.config.rendezvous_port)
+
+        logger.info(
+            "Waiting up to %.1f seconds for the MemFabric BM peer rendezvous: "
+            "role=%s, tp_rank=%d, rank_id=%d, address=%s:%d.",
+            timeout,
+            self.config.role,
+            self.config.tp_rank,
+            self.config.rank_id,
+            *rendezvous_address,
+        )
+
+        if self.config.starts_store:
+            expected_message = self._ready_message(peer_rank_id)
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    listener.bind((self.config.nic_ip, self.config.rendezvous_port))
+                    listener.listen(1)
+                    listener.settimeout(timeout)
+                    connection, _ = listener.accept()
+                    with connection:
+                        connection.settimeout(timeout)
+                        message = self._recv_control_message(connection)
+                        if message != expected_message:
+                            raise RuntimeError(
+                                "MemFabric BM peer rendezvous identity mismatch: "
+                                f"expected={expected_message!r}, got={message!r}"
+                            )
+                        connection.sendall(MEMFABRIC_BM_ACK)
+            except OSError as exc:
+                raise RuntimeError(
+                    "MemFabric BM peer rendezvous server failed: "
+                    f"address={self.config.nic_ip}:{self.config.rendezvous_port}, "
+                    f"role={self.config.role}, tp_rank={self.config.tp_rank}"
+                ) from exc
+        else:
+            deadline = time.monotonic() + timeout
+            connection = None
+            last_error: OSError | None = None
+            while connection is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Timed out connecting to the MemFabric BM peer "
+                        "rendezvous: "
+                        f"address={rendezvous_address[0]}:{rendezvous_address[1]}, "
+                        f"role={self.config.role}, tp_rank={self.config.tp_rank}, "
+                        f"last_error={last_error}"
+                    )
+                try:
+                    connection = socket.create_connection(
+                        rendezvous_address,
+                        timeout=min(1.0, remaining),
+                    )
+                except OSError as exc:
+                    last_error = exc
+                    time.sleep(
+                        min(
+                            MEMFABRIC_BM_CONNECT_RETRY_INTERVAL_SECONDS,
+                            remaining,
+                        )
+                    )
+            try:
+                with connection:
+                    connection.settimeout(max(0.1, deadline - time.monotonic()))
+                    connection.sendall(self._ready_message(self.config.rank_id))
+                    message = self._recv_control_message(connection)
+                    if message != MEMFABRIC_BM_ACK:
+                        raise RuntimeError(
+                            "MemFabric BM peer rendezvous acknowledgement "
+                            f"mismatch: expected={MEMFABRIC_BM_ACK!r}, "
+                            f"got={message!r}"
+                        )
+            except OSError as exc:
+                raise RuntimeError(
+                    "MemFabric BM peer rendezvous client failed: "
+                    f"address={rendezvous_address[0]}:{rendezvous_address[1]}, "
+                    f"role={self.config.role}, tp_rank={self.config.tp_rank}"
+                ) from exc
+
+        logger.info(
+            "MemFabric BM peer rendezvous completed: role=%s, tp_rank=%d, "
+            "rank_id=%d.",
+            self.config.role,
+            self.config.tp_rank,
+            self.config.rank_id,
+        )
+
+    def _resolve_local_addresses(self) -> None:
         assert self._handle is not None
         assert self._bm is not None
 
-        started_at = time.monotonic()
-        deadline = started_at + self.config.peer_join_timeout_seconds
-        waiting_logged = False
-        while True:
-            self.local_gva = self._handle.peer_rank_ptr(
-                self.config.rank_id,
-                self._bm.BmMemType.HOST,
-            )
-            if self.local_gva:
-                self.local_host_va = self._handle.gva_to_va(
-                    self.local_gva,
-                    self._bm.BmMemType.LOCAL_HOST,
-                )
-                self.local_device_va = self._handle.gva_to_va(
-                    self.local_gva,
-                    self._bm.BmMemType.LOCAL_DEVICE,
-                )
-            else:
-                self.local_host_va = 0
-                self.local_device_va = 0
-
-            if self.local_gva and self.local_host_va and self.local_device_va:
-                if waiting_logged:
-                    logger.info(
-                        "MemFabric BM peer became ready after %.1f seconds: "
-                        "role=%s, tp_rank=%d, rank_id=%d.",
-                        time.monotonic() - started_at,
-                        self.config.role,
-                        self.config.tp_rank,
-                        self.config.rank_id,
-                    )
-                return
-
-            now = time.monotonic()
-            if now >= deadline:
-                raise RuntimeError(
-                    "Timed out waiting for the MemFabric BM peer to expose "
-                    "the required local addresses: "
-                    f"timeout_seconds={self.config.peer_join_timeout_seconds}, "
-                    f"role={self.config.role}, tp_rank={self.config.tp_rank}, "
-                    f"rank_id={self.config.rank_id}, "
-                    f"gva=0x{self.local_gva:x}, "
-                    f"host=0x{self.local_host_va:x}, "
-                    f"device=0x{self.local_device_va:x}"
-                )
-            if not waiting_logged:
-                logger.info(
-                    "Waiting up to %.1f seconds for the MemFabric BM peer: "
-                    "role=%s, tp_rank=%d, rank_id=%d, "
-                    "gva=0x%x, host=0x%x, device=0x%x.",
-                    self.config.peer_join_timeout_seconds,
-                    self.config.role,
-                    self.config.tp_rank,
-                    self.config.rank_id,
-                    self.local_gva,
-                    self.local_host_va,
-                    self.local_device_va,
-                )
-                waiting_logged = True
-            time.sleep(
-                min(
-                    MEMFABRIC_BM_ADDRESS_POLL_INTERVAL_SECONDS,
-                    max(0.0, deadline - now),
-                )
+        self.local_gva = self._handle.peer_rank_ptr(
+            self.config.rank_id,
+            self._bm.BmMemType.HOST,
+        )
+        self.local_host_va = self._handle.gva_to_va(
+            self.local_gva,
+            self._bm.BmMemType.LOCAL_HOST,
+        )
+        self.local_device_va = self._handle.gva_to_va(
+            self.local_gva,
+            self._bm.BmMemType.LOCAL_DEVICE,
+        )
+        if not self.local_gva or not self.local_host_va or not self.local_device_va:
+            raise RuntimeError(
+                "MemFabric BM did not expose the required local addresses "
+                "after peer rendezvous: "
+                f"gva=0x{self.local_gva:x}, host=0x{self.local_host_va:x}, "
+                f"device=0x{self.local_device_va:x}"
             )
 
     def _initialize_runtime(self) -> None:
@@ -423,7 +499,8 @@ class MemFabricBMFullKVAllocator:
             raise RuntimeError(f"MemFabric BM join failed: result={join_result}")
         self._joined = True
 
-        self._wait_for_local_addresses()
+        self._wait_for_peer_join()
+        self._resolve_local_addresses()
         if not (
             self.local_gva == self.local_host_va == self.local_device_va
         ):
