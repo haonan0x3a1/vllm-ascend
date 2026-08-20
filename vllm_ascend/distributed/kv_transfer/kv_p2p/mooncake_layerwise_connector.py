@@ -97,6 +97,7 @@ SPARSE_KV_TRANSFER_MODES = {
     SPARSE_KV_TRANSFER_MODE_MEMFABRIC_BM,
 }
 MOONCAKE_MEMORY_ALIGNMENT = 2 * 1024 * 1024
+MOONCAKE_THREAD_STARTUP_TIMEOUT_SECONDS = 30.0
 MOONCAKE_THREAD_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 
 
@@ -292,6 +293,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.sparse_host_staging_kv = sparse_host_staging_kv
         self.sparse_host_relay_kv = sparse_host_relay_kv
         self.ready_event = ready_event
+        self.startup_error: BaseException | None = None
         self.callback_func = callback_func
         self.layer_callback_func = layer_callback_func
         self._stop_event = threading.Event()
@@ -315,10 +317,15 @@ class KVCacheSendingLayerThread(threading.Thread):
         return self.host_engine is not None
 
     def run(self):
-        local_rank = get_world_group().local_rank
-        device = torch.device(f"npu:{local_rank}")
-        torch.npu.set_device(device)
-        self.ready_event.set()
+        try:
+            local_rank = get_world_group().local_rank
+            device = torch.device(f"npu:{local_rank}")
+            torch.npu.set_device(device)
+        except BaseException as exc:
+            self.startup_error = exc
+            raise
+        finally:
+            self.ready_event.set()
         while not self._stop_event.is_set():
             try:
                 send_task = self.send_queue.get(timeout=0.1)
@@ -831,6 +838,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.failed_requests = set[str]()
         self.task_tracker = dict[str, int]()
         self.ready_event = ready_event
+        self.startup_error: BaseException | None = None
         self.metadata = metadata
         self.sparse_host_final_kv_caches = sparse_host_final_kv_caches
         self.sparse_host_staging_kv = sparse_host_staging_kv
@@ -951,76 +959,83 @@ class KVCacheRecvingLayerThread(threading.Thread):
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
-        if self.uses_sparse_host_staging:
-            local_rank = get_world_group().local_rank
-            torch.npu.set_device(torch.device(f"npu:{local_rank}"))
-        handshake_port = self.side_channel_port + self.tp_rank
-        path = make_zmq_path("tcp", self.side_channel_host, handshake_port)
-        logger.info("KVCacheRecvingLayerThread listening on %s, tp_rank=%d", path, self.tp_rank)
-        encoder = msgspec.msgpack.Encoder()
-        encoded_data = encoder.encode(self.metadata)
-        with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
-            self.ready_event.set()
-            decoder = msgspec.msgpack.Decoder(type=tuple)
-            while not self._stop_event.is_set():
-                try:
-                    if not sock.poll(timeout=100):
-                        continue
-                    frames = sock.recv_multipart()
-                    if len(frames) < 2:
-                        logger.error(
-                            "Invalid message format. expected>=2 frames, got %d. frames=%s", len(frames), frames
-                        )
-                        continue
-
-                    identity = frames[0]
-                    payload = [f for f in frames[1:] if f != b""]
-                    if len(payload) != 1:
-                        logger.error("Invalid payload count. expected=1, got %d. frames=%s", len(payload), frames)
-                        continue
-
-                    msg = decoder.decode(payload[0])
-                    if msg[0] == GET_META_MSG:
-                        logger.info("Got GET META INFO for request %s", msg[0])
-                        sock.send_multipart((identity, b"", encoded_data))
-                    elif msg[0] == DONE_SENDING_MSG:
-                        logger.debug("Got DONE_RECVING_MSG for request %s", msg[1])
-                        request_id = msg[1]
-                        trans_count = msg[2]
-                        side_channel_path = msg[3]
-                        self.update_done_task(request_id, trans_count, side_channel_path)
-                        sock.send_multipart((identity, b"", b"ACK"))
-                    elif msg[0] == LAYER_STAGED_MSG:
-                        layer_name = msg[2]
-                        remote_block_ids = list(msg[3])
-                        try:
-                            self.persist_staged_layer(layer_name, remote_block_ids)
-                        except Exception as e:
+        try:
+            if self.uses_sparse_host_staging:
+                local_rank = get_world_group().local_rank
+                torch.npu.set_device(torch.device(f"npu:{local_rank}"))
+            handshake_port = self.side_channel_port + self.tp_rank
+            path = make_zmq_path("tcp", self.side_channel_host, handshake_port)
+            logger.info("KVCacheRecvingLayerThread listening on %s, tp_rank=%d", path, self.tp_rank)
+            encoder = msgspec.msgpack.Encoder()
+            encoded_data = encoder.encode(self.metadata)
+            with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
+                decoder = msgspec.msgpack.Decoder(type=tuple)
+                self.ready_event.set()
+                while not self._stop_event.is_set():
+                    try:
+                        if not sock.poll(timeout=100):
+                            continue
+                        frames = sock.recv_multipart()
+                        if len(frames) < 2:
                             logger.error(
-                                "Failed to persist sparse Host KV staging. request_id=%s, layer=%s, error=%s.",
-                                msg[1],
-                                layer_name,
-                                e,
+                                "Invalid message format. expected>=2 frames, got %d. frames=%s", len(frames), frames
                             )
-                            sock.send_multipart((identity, b"", b"NACK"))
-                        else:
+                            continue
+
+                        identity = frames[0]
+                        payload = [f for f in frames[1:] if f != b""]
+                        if len(payload) != 1:
+                            logger.error("Invalid payload count. expected=1, got %d. frames=%s", len(payload), frames)
+                            continue
+
+                        msg = decoder.decode(payload[0])
+                        if msg[0] == GET_META_MSG:
+                            logger.info("Got GET META INFO for request %s", msg[0])
+                            sock.send_multipart((identity, b"", encoded_data))
+                        elif msg[0] == DONE_SENDING_MSG:
+                            logger.debug("Got DONE_RECVING_MSG for request %s", msg[1])
+                            request_id = msg[1]
+                            trans_count = msg[2]
+                            side_channel_path = msg[3]
+                            self.update_done_task(request_id, trans_count, side_channel_path)
                             sock.send_multipart((identity, b"", b"ACK"))
-                    elif msg[0] == FAILED_SENDING_MSG:
-                        request_id = msg[1]
-                        logger.error("Got FAILED_SENDING_MSG for request. request_id=%s. ", msg[1])
-                        self.update_failed_task(request_id)
-                        sock.send_multipart((identity, b"", b"ACK"))
-                    else:
+                        elif msg[0] == LAYER_STAGED_MSG:
+                            layer_name = msg[2]
+                            remote_block_ids = list(msg[3])
+                            try:
+                                self.persist_staged_layer(layer_name, remote_block_ids)
+                            except Exception as e:
+                                logger.error(
+                                    "Failed to persist sparse Host KV staging. request_id=%s, layer=%s, error=%s.",
+                                    msg[1],
+                                    layer_name,
+                                    e,
+                                )
+                                sock.send_multipart((identity, b"", b"NACK"))
+                            else:
+                                sock.send_multipart((identity, b"", b"ACK"))
+                        elif msg[0] == FAILED_SENDING_MSG:
+                            request_id = msg[1]
+                            logger.error("Got FAILED_SENDING_MSG for request. request_id=%s. ", msg[1])
+                            self.update_failed_task(request_id)
+                            sock.send_multipart((identity, b"", b"ACK"))
+                        else:
+                            logger.error(
+                                "Unexpected message type: %s. expected GET_META_MSG, "
+                                "LAYER_STAGED_MSG, or DONE_RECVING_MSG. msg=%s",
+                                msg[0] if msg else "empty",
+                                msg,
+                            )
+                    except Exception as e:
                         logger.error(
-                            "Unexpected message type: %s. expected GET_META_MSG, "
-                            "LAYER_STAGED_MSG, or DONE_RECVING_MSG. msg=%s",
-                            msg[0] if msg else "empty",
-                            msg,
+                            "Failed to decode message. type=%s, error=%s. context=decoding payload", type(e).__name__, e
                         )
-                except Exception as e:
-                    logger.error(
-                        "Failed to decode message. type=%s, error=%s. context=decoding payload", type(e).__name__, e
-                    )
+        except BaseException as exc:
+            if not self.ready_event.is_set():
+                self.startup_error = exc
+            raise
+        finally:
+            self.ready_event.set()
 
     def shutdown(self) -> None:
         """Stop the side channel before releasing its final-KV aliases."""
@@ -1805,6 +1820,22 @@ class MooncakeLayerwiseConnectorWorker:
             if ret_value != 0:
                 raise RuntimeError("Mooncake memory registration failed. ")
 
+    @staticmethod
+    def _wait_for_background_thread_start(
+        thread: KVCacheSendingLayerThread | KVCacheRecvingLayerThread,
+        ready_event: threading.Event,
+        thread_name: str,
+    ) -> None:
+        if not ready_event.wait(timeout=MOONCAKE_THREAD_STARTUP_TIMEOUT_SECONDS):
+            raise TimeoutError(
+                f"Mooncake {thread_name} thread did not start within "
+                f"{MOONCAKE_THREAD_STARTUP_TIMEOUT_SECONDS:.1f} seconds."
+            )
+        if isinstance(thread.startup_error, BaseException):
+            raise RuntimeError(
+                f"Mooncake {thread_name} thread failed to start."
+            ) from thread.startup_error
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data."""
         self.kv_caches = kv_caches
@@ -1970,7 +2001,11 @@ class MooncakeLayerwiseConnectorWorker:
                 ),
             )
             self.kv_send_layer_thread.start()
-            ready_event.wait()
+            self._wait_for_background_thread_start(
+                self.kv_send_layer_thread,
+                ready_event,
+                "KV sender",
+            )
 
         if self.vllm_config.kv_transfer_config.is_kv_consumer:
             ready_event = threading.Event()
@@ -1987,7 +2022,11 @@ class MooncakeLayerwiseConnectorWorker:
                 sparse_host_relay_kv=self.sparse_host_relay_kv,
             )
             self.kv_recv_layer_thread.start()
-            ready_event.wait()
+            self._wait_for_background_thread_start(
+                self.kv_recv_layer_thread,
+                ready_event,
+                "KV receiver",
+            )
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_recving = (

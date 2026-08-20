@@ -190,6 +190,21 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
         )
 
     @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p."
+        "mooncake_layerwise_connector.get_world_group",
+        side_effect=RuntimeError("world group unavailable"),
+    )
+    def test_run_reports_device_setup_failure_to_startup_waiter(
+        self,
+        _mock_world_group,
+    ):
+        with self.assertRaisesRegex(RuntimeError, "world group unavailable"):
+            self.thread.run()
+
+        self.assertTrue(self.ready_event.is_set())
+        self.assertIsInstance(self.thread.startup_error, RuntimeError)
+
+    @patch(
         "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.npu_stream_switch",
         side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
     )
@@ -704,6 +719,38 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside sparse Host staging capacity"):
             th.persist_staged_layer("layer0", [4])
         mock_sync.assert_not_called()
+
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p."
+        "mooncake_layerwise_connector.zmq_ctx",
+        side_effect=zmq.ZMQError("Address already in use"),
+    )
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p."
+        "mooncake_layerwise_connector.get_ip",
+        return_value="127.0.0.1",
+    )
+    def test_run_reports_socket_bind_failure_to_startup_waiter(
+        self,
+        _mock_get_ip,
+        _mock_zmq_ctx,
+    ):
+        ready_event = threading.Event()
+        th = KVCacheRecvingLayerThread(
+            tp_rank=1,
+            side_channel_port=36400,
+            tp_size=8,
+            pd_head_ratio=1,
+            local_engine_id="engineA",
+            metadata=self.meta,
+            ready_event=ready_event,
+        )
+
+        with self.assertRaisesRegex(zmq.ZMQError, "Address already in use"):
+            th.run()
+
+        self.assertTrue(ready_event.is_set())
+        self.assertIsInstance(th.startup_error, zmq.ZMQError)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.logger")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_ip", return_value="127.0.0.1")
@@ -1471,6 +1518,37 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         self.assertEqual(len(worker.layer_metadata), 1)
         self.assertIsNone(worker.kv_send_layer_thread)
         self.assertIsNotNone(worker.kv_recv_layer_thread)
+
+    def test_register_kv_caches_propagates_receiver_startup_failure(self):
+        self.vllm_config.kv_transfer_config.is_kv_producer = False
+        self.vllm_config.kv_transfer_config.is_kv_consumer = True
+        startup_error = zmq.ZMQError("Address already in use")
+
+        class FailingReceiverThread:
+            def __init__(self, *args, **kwargs):
+                self.ready_event = args[6]
+                self.startup_error = startup_error
+
+            def start(self):
+                self.ready_event.set()
+
+        worker = MooncakeLayerwiseConnectorWorker(
+            self.vllm_config,
+            self.kv_cache_config,
+            self.engine_id,
+        )
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_p2p."
+                "mooncake_layerwise_connector.KVCacheRecvingLayerThread",
+                FailingReceiverThread,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Mooncake KV receiver thread failed to start",
+            ),
+        ):
+            worker.register_kv_caches(self.kv_caches)
 
     def test_init_accepts_quant_config_without_kv_quant_flags(self):
         self.vllm_config.quant_config = SimpleNamespace()
