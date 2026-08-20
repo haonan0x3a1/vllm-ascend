@@ -73,7 +73,9 @@ def test_memfabric_same_host_ports_are_distinct_per_tp_role():
         37404,
         37405,
         37402,
+        37403,
         37406,
+        37407,
     )
     assert len(ports) == len(set(ports))
 

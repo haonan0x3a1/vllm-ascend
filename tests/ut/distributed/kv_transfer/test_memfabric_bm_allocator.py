@@ -65,18 +65,41 @@ def test_allocation_plan_fails_before_exceeding_pool() -> None:
         plan.reserve(1)
 
 
-def test_same_host_tp_pair_uses_one_store_and_distinct_hcom_ports() -> None:
+def test_same_host_tp_pair_uses_store_rank_and_one_hcom_base() -> None:
     producer = _runtime_config("kv_producer")
     consumer = _runtime_config("kv_consumer")
 
-    assert producer.rank_id == 0
-    assert consumer.rank_id == 1
+    assert producer.rank_id == 1
+    assert consumer.rank_id == 0
     assert producer.store_url == consumer.store_url == "tcp://172.16.0.146:37203"
     assert producer.nic_url == "tcp://172.16.0.146:37412"
-    assert consumer.nic_url == "tcp://172.16.0.146:37413"
-    assert producer.rendezvous_port == consumer.rendezvous_port == 37414
+    assert consumer.nic_url == "tcp://172.16.0.146:37412"
+    assert (
+        producer.create_rendezvous_port
+        == consumer.create_rendezvous_port
+        == 37414
+    )
+    assert (
+        producer.join_rendezvous_port
+        == consumer.join_rendezvous_port
+        == 37415
+    )
     assert not producer.starts_store
     assert consumer.starts_store
+
+
+def test_rank_mapping_tracks_a_producer_owned_store() -> None:
+    producer = _runtime_config(
+        "kv_producer",
+        start_store_role="kv_producer",
+    )
+    consumer = _runtime_config(
+        "kv_consumer",
+        start_store_role="kv_producer",
+    )
+
+    assert producer.rank_id == 0
+    assert consumer.rank_id == 1
 
 
 @pytest.mark.parametrize(
@@ -120,6 +143,7 @@ def test_allocator_initializes_and_releases_runtime_in_order(monkeypatch) -> Non
             return 0
 
         def peer_rank_ptr(self, *args):
+            calls.append("peer_rank_ptr")
             return 0x280040000000
 
         def gva_to_va(self, pointer, *args):
@@ -173,8 +197,8 @@ def test_allocator_initializes_and_releases_runtime_in_order(monkeypatch) -> Non
     monkeypatch.setattr(allocator, "_assert_cpu_mapping", lambda: "rw-s")
     monkeypatch.setattr(
         allocator,
-        "_wait_for_peer_join",
-        lambda: calls.append("peer_rendezvous"),
+        "_rendezvous_with_peer",
+        lambda **kwargs: calls.append(("rendezvous", kwargs["stage"])),
     )
     monkeypatch.setattr(
         allocator_module.torch,
@@ -188,12 +212,11 @@ def test_allocator_initializes_and_releases_runtime_in_order(monkeypatch) -> Non
 
     create_call = next(value for value in calls if isinstance(value, tuple) and value[0] == "create2")
     assert create_call[1]["flags"] == SMEM_BM_FLAG_DRAM_MAP_HOST_VA
-    assert (
-        calls.index("mf_initialize")
-        < calls.index("bm_initialize")
-        < calls.index("join")
-        < calls.index("peer_rendezvous")
-    )
+    assert calls.index("mf_initialize") < calls.index("bm_initialize")
+    assert calls.index(create_call) < calls.index(("rendezvous", "created"))
+    assert calls.index(("rendezvous", "created")) < calls.index("join")
+    assert calls.index("join") < calls.index(("rendezvous", "joined"))
+    assert calls.index(("rendezvous", "joined")) < calls.index("peer_rank_ptr")
     assert calls[-4:] == [
         "leave",
         "destroy",
@@ -223,9 +246,9 @@ class _FakeConnection:
         self.sent.append(message)
 
 
-def test_store_owner_waits_for_peer_join_without_querying_bm(monkeypatch) -> None:
+def test_store_owner_waits_for_peer_stage_without_querying_bm(monkeypatch) -> None:
     allocator = MemFabricBMFullKVAllocator(_runtime_config("kv_consumer"))
-    peer_message = allocator._ready_message(0)
+    peer_message = allocator._ready_message("created", 1)
     connection = _FakeConnection(peer_message)
     listener_calls = []
 
@@ -258,13 +281,16 @@ def test_store_owner_waits_for_peer_join_without_querying_bm(monkeypatch) -> Non
         lambda *args: _FakeListener(),
     )
 
-    allocator._wait_for_peer_join()
+    allocator._rendezvous_with_peer(
+        stage="created",
+        port=allocator.config.create_rendezvous_port,
+    )
 
     assert ("bind", ("172.16.0.146", 37414)) in listener_calls
     assert connection.sent == [MEMFABRIC_BM_ACK]
 
 
-def test_non_store_rank_announces_join_and_waits_for_ack(monkeypatch) -> None:
+def test_non_store_rank_announces_stage_and_waits_for_ack(monkeypatch) -> None:
     allocator = MemFabricBMFullKVAllocator(_runtime_config("kv_producer"))
     connection = _FakeConnection(MEMFABRIC_BM_ACK)
     connect_calls = []
@@ -279,7 +305,10 @@ def test_non_store_rank_announces_join_and_waits_for_ack(monkeypatch) -> None:
         _create_connection,
     )
 
-    allocator._wait_for_peer_join()
+    allocator._rendezvous_with_peer(
+        stage="created",
+        port=allocator.config.create_rendezvous_port,
+    )
 
     assert connect_calls[0][0] == ("172.16.0.146", 37414)
-    assert connection.sent == [allocator._ready_message(0)]
+    assert connection.sent == [allocator._ready_message("created", 1)]

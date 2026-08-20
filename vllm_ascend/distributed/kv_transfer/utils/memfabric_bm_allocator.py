@@ -26,10 +26,11 @@ MEMFABRIC_BM_DRAM_ALIGNMENT_BYTES = 1 << 30
 MEMFABRIC_BM_TENSOR_ALIGNMENT_BYTES = 2 << 20
 SMEM_BM_FLAG_DRAM_MAP_HOST_VA = 1 << 9
 MEMFABRIC_BM_WORLD_SIZE = 2
-MEMFABRIC_BM_PREFILL_RANK = 0
-MEMFABRIC_BM_DECODE_RANK = 1
+MEMFABRIC_BM_STORE_RANK = 0
+MEMFABRIC_BM_PEER_RANK = 1
 MEMFABRIC_BM_HCOM_PORT_STRIDE = 4
-MEMFABRIC_BM_RENDEZVOUS_PORT_OFFSET = 2
+MEMFABRIC_BM_CREATE_RENDEZVOUS_PORT_OFFSET = 2
+MEMFABRIC_BM_JOIN_RENDEZVOUS_PORT_OFFSET = 3
 MEMFABRIC_BM_CONNECT_RETRY_INTERVAL_SECONDS = 0.2
 MEMFABRIC_BM_READY_PREFIX = "MEMFABRIC_BM_READY_V1"
 MEMFABRIC_BM_ACK = b"MEMFABRIC_BM_ACK_V1\n"
@@ -198,17 +199,21 @@ class MemFabricBMRuntimeConfig:
             )
         for name, port in (
             ("store", self.store_port),
-            ("hcom", self.hcom_port),
-            ("rendezvous", self.rendezvous_port),
+            ("hcom base", self.hcom_port),
+            ("create rendezvous", self.create_rendezvous_port),
+            ("join rendezvous", self.join_rendezvous_port),
         ):
             if not 1 <= port <= 65535:
                 raise ValueError(f"memfabric_bm {name} port is outside [1, 65535]: {port}")
 
     @property
     def rank_id(self) -> int:
-        if self.role == "kv_producer":
-            return MEMFABRIC_BM_PREFILL_RANK
-        return MEMFABRIC_BM_DECODE_RANK
+        # MemFabric 1.1.x auto-ranking assigns rank 0 to the process that owns
+        # the config store and rank 1 to the peer. Keep our address lookups and
+        # control-plane identities aligned with that runtime behavior.
+        if self.starts_store:
+            return MEMFABRIC_BM_STORE_RANK
+        return MEMFABRIC_BM_PEER_RANK
 
     @property
     def store_port(self) -> int:
@@ -216,23 +221,24 @@ class MemFabricBMRuntimeConfig:
 
     @property
     def hcom_port(self) -> int:
-        # Prefill and Decode may run as separate processes on one physical
-        # host during the same-node gate. Give both ranks distinct listener
-        # ports while keeping all TP-pair ranges disjoint.
+        # Both ranks pass the same per-TP base. MemFabric adds its auto-ranked
+        # rank id internally, producing listeners at offsets 0 and 1.
+        return self.hcom_port_base + self.tp_rank * MEMFABRIC_BM_HCOM_PORT_STRIDE
+
+    @property
+    def create_rendezvous_port(self) -> int:
         return (
             self.hcom_port_base
             + self.tp_rank * MEMFABRIC_BM_HCOM_PORT_STRIDE
-            + self.rank_id
+            + MEMFABRIC_BM_CREATE_RENDEZVOUS_PORT_OFFSET
         )
 
     @property
-    def rendezvous_port(self) -> int:
-        # Offsets 0 and 1 are the Prefill and Decode HCOM listeners. Offset 2
-        # is reserved for a small control-plane barrier; offset 3 stays free.
+    def join_rendezvous_port(self) -> int:
         return (
             self.hcom_port_base
             + self.tp_rank * MEMFABRIC_BM_HCOM_PORT_STRIDE
-            + MEMFABRIC_BM_RENDEZVOUS_PORT_OFFSET
+            + MEMFABRIC_BM_JOIN_RENDEZVOUS_PORT_OFFSET
         )
 
     @property
@@ -339,22 +345,23 @@ class MemFabricBMFullKVAllocator:
             "MemFabric BM peer rendezvous received an incomplete control message"
         )
 
-    def _ready_message(self, rank_id: int) -> bytes:
+    def _ready_message(self, stage: str, rank_id: int) -> bytes:
         return (
             f"{MEMFABRIC_BM_READY_PREFIX} {self.config.bm_id} "
-            f"{self.config.tp_rank} {rank_id}\n"
+            f"{self.config.tp_rank} {stage} {rank_id}\n"
         ).encode("ascii")
 
-    def _wait_for_peer_join(self) -> None:
-        """Barrier after both ranks join, without querying incomplete BM state."""
+    def _rendezvous_with_peer(self, *, stage: str, port: int) -> None:
+        """Synchronize one BM lifecycle stage without querying native state."""
         peer_rank_id = 1 - self.config.rank_id
         timeout = self.config.peer_join_timeout_seconds
-        rendezvous_address = (self.config.store_host, self.config.rendezvous_port)
+        rendezvous_address = (self.config.store_host, port)
 
         logger.info(
-            "Waiting up to %.1f seconds for the MemFabric BM peer rendezvous: "
+            "Waiting up to %.1f seconds for the MemFabric BM %s rendezvous: "
             "role=%s, tp_rank=%d, rank_id=%d, address=%s:%d.",
             timeout,
+            stage,
             self.config.role,
             self.config.tp_rank,
             self.config.rank_id,
@@ -362,11 +369,11 @@ class MemFabricBMFullKVAllocator:
         )
 
         if self.config.starts_store:
-            expected_message = self._ready_message(peer_rank_id)
+            expected_message = self._ready_message(stage, peer_rank_id)
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
                     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    listener.bind((self.config.nic_ip, self.config.rendezvous_port))
+                    listener.bind((self.config.nic_ip, port))
                     listener.listen(1)
                     listener.settimeout(timeout)
                     connection, _ = listener.accept()
@@ -382,7 +389,7 @@ class MemFabricBMFullKVAllocator:
             except OSError as exc:
                 raise RuntimeError(
                     "MemFabric BM peer rendezvous server failed: "
-                    f"address={self.config.nic_ip}:{self.config.rendezvous_port}, "
+                    f"stage={stage}, address={self.config.nic_ip}:{port}, "
                     f"role={self.config.role}, tp_rank={self.config.tp_rank}"
                 ) from exc
         else:
@@ -395,6 +402,7 @@ class MemFabricBMFullKVAllocator:
                     raise RuntimeError(
                         "Timed out connecting to the MemFabric BM peer "
                         "rendezvous: "
+                        f"stage={stage}, "
                         f"address={rendezvous_address[0]}:{rendezvous_address[1]}, "
                         f"role={self.config.role}, tp_rank={self.config.tp_rank}, "
                         f"last_error={last_error}"
@@ -415,7 +423,9 @@ class MemFabricBMFullKVAllocator:
             try:
                 with connection:
                     connection.settimeout(max(0.1, deadline - time.monotonic()))
-                    connection.sendall(self._ready_message(self.config.rank_id))
+                    connection.sendall(
+                        self._ready_message(stage, self.config.rank_id)
+                    )
                     message = self._recv_control_message(connection)
                     if message != MEMFABRIC_BM_ACK:
                         raise RuntimeError(
@@ -426,13 +436,15 @@ class MemFabricBMFullKVAllocator:
             except OSError as exc:
                 raise RuntimeError(
                     "MemFabric BM peer rendezvous client failed: "
+                    f"stage={stage}, "
                     f"address={rendezvous_address[0]}:{rendezvous_address[1]}, "
                     f"role={self.config.role}, tp_rank={self.config.tp_rank}"
                 ) from exc
 
         logger.info(
-            "MemFabric BM peer rendezvous completed: role=%s, tp_rank=%d, "
+            "MemFabric BM %s rendezvous completed: role=%s, tp_rank=%d, "
             "rank_id=%d.",
+            stage,
             self.config.role,
             self.config.tp_rank,
             self.config.rank_id,
@@ -494,12 +506,19 @@ class MemFabricBMFullKVAllocator:
         )
         if self._handle is None:
             raise RuntimeError("MemFabric BM create2 returned None")
+        self._rendezvous_with_peer(
+            stage="created",
+            port=self.config.create_rendezvous_port,
+        )
         join_result = self._handle.join()
         if join_result != 0:
             raise RuntimeError(f"MemFabric BM join failed: result={join_result}")
         self._joined = True
 
-        self._wait_for_peer_join()
+        self._rendezvous_with_peer(
+            stage="joined",
+            port=self.config.join_rendezvous_port,
+        )
         self._resolve_local_addresses()
         if not (
             self.local_gva == self.local_host_va == self.local_device_va

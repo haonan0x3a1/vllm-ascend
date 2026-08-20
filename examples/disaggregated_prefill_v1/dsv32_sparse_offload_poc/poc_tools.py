@@ -190,7 +190,9 @@ def memfabric_bm_required_ports(
         for rank_id in (0, 1)
     )
     rendezvous_ports = tuple(
-        hcom_port_base + tp_rank * 4 + 2 for tp_rank in range(tp_size)
+        hcom_port_base + tp_rank * 4 + offset
+        for tp_rank in range(tp_size)
+        for offset in (2, 3)
     )
     return (*store_ports, *hcom_ports, *rendezvous_ports)
 

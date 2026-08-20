@@ -381,11 +381,12 @@ bash run.sh proxy
 ```
 
 `memfabric_bm` 模式下，不要等待 Decode API ready 后才启动 Prefill。Decode 先启动，
-看到 `Waiting ... for the MemFabric BM peer rendezvous` 后就应
+看到 `Waiting ... for the MemFabric BM created rendezvous` 后就应
 立即在终端二启动 Prefill；两端 BM 建组完成后才会继续到 API ready。这个等待复用
 `ASCEND_TRANSFER_TIMEOUT`（当前示例为 600 秒），覆盖 P/D 模型加载耗时不同造成的
-启动间隔。每个 TP pair 使用 `MEMFABRIC_BM_HCOM_PORT_BASE + 4 * tp_rank + 2`
-作为控制屏障端口，不承载 KV payload。只有超时或对端初始化失败才是错误。
+启动间隔。每个 TP pair 使用 HCOM 端口段的 offset 0/1 作为 MemFabric 实际监听端口，
+offset 2/3 分别作为 `create2` 后和 `join` 后的控制屏障，不承载 KV payload。只有
+超时或对端初始化失败才是错误。
 
 `npu_staging` 和 `host_relay` 模式仍可按原基线流程等待 Decode ready 后再启动
 Prefill。
