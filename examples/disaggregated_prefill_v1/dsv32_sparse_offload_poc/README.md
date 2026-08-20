@@ -155,6 +155,72 @@ Gather 直接读取普通 pinned Host Tensor。停止扩展 `host_relay`，保�
 支持作为下层依赖问题。除非 CANN、torch_npu 或 Mooncake 的相关接口发生变化，
 否则不再重复运行该探针或追加同类 bridge 探针。
 
+## MemFabric BM 双视图 Gather G1
+
+目标 Host-to-Host 路径的第一硬件门槛，不再使用普通 pinned Host Tensor。它直接
+验证 MemFabric BM 的同一块 DRAM pool 是否可以同时提供：
+
+```text
+LOCAL_HOST VA
+└── MemFabric Host 数据操作使用
+
+LOCAL_DEVICE VA
+└── 构造 torch NPU Tensor alias，供 NPU copy 和 Gather 使用
+```
+
+该探针位于
+`tests/ut/distributed/kv_transfer/a3_2/test_memfabric_bm_dual_view_gather_npu.py`，
+默认跳过，必须在确认一张空闲 A3 NPU 后显式启用。例如物理 8 卡空闲时：
+
+```bash
+cd /workspace/w50062541/code/vllm-ascend
+
+ASCEND_RT_VISIBLE_DEVICES=8 \
+VLLM_ASCEND_RUN_MEMFABRIC_BM_GATHER_GATE=1 \
+pytest -sv \
+  tests/ut/distributed/kv_transfer/a3_2/test_memfabric_bm_dual_view_gather_npu.py::test_memfabric_bm_dual_view_host_full_kv_gather_gate
+```
+
+测试完全运行在独立子进程中，依次验证：
+
+1. framework swapped Full KV 可以执行真实 Gather，作为当前环境的正对照；
+2. MemFabric BM `HOST` GVA 可转换为 `LOCAL_HOST` 和 `LOCAL_DEVICE` 两个地址；
+3. `LOCAL_DEVICE` 地址可按 model runner 的 raw-int8、`view/as_strided` 方式构造成
+   BF16 NoPE/RoPE NPU Tensor；
+4. `persist_updated_slots` 可以执行 copy ①：普通 NPU staging → BM Host Full KV；
+5. 使用不同数据通过 BM `H2G` 写入同一 Host pool 后，真实 Gather 能从 NPU alias
+   读取新数据，而不是误读 copy ① 的旧数据；
+6. 非目标 block、tensor 间隔和前后 guard 未被修改；
+7. 所有 Tensor view 在 BM handle 释放前销毁，进程正常退出且不出现
+   segfault/double free。
+
+只有输出包含：
+
+```text
+MemFabric BM dual-view Host Full-KV -> Gather G1 PASSED
+1 passed
+```
+
+才判定 G1 为 Go。以下任一情况均为 No-Go 或下层依赖阻塞：
+
+- `gva_to_va(..., LOCAL_DEVICE)` 不存在或返回 0；
+- pointer → NPU Tensor 构造接口不可用；
+- NPU staging → BM alias 的 `index_copy_` 失败；
+- Gather 报 invalid GM address、进程超时或异常退出；
+- Gather 仍读到 Host 写入前的旧数据；
+- guard 损坏、析构崩溃或 double free。
+
+该测试只使用单 rank BM `SDMA` 验证 allocator、双地址和 Gather 契约，不验证
+`HOST_RDMA` 或跨机可见性。G1 通过后才能继续 G2：
+
+```text
+P BM Host Full KV
+→ MemFabric HOST_RDMA
+→ D BM Host Full KV
+→ completion/visibility fence
+→ D Gather
+```
+
 ## 选择生产传输路径
 
 `config.env` 中的 `SPARSE_KV_TRANSFER_MODE` 控制 Full KV 的逐层 P/D 路径：
