@@ -1,8 +1,9 @@
-# DeepSeek-V3.2 Sparse KV Offload Online P/D PoC
+# DeepSeek-V3.2 Sparse KV Offload Online P/D 分阶段开发
 
 本目录把同节点 DeepSeek-V3.2 Sparse Host KV Offload 的 Online P/D
-启动、预检、验收和证据归档固化为一个入口。它面向正确性 PoC，
-不是性能或生产部署脚本。
+启动、预检、验收和证据归档固化为一个入口。目录名保留了历史 `poc`，
+当前用途已经是正式功能开发中的分阶段正确性门槛；它仍不是生产部署脚本，
+任何新 data plane 通过真实模型和跨机性能验收前都不会替换默认路径。
 
 Mooncake 传输路径、内存类型、真实 NPU 探针和最终 Stop/Go 结论见
 [MOONCAKE_TRANSFER_PATHS_2026-08-14.md](MOONCAKE_TRANSFER_PATHS_2026-08-14.md)。
@@ -284,6 +285,16 @@ python -X faulthandler -m \
 MemFabric BM same-host P -> D Host Full-KV -> Gather G2a PASSED
 ```
 
+当前服务器已在 MemFabric Hybrid 1.1.2、物理 NPU 0/8、`HOST_TCP` 下通过 G2a。
+结果确认 P/D 两端 `LOCAL_HOST == LOCAL_DEVICE == GVA`、P NPU copy①、BM
+`G2G` copy②、D 端真实 Gather、非目标块/guard 和完整清理均通过。这个结果证明
+同机双进程功能链路，不是跨机或 RDMA 性能证据。
+
+当前容器不能继续做 `HOST_RDMA` smoke：`/dev/infiniband` 不存在、
+`/sys/class/infiniband` 为空，也没有 verbs 设备可供 HCOM 枚举。该缺口只阻塞
+G2b/cross-host RDMA 验收，不阻塞下面的真实模型 allocator 集成和同机
+`HOST_TCP` data-plane 开发。
+
 `HOST_TCP` 通过后，也可以把协议切成 `host_rdma` 做同机 HCOM 兼容性 smoke。
 即使该 smoke 通过，也不能替代 G2b 的真实跨机 `HOST_RDMA` 验收。
 
@@ -297,6 +308,9 @@ SPARSE_KV_TRANSFER_MODE=npu_staging
 
 # 新的 Host relay 对照路径
 SPARSE_KV_TRANSFER_MODE=host_relay
+
+# M1：BM Full-KV allocator + 既有 Mooncake NPU staging 传输
+SPARSE_KV_TRANSFER_MODE=memfabric_bm
 ```
 
 `npu_staging` 保持原路径：Full KV 与 Indexer 都通过 Mooncake Ascend transport
@@ -315,7 +329,41 @@ Indexer: P Indexer NPU KV --Mooncake Ascend NPU→NPU--> D Indexer NPU KV
 
 Decode 只有在 Host relay 已桥接到 swapped Full KV、Indexer 也已传完后才确认该层。
 这个实现仍让 Full KV 经过 Decode NPU，不是 mentor 所指的最终 Host 路径，当前
-不得用它得出性能收益结论。`run.sh` 会主动清除外部 `MC_FORCE_TCP`；不要手工导出它，否则现有
+不得用它得出性能收益结论。
+
+`memfabric_bm` 当前对应 M1 allocator 集成门槛。它把每个 TP worker 的 Full-KV
+底层 allocation 从 `empty_with_swapped_memory` 换成一份 1 GiB MemFabric BM DRAM
+pool，并将 `LOCAL_DEVICE` view 包装成原布局的 NPU Tensor。当前真实模型路径是：
+
+```text
+P 模型算子
+  -> P 普通 NPU staging
+  -> Mooncake Ascend NPU-to-NPU
+  -> D 普通 NPU staging
+  -> 本地 NPU copy
+  -> D MemFabric BM dual-view Full KV
+  -> Gather selected NPU KV
+  -> SFA
+```
+
+因此 M1 只回答“真实 61 层模型能否把 BM alias 当成原 Full-KV cache，并在正常
+退出时安全释放”；它仍有 NPU-to-NPU Full-KV 传输，不得做性能收益声明。
+Host 模式会把 4K 配置限制为 33 个物理 block，61 层 BF16 Full-KV 的有效数据约
+283 MiB，加上每个 tensor 的 2 MiB 对齐仍落在 1 GiB BM pool 内。若修改层数、
+最大长度或 block 数，必须相应增大 `MEMFABRIC_BM_POOL_BYTES`，且保持 1 GiB 整数倍。
+
+M1 通过后才进入 M2，把 Full-KV payload 改成：
+
+```text
+P NPU staging -> P BM Full KV -> BM G2G/HOST_TCP -> D BM Full KV -> Gather
+Indexer NPU KV ----------------> Mooncake Ascend ----------------> D Indexer KV
+```
+
+M2 同机正确后保留相同 block-offset/fence 契约，在两台真实服务器上把协议切到
+`HOST_RDMA` 完成 G2b。当前实现不会把“初始化了 HOST_TCP BM group”误写成
+“Full-KV 已经走 BM Host-to-Host”。
+
+`run.sh` 会主动清除外部 `MC_FORCE_TCP`；不要手工导出它，否则现有
 Ascend engine 可能被错误初始化成 TCP。两种模式使用带模式名的独立日志和结果
 文件，避免覆盖对照证据。
 
@@ -358,6 +406,9 @@ NPU 状态和传输生命周期归档到 `OUTPUT_DIR` 下的带时间戳目录�
 
 通过后，在 Proxy、Prefill、Decode 三个服务终端依次按 `Ctrl+C`。不要在共享服务器
 使用会影响同事 Ray/Python 进程的宽泛 `pkill`。
+M1 `memfabric_bm` 还必须在 P/D 日志中分别看到 8 条
+`Released MemFabric BM Full-KV allocator`，且进程正常返回、没有 segfault 或
+double free，才算 allocator 生命周期完整通过。
 
 ## 当前边界
 
@@ -368,5 +419,8 @@ NPU 状态和传输生命周期归档到 `OUTPUT_DIR` 下的带时间戳目录�
 - `host_relay` 只是默认关闭的兼容性诊断路径，不是性能候选；它使用 TCP 验证
   pinned Host relay 传输，尚未证明跨节点 RDMA/RoCE/UB Host transport，也不使用
   Mooncake Store。
+- `memfabric_bm` 当前是默认关闭的 M1 allocator 门槛；Full-KV payload 仍走
+  Mooncake NPU staging。M2 BM `G2G` 尚未接入生产 Connector，G2b 跨机
+  `HOST_RDMA` 也尚未验证。
 - 如果端口被 Ray 等共享服务占用，应修改 `config.env` 选择完整空闲端口段，
   不要终止不属于本任务的进程。

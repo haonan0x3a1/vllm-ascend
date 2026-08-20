@@ -177,6 +177,21 @@ def clear_inherited_device_visibility(
     return environment.pop(DEVICE_VISIBILITY_ENV, None)
 
 
+def memfabric_bm_required_ports(
+    tp_size: int,
+    store_port_base: int,
+    hcom_port_base: int,
+) -> tuple[int, ...]:
+    """Return same-host BM store and per-role HCOM listener ports."""
+    store_ports = tuple(store_port_base + tp_rank for tp_rank in range(tp_size))
+    hcom_ports = tuple(
+        hcom_port_base + tp_rank * 4 + rank_id
+        for tp_rank in range(tp_size)
+        for rank_id in (0, 1)
+    )
+    return (*store_ports, *hcom_ports)
+
+
 def preflight(args: argparse.Namespace) -> int:
     errors: list[str] = []
     prefill_devices = parse_devices(args.prefill_devices)
@@ -223,6 +238,8 @@ def preflight(args: argparse.Namespace) -> int:
         "torch-npu",
     ):
         print(f"  {distribution}: {package_version(distribution)}")
+    if args.transfer_mode == "memfabric_bm":
+        print(f"  memfabric-hybrid: {package_version('memfabric_hybrid')}")
 
     try:
         inherited_visibility = clear_inherited_device_visibility(os.environ)
@@ -250,6 +267,13 @@ def preflight(args: argparse.Namespace) -> int:
             errors.append("torch_npu.npu_gather_selection_kv_cache is unavailable.")
         if not hasattr(torch.ops.custom, "npu_swiglu_clip_quant"):
             errors.append("torch.ops.custom.npu_swiglu_clip_quant is unavailable.")
+        if args.transfer_mode == "memfabric_bm":
+            memfabric_hybrid = import_module("memfabric_hybrid")
+            memfabric_bm = import_module("memfabric_hybrid.bm")
+            if not hasattr(memfabric_hybrid, "initialize"):
+                errors.append("memfabric_hybrid.initialize is unavailable.")
+            if not hasattr(memfabric_bm, "create2"):
+                errors.append("memfabric_hybrid.bm.create2 is unavailable.")
     except Exception as exc:  # pragma: no cover - hardware/runtime specific
         errors.append(f"Runtime import probe failed: {type(exc).__name__}: {exc}")
 
@@ -261,6 +285,14 @@ def preflight(args: argparse.Namespace) -> int:
         *(args.prefill_kv_port_base + rank for rank in range(args.tp_size)),
         *(args.decode_kv_port_base + rank for rank in range(args.tp_size)),
     ]
+    if args.transfer_mode == "memfabric_bm":
+        required_ports.extend(
+            memfabric_bm_required_ports(
+                args.tp_size,
+                args.memfabric_bm_store_port_base,
+                args.memfabric_bm_hcom_port_base,
+            )
+        )
     for port in required_ports:
         free, reason = can_bind(port)
         print(f"  {port}: {'FREE' if free else f'BUSY ({reason})'}")
@@ -391,6 +423,17 @@ def validate(args: argparse.Namespace) -> int:
         print("\n".join(fatal_lines[-200:]))
         raise RuntimeError(f"Found {len(fatal_lines)} fatal log matches")
 
+    if args.transfer_mode == "memfabric_bm":
+        allocator_marker = "Initialized MemFabric BM Full-KV allocator:"
+        prefill_allocators = prefill_log.count(allocator_marker)
+        decode_allocators = decode_log.count(allocator_marker)
+        if prefill_allocators != args.tp_size or decode_allocators != args.tp_size:
+            raise RuntimeError(
+                "MemFabric BM M1 expected one allocator per TP worker, got "
+                f"Prefill={prefill_allocators}, Decode={decode_allocators}, "
+                f"expected={args.tp_size}."
+            )
+
     print(f"Results saved to: {output_path}")
     print("FINAL 4K ONLINE PD SUITE: PASSED")
     return 0
@@ -508,6 +551,21 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument("--decode-api-port", type=int, required=True)
     preflight_parser.add_argument("--prefill-kv-port-base", type=int, required=True)
     preflight_parser.add_argument("--decode-kv-port-base", type=int, required=True)
+    preflight_parser.add_argument(
+        "--transfer-mode",
+        choices=("npu_staging", "host_relay", "memfabric_bm"),
+        required=True,
+    )
+    preflight_parser.add_argument(
+        "--memfabric-bm-store-port-base",
+        type=int,
+        required=True,
+    )
+    preflight_parser.add_argument(
+        "--memfabric-bm-hcom-port-base",
+        type=int,
+        required=True,
+    )
     preflight_parser.add_argument("--min-adxl-free-ports", type=int, default=2)
     preflight_parser.set_defaults(func=preflight)
 
@@ -516,6 +574,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--model", required=True)
     validate_parser.add_argument("--index-topk", type=int, required=True)
     validate_parser.add_argument("--tp-size", type=int, required=True)
+    validate_parser.add_argument(
+        "--transfer-mode",
+        choices=("npu_staging", "host_relay", "memfabric_bm"),
+        required=True,
+    )
     validate_parser.add_argument("--timeout", type=int, default=1200)
     validate_parser.add_argument("--log-settle-seconds", type=int, default=5)
     validate_parser.add_argument("--output", required=True)
@@ -538,7 +601,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect_parser.add_argument("--decode-kv-port-base", type=int, required=True)
     collect_parser.add_argument(
         "--transfer-mode",
-        choices=("npu_staging", "host_relay"),
+        choices=("npu_staging", "host_relay", "memfabric_bm"),
         required=True,
     )
     collect_parser.add_argument("--validation-output", required=True)

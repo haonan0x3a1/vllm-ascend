@@ -60,10 +60,17 @@ source "$CONFIG_PATH"
 
 SPARSE_KV_TRANSFER_MODE=${SPARSE_KV_TRANSFER_MODE:-npu_staging}
 if [[ "$SPARSE_KV_TRANSFER_MODE" != "npu_staging" \
-    && "$SPARSE_KV_TRANSFER_MODE" != "host_relay" ]]; then
-    echo "SPARSE_KV_TRANSFER_MODE must be npu_staging or host_relay, got: $SPARSE_KV_TRANSFER_MODE" >&2
+    && "$SPARSE_KV_TRANSFER_MODE" != "host_relay" \
+    && "$SPARSE_KV_TRANSFER_MODE" != "memfabric_bm" ]]; then
+    echo "SPARSE_KV_TRANSFER_MODE must be npu_staging, host_relay, or memfabric_bm, got: $SPARSE_KV_TRANSFER_MODE" >&2
     exit 1
 fi
+MEMFABRIC_HYBRID_LIB_DIR=${MEMFABRIC_HYBRID_LIB_DIR:-/usr/local/python3.11.10/lib/python3.11/site-packages/memfabric_hybrid/lib}
+MEMFABRIC_BM_PROTOCOL=${MEMFABRIC_BM_PROTOCOL:-host_tcp}
+MEMFABRIC_BM_POOL_BYTES=${MEMFABRIC_BM_POOL_BYTES:-1073741824}
+MEMFABRIC_BM_STORE_PORT_BASE=${MEMFABRIC_BM_STORE_PORT_BASE:-37200}
+MEMFABRIC_BM_HCOM_PORT_BASE=${MEMFABRIC_BM_HCOM_PORT_BASE:-37400}
+MEMFABRIC_BM_ID=${MEMFABRIC_BM_ID:-74}
 
 required_variables=(
     WORKSPACE_DIR REPO_DIR MODEL_PATH LOG_DIR OUTPUT_DIR CANN_ENV CUSTOM_OPP_ENV
@@ -160,6 +167,14 @@ prepare_environment() {
     export VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
     export ASCEND_TRANSPORT_PRINT=1
 
+    if [[ "$SPARSE_KV_TRANSFER_MODE" == "memfabric_bm" ]]; then
+        if [[ ! -d "$MEMFABRIC_HYBRID_LIB_DIR" ]]; then
+            echo "MemFabric Hybrid library directory does not exist: $MEMFABRIC_HYBRID_LIB_DIR" >&2
+            exit 1
+        fi
+        export LD_LIBRARY_PATH="$MEMFABRIC_HYBRID_LIB_DIR:${LD_LIBRARY_PATH:-}"
+    fi
+
     mkdir -p "$LOG_DIR" "$OUTPUT_DIR"
 }
 
@@ -171,19 +186,54 @@ build_kv_transfer_config() {
 import json
 import sys
 
-role, port_base, engine_id, tp_size, transfer_mode = sys.argv[1:]
+(
+    role,
+    port_base,
+    engine_id,
+    tp_size,
+    transfer_mode,
+    host_ip,
+    bm_protocol,
+    bm_pool_bytes,
+    bm_store_port_base,
+    bm_hcom_port_base,
+    bm_id,
+) = sys.argv[1:]
+extra_config = {
+    "prefill": {"dp_size": 1, "tp_size": int(tp_size)},
+    "decode": {"dp_size": 1, "tp_size": int(tp_size)},
+    "sparse_kv_transfer_mode": transfer_mode,
+}
+if transfer_mode == "memfabric_bm":
+    extra_config["memfabric_bm"] = {
+        "protocol": bm_protocol,
+        "store_host": host_ip,
+        "store_port_base": int(bm_store_port_base),
+        "nic_ip": host_ip,
+        "hcom_port_base": int(bm_hcom_port_base),
+        "pool_bytes": int(bm_pool_bytes),
+        "bm_id": int(bm_id),
+        "start_store_role": "kv_consumer",
+    }
 print(json.dumps({
     "kv_connector": "MooncakeLayerwiseConnector",
     "kv_role": role,
     "kv_port": port_base,
     "engine_id": engine_id,
-    "kv_connector_extra_config": {
-        "prefill": {"dp_size": 1, "tp_size": int(tp_size)},
-        "decode": {"dp_size": 1, "tp_size": int(tp_size)},
-        "sparse_kv_transfer_mode": transfer_mode,
-    },
+    "kv_connector_extra_config": extra_config,
 }, separators=(",", ":")))
-' "$role" "$port_base" "$engine_id" "$TP_SIZE" "$SPARSE_KV_TRANSFER_MODE"
+' \
+        "$role" \
+        "$port_base" \
+        "$engine_id" \
+        "$TP_SIZE" \
+        "$SPARSE_KV_TRANSFER_MODE" \
+        "$HOST_IP" \
+        "$MEMFABRIC_BM_PROTOCOL" \
+        "$MEMFABRIC_BM_POOL_BYTES" \
+        "$MEMFABRIC_BM_STORE_PORT_BASE" \
+        "$MEMFABRIC_BM_HCOM_PORT_BASE" \
+        "$MEMFABRIC_BM_ID"
 }
 
 build_additional_config() {
@@ -281,7 +331,10 @@ case "$ACTION" in
             --prefill-api-port "$PREFILL_API_PORT" \
             --decode-api-port "$DECODE_API_PORT" \
             --prefill-kv-port-base "$PREFILL_KV_PORT_BASE" \
-            --decode-kv-port-base "$DECODE_KV_PORT_BASE"
+            --decode-kv-port-base "$DECODE_KV_PORT_BASE" \
+            --transfer-mode "$SPARSE_KV_TRANSFER_MODE" \
+            --memfabric-bm-store-port-base "$MEMFABRIC_BM_STORE_PORT_BASE" \
+            --memfabric-bm-hcom-port-base "$MEMFABRIC_BM_HCOM_PORT_BASE"
         ;;
     probe-host-transfer)
         (
@@ -361,6 +414,7 @@ case "$ACTION" in
             --model "$SERVED_MODEL_NAME" \
             --index-topk "$INDEX_TOPK" \
             --tp-size "$TP_SIZE" \
+            --transfer-mode "$SPARSE_KV_TRANSFER_MODE" \
             --output "$VALIDATION_OUTPUT" \
             --prefill-log "$PREFILL_LOG" \
             --decode-log "$DECODE_LOG" \

@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import gc
 import logging
 import math
 import sys
@@ -4317,6 +4318,58 @@ class NPUModelRunner(GPUModelRunner):
             device=self.device,
         )
 
+    def _uses_memfabric_bm_full_kv(self) -> bool:
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is None:
+            return False
+        return (
+            kv_transfer_config.get_from_extra_config(
+                "sparse_kv_transfer_mode",
+                "npu_staging",
+            )
+            == "memfabric_bm"
+        )
+
+    def _allocate_memfabric_bm_int8_cache_tensor(
+        self,
+        numel: int,
+    ) -> torch.Tensor:
+        """Allocate raw Full-KV bytes from this TP worker's BM DRAM pool."""
+        if numel <= 0:
+            raise ValueError(f"Invalid MemFabric BM cache tensor size: {numel}")
+        allocator = getattr(self, "_memfabric_bm_full_kv_allocator", None)
+        if allocator is None:
+            from vllm_ascend.distributed.kv_transfer.utils.memfabric_bm_allocator import (
+                MemFabricBMFullKVAllocator,
+                MemFabricBMRuntimeConfig,
+            )
+
+            tp_rank = get_tp_group().rank_in_group
+            device_id = torch.npu.current_device()
+            runtime_config = MemFabricBMRuntimeConfig.from_kv_transfer_config(
+                self.vllm_config.kv_transfer_config,
+                tp_rank=tp_rank,
+                device_id=device_id,
+            )
+            allocator = MemFabricBMFullKVAllocator(runtime_config)
+            self._memfabric_bm_full_kv_allocator = allocator
+        return allocator.allocate_int8(numel, device=self.device)
+
+    def shutdown(self) -> None:
+        """Release all Tensor aliases before destroying the MemFabric pool."""
+        allocator = getattr(self, "_memfabric_bm_full_kv_allocator", None)
+        super().shutdown()
+        if allocator is None:
+            return
+
+        # The parent clears bound KV caches and attention-layer references.
+        # Force Python Tensor/Storage finalizers to run before BM unmaps the
+        # backing DRAM pages. The connector has already been shut down by the
+        # Worker, so no background thread may retain or access these aliases.
+        gc.collect()
+        allocator.close()
+        del self._memfabric_bm_full_kv_allocator
+
     def _allocate_sparse_c8_indexer_tensors(
         self,
         dsa_k_tensor_size: int,
@@ -4512,9 +4565,14 @@ class NPUModelRunner(GPUModelRunner):
                         and self.ascend_config.sparse_kv_offload.mode == "host"
                     )
                     if use_host_full_kv:
-                        k_tensor = self._allocate_swapped_int8_cache_tensor(
-                            k_tensor_size,
-                        )
+                        if self._uses_memfabric_bm_full_kv():
+                            k_tensor = self._allocate_memfabric_bm_int8_cache_tensor(
+                                k_tensor_size,
+                            )
+                        else:
+                            k_tensor = self._allocate_swapped_int8_cache_tensor(
+                                k_tensor_size,
+                            )
                     else:
                         k_tensor = self._allocate_int8_cache_tensor(
                             k_tensor_size,
@@ -4522,9 +4580,14 @@ class NPUModelRunner(GPUModelRunner):
                         )
                     if v_tensor_size is not None:
                         if use_host_full_kv:
-                            v_tensor = self._allocate_swapped_int8_cache_tensor(
-                                v_tensor_size,
-                            )
+                            if self._uses_memfabric_bm_full_kv():
+                                v_tensor = self._allocate_memfabric_bm_int8_cache_tensor(
+                                    v_tensor_size,
+                                )
+                            else:
+                                v_tensor = self._allocate_swapped_int8_cache_tensor(
+                                    v_tensor_size,
+                                )
                         else:
                             v_tensor = self._allocate_int8_cache_tensor(
                                 v_tensor_size,

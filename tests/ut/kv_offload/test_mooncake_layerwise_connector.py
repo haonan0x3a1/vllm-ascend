@@ -1501,6 +1501,46 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         self.assertEqual(worker.host_te_rpc_port, 9191)
         self.mock_create_host_transfer_engine.assert_called_once_with("127.0.0.1")
 
+    def test_init_memfabric_bm_keeps_existing_mooncake_engine(self):
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = (
+            lambda key, default: "memfabric_bm"
+            if key == "sparse_kv_transfer_mode"
+            else default
+        )
+
+        worker = MooncakeLayerwiseConnectorWorker(
+            self.vllm_config,
+            self.kv_cache_config,
+            self.engine_id,
+        )
+
+        self.assertFalse(worker.uses_sparse_host_relay)
+        self.assertIsNone(worker.host_engine)
+        self.mock_create_host_transfer_engine.assert_not_called()
+
+    def test_shutdown_stops_threads_before_releasing_cache_references(self):
+        worker = object.__new__(MooncakeLayerwiseConnectorWorker)
+        worker.kv_send_layer_thread = MagicMock()
+        worker.kv_recv_layer_thread = MagicMock()
+        worker.kv_caches = {"layer0": object()}
+        worker.sparse_host_final_kv_caches = {"layer0": (object(), object())}
+        worker.sparse_host_staging_kv = (object(), object())
+        worker.sparse_host_relay_kv = (object(), object())
+        worker.sparse_host_relay_storage = object()
+        worker.sparse_host_relay_owner = object()
+
+        send_thread = worker.kv_send_layer_thread
+        recv_thread = worker.kv_recv_layer_thread
+        worker.shutdown()
+
+        send_thread.shutdown.assert_called_once_with()
+        recv_thread.shutdown.assert_called_once_with()
+        self.assertIsNone(worker.kv_send_layer_thread)
+        self.assertIsNone(worker.kv_recv_layer_thread)
+        self.assertEqual(worker.kv_caches, {})
+        self.assertIsNone(worker.sparse_host_final_kv_caches)
+        self.assertIsNone(worker.sparse_host_staging_kv)
+
     def test_init_rejects_unknown_sparse_transfer_mode(self):
         self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = (
             lambda key, default: "unknown" if key == "sparse_kv_transfer_mode" else default

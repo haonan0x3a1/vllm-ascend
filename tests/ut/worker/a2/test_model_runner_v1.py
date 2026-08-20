@@ -135,6 +135,74 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             device=runner.device,
         )
 
+    def test_memfabric_bm_mode_is_selected_from_connector_config(self):
+        runner = self._build_runner()
+        runner.vllm_config.kv_transfer_config = MagicMock()
+        runner.vllm_config.kv_transfer_config.get_from_extra_config.return_value = (
+            "memfabric_bm"
+        )
+
+        self.assertTrue(runner._uses_memfabric_bm_full_kv())
+
+    @patch("vllm_ascend.worker.model_runner_v1.torch.npu.current_device")
+    @patch("vllm_ascend.worker.model_runner_v1.get_tp_group")
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.utils.memfabric_bm_allocator."
+        "MemFabricBMRuntimeConfig"
+    )
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.utils.memfabric_bm_allocator."
+        "MemFabricBMFullKVAllocator"
+    )
+    def test_allocate_memfabric_cache_reuses_one_worker_pool(
+        self,
+        mock_allocator_cls,
+        mock_runtime_config_cls,
+        mock_get_tp_group,
+        mock_current_device,
+    ):
+        runner = self._build_runner()
+        runner.vllm_config.kv_transfer_config = MagicMock()
+        mock_get_tp_group.return_value.rank_in_group = 3
+        mock_current_device.return_value = 3
+        allocator = mock_allocator_cls.return_value
+        allocator.allocate_int8.side_effect = [
+            torch.empty(16, dtype=torch.int8),
+            torch.empty(8, dtype=torch.int8),
+        ]
+
+        first = runner._allocate_memfabric_bm_int8_cache_tensor(16)
+        second = runner._allocate_memfabric_bm_int8_cache_tensor(8)
+
+        self.assertEqual(first.numel(), 16)
+        self.assertEqual(second.numel(), 8)
+        mock_allocator_cls.assert_called_once_with(
+            mock_runtime_config_cls.from_kv_transfer_config.return_value
+        )
+        mock_runtime_config_cls.from_kv_transfer_config.assert_called_once_with(
+            runner.vllm_config.kv_transfer_config,
+            tp_rank=3,
+            device_id=3,
+        )
+        self.assertEqual(allocator.allocate_int8.call_count, 2)
+
+    @patch("vllm.v1.worker.gpu_model_runner.GPUModelRunner.shutdown")
+    def test_shutdown_releases_parent_tensors_before_memfabric_pool(
+        self,
+        mock_parent_shutdown,
+    ):
+        runner = self._build_runner()
+        allocator = MagicMock()
+        runner._memfabric_bm_full_kv_allocator = allocator
+        order = []
+        mock_parent_shutdown.side_effect = lambda: order.append("parent")
+        allocator.close.side_effect = lambda: order.append("allocator")
+
+        runner.shutdown()
+
+        self.assertEqual(order, ["parent", "allocator"])
+        self.assertFalse(hasattr(runner, "_memfabric_bm_full_kv_allocator"))
+
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
     def test_bind_host_mode_shares_one_prefill_cache_across_sparse_layers(
         self,

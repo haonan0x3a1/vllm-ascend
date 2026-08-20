@@ -90,11 +90,14 @@ LAYER_STAGED_MSG = b"layer_staged_msg"
 SPARSE_HOST_CACHE_TENSOR_COUNT = 2
 SPARSE_KV_TRANSFER_MODE_NPU_STAGING = "npu_staging"
 SPARSE_KV_TRANSFER_MODE_HOST_RELAY = "host_relay"
+SPARSE_KV_TRANSFER_MODE_MEMFABRIC_BM = "memfabric_bm"
 SPARSE_KV_TRANSFER_MODES = {
     SPARSE_KV_TRANSFER_MODE_NPU_STAGING,
     SPARSE_KV_TRANSFER_MODE_HOST_RELAY,
+    SPARSE_KV_TRANSFER_MODE_MEMFABRIC_BM,
 }
 MOONCAKE_MEMORY_ALIGNMENT = 2 * 1024 * 1024
+MOONCAKE_THREAD_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass
@@ -291,6 +294,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.ready_event = ready_event
         self.callback_func = callback_func
         self.layer_callback_func = layer_callback_func
+        self._stop_event = threading.Event()
 
         host_relay_state = (
             self.host_engine,
@@ -315,9 +319,25 @@ class KVCacheSendingLayerThread(threading.Thread):
         device = torch.device(f"npu:{local_rank}")
         torch.npu.set_device(device)
         self.ready_event.set()
-        while True:
-            send_task = self.send_queue.get()
+        while not self._stop_event.is_set():
+            try:
+                send_task = self.send_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
             self._handle_request(send_task)
+
+    def shutdown(self) -> None:
+        """Stop after the current transfer and release Tensor references."""
+        self._stop_event.set()
+        if self.is_alive() and threading.current_thread() is not self:
+            self.join(timeout=MOONCAKE_THREAD_SHUTDOWN_TIMEOUT_SECONDS)
+        if self.is_alive():
+            raise RuntimeError(
+                "Mooncake sparse KV sender did not stop before KV memory "
+                "teardown."
+            )
+        self.sparse_host_staging_kv = None
+        self.sparse_host_relay_kv = None
 
     def _handle_request(self, send_task: SendTask):
         try:
@@ -815,6 +835,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.sparse_host_final_kv_caches = sparse_host_final_kv_caches
         self.sparse_host_staging_kv = sparse_host_staging_kv
         self.sparse_host_relay_kv = sparse_host_relay_kv
+        self._stop_event = threading.Event()
 
     @property
     def uses_sparse_host_staging(self) -> bool:
@@ -941,8 +962,10 @@ class KVCacheRecvingLayerThread(threading.Thread):
         with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
             self.ready_event.set()
             decoder = msgspec.msgpack.Decoder(type=tuple)
-            while True:
+            while not self._stop_event.is_set():
                 try:
+                    if not sock.poll(timeout=100):
+                        continue
                     frames = sock.recv_multipart()
                     if len(frames) < 2:
                         logger.error(
@@ -998,6 +1021,20 @@ class KVCacheRecvingLayerThread(threading.Thread):
                     logger.error(
                         "Failed to decode message. type=%s, error=%s. context=decoding payload", type(e).__name__, e
                     )
+
+    def shutdown(self) -> None:
+        """Stop the side channel before releasing its final-KV aliases."""
+        self._stop_event.set()
+        if self.is_alive() and threading.current_thread() is not self:
+            self.join(timeout=MOONCAKE_THREAD_SHUTDOWN_TIMEOUT_SECONDS)
+        if self.is_alive():
+            raise RuntimeError(
+                "Mooncake sparse KV receiver did not stop before KV memory "
+                "teardown."
+            )
+        self.sparse_host_final_kv_caches = None
+        self.sparse_host_staging_kv = None
+        self.sparse_host_relay_kv = None
 
 
 class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
@@ -1142,6 +1179,10 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self):
         """MooncakeLayerwiseConnector does not save explicitly."""
         pass
+
+    def shutdown(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.shutdown()
 
 
 class MooncakeLayerwiseConnectorScheduler:
@@ -1987,6 +2028,22 @@ class MooncakeLayerwiseConnectorWorker:
         result = self._invalid_block_ids
         self._invalid_block_ids = set()
         return result
+
+    def shutdown(self) -> None:
+        """Stop background access before the model runner frees KV memory."""
+        if self.kv_send_layer_thread is not None:
+            self.kv_send_layer_thread.shutdown()
+            self.kv_send_layer_thread = None
+        if self.kv_recv_layer_thread is not None:
+            self.kv_recv_layer_thread.shutdown()
+            self.kv_recv_layer_thread = None
+
+        self.kv_caches.clear()
+        self.sparse_host_final_kv_caches = None
+        self.sparse_host_staging_kv = None
+        self.sparse_host_relay_kv = None
+        self.sparse_host_relay_storage = None
+        self.sparse_host_relay_owner = None
 
     # {(ip, port)]: {local_block_ids: [], remote_block_ids: {}}}
     def _get_kv_split_metadata(self, req_meta: ReqMeta, req_idx: int, req_id: str, group_idx: int):

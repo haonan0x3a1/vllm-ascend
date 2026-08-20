@@ -58,6 +58,17 @@ def test_preflight_clears_inherited_role_device_visibility():
     assert environment == {"KEEP_ME": "value"}
 
 
+def test_memfabric_same_host_ports_are_distinct_per_tp_role():
+    ports = POC_TOOLS.memfabric_bm_required_ports(
+        tp_size=2,
+        store_port_base=37200,
+        hcom_port_base=37400,
+    )
+
+    assert ports == (37200, 37201, 37400, 37401, 37404, 37405)
+    assert len(ports) == len(set(ports))
+
+
 def test_count_lifecycle_records_uses_specific_completion_events():
     request_id = "chatcmpl-test"
     prefill_log = "\n".join(
