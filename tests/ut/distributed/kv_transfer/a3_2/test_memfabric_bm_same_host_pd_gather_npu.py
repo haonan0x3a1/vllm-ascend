@@ -27,6 +27,12 @@ Full KV through a remote NPU allocation. HOST_RDMA can be selected as an
 additional same-host smoke, but it does not prove cross-host registration,
 RNIC traffic, remote visibility, or performance. Those remain G2b.
 
+The BM allocation explicitly enables SMEM_BM_FLAG_DRAM_MAP_HOST_VA. Without
+that create flag, MemFabric Hybrid 1.1.2 can report a non-zero LOCAL_HOST value
+for the VMM DRAM segment even though the address is not CPU-dereferenceable.
+The flag maps the Host VA and grants the local NPU read/write access to the same
+pages, which is the dual-view contract this gate is meant to prove.
+
 HOST_SHM is intentionally not offered here. MemFabric Hybrid 1.1.2 maps its
 DRAM pool into CPU processes, but that segment does not publish the
 LOCAL_DEVICE alias required by GatherSelectionKvCache.
@@ -83,6 +89,7 @@ PREFILL_RANK = 0
 DECODE_RANK = 1
 WORLD_SIZE = 2
 PROCESS_TERMINATE_GRACE_SECONDS = 5
+SMEM_BM_FLAG_DRAM_MAP_HOST_VA = 1 << 9
 
 
 def _find_loopback_store_url() -> str:
@@ -179,9 +186,33 @@ def _construct_workspace(
     return workspace, owners
 
 
-def _initialize_local_guard(*, local_host_va: int) -> None:
+def _assert_cpu_mapping(*, address: int, size: int) -> str:
+    """Return mapping permissions or fail before dereferencing a bad Host VA."""
+    end_address = address + size
+    for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines():
+        address_range, permissions, *_ = line.split(maxsplit=2)
+        start_text, end_text = address_range.split("-", maxsplit=1)
+        mapping_start = int(start_text, 16)
+        mapping_end = int(end_text, 16)
+        if mapping_start <= address and end_address <= mapping_end:
+            if "r" not in permissions or "w" not in permissions:
+                raise RuntimeError(
+                    "MemFabric BM LOCAL_HOST mapping is not CPU read/write: "
+                    f"address=0x{address:x}, size={size}, permissions={permissions}"
+                )
+            return permissions
+    raise RuntimeError(
+        "MemFabric BM LOCAL_HOST is not present in /proc/self/maps; "
+        "SMEM_BM_FLAG_DRAM_MAP_HOST_VA may be unsupported or ineffective: "
+        f"address=0x{address:x}, size={size}"
+    )
+
+
+def _initialize_local_guard(*, local_host_va: int) -> str:
     """Initialize BM-owned local Host pages without a BM transport copy."""
+    permissions = _assert_cpu_mapping(address=local_host_va, size=REQUIRED_POOL_BYTES)
     ctypes.memset(local_host_va, GUARD_SENTINEL, REQUIRED_POOL_BYTES)
+    return permissions
 
 
 def _read_local_bfloat16(
@@ -333,6 +364,9 @@ def _run_rank(args: argparse.Namespace) -> int:
         "memfabric_version": _distribution_version("memfabric_hybrid"),
         "torch_npu_version": getattr(torch_npu, "__version__", "unknown"),
         "scope": "same physical host; cross-host HOST_RDMA is not proven",
+        "bm_create_flags": {
+            "dram_map_host_va": SMEM_BM_FLAG_DRAM_MAP_HOST_VA,
+        },
     }
 
     try:
@@ -358,6 +392,7 @@ def _run_rank(args: argparse.Namespace) -> int:
             local_dram_size=args.pool_bytes,
             max_dram_size=args.pool_bytes,
             data_op_type=_protocol_value(bm, args.protocol),
+            flags=SMEM_BM_FLAG_DRAM_MAP_HOST_VA,
         )
         if handle is None:
             raise RuntimeError("MemFabric BM create2 returned None")
@@ -389,7 +424,9 @@ def _run_rank(args: argparse.Namespace) -> int:
             "local_device_va": hex(local_device_va),
         }
 
-        _initialize_local_guard(local_host_va=local_host_va)
+        result["local_host_mapping_permissions"] = _initialize_local_guard(
+            local_host_va=local_host_va,
+        )
         workspace, tensor_owners = _construct_workspace(
             torch,
             torch_npu,

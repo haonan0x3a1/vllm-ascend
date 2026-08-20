@@ -250,10 +250,18 @@ G2a 改为默认使用 `HOST_TCP`：它仍然传输 P/D 两份 BM Host allocatio
 
 第二次真实运行确认双 rank join、HCOM TCP 建链和 `LOCAL_HOST`/`LOCAL_DEVICE`
 双地址均成功，但 MemFabric 的本地 `H2G` 辅助初始化在 `HOST_TCP` 下返回
-`507899`。该动作只用于测试 guard 初始化，不属于目标数据路径。G2a 因此改为用
-`LOCAL_HOST` 直接初始化和校验本地 BM 页；核心 copy①仍由 P NPU staging 写入
-P `LOCAL_DEVICE` alias，copy②仍由 BM `G2G` 执行 P Host→D Host 传输，D 端仍由
-真实 Gather 读取 `LOCAL_DEVICE` alias。
+`507899`。第三次运行进一步确认：默认 `create2(flags=0)` 虽然返回非零且相等的
+`LOCAL_HOST`/`LOCAL_DEVICE`，但两端直接解引用 `LOCAL_HOST` 都在 `ctypes.memset`
+触发 SIGSEGV。由此可知“地址转换非零”不等于“CPU 可访问”，不能把默认 VMM
+地址误称为双视图 Host 内存。
+
+MemFabric Hybrid 1.1.2 源码提供 `SMEM_BM_FLAG_DRAM_MAP_HOST_VA (1 << 9)`：设置后
+DRAM allocation 映射 Host VA，并给本地 NPU 添加 READWRITE 权限。G2a 现在显式
+通过 `create2(flags=1 << 9)` 请求这个模式，并在 `ctypes` 读写前确认所需区间存在于
+`/proc/self/maps` 且可读写。核心 copy①仍由 P NPU staging 写入 P
+`LOCAL_DEVICE` alias，copy②仍由 BM `G2G` 执行 P Host→D Host 传输，D 端仍由
+真实 Gather 读取 `LOCAL_DEVICE` alias。只有该标志在当前 wheel/driver 上同时满足
+CPU Host view、NPU alias、G2G 和 Gather，才能判定目标双视图内存契约成立。
 
 确认两张空闲 NPU 后，例如使用物理 0 卡作为 P、物理 8 卡作为 D：
 
