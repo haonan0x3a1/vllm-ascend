@@ -162,7 +162,7 @@ Gather 直接读取普通 pinned Host Tensor。停止扩展 `host_relay`，保�
 
 ```text
 LOCAL_HOST VA
-└── MemFabric Host 数据操作使用
+└── 仅验证地址转换；Host 数据读写通过 BM H2G/G2H API
 
 LOCAL_DEVICE VA
 └── 构造 torch NPU Tensor alias，供 NPU copy 和 Gather 使用
@@ -193,6 +193,12 @@ pytest -sv \
 6. 非目标 block、tensor 间隔和前后 guard 未被修改；
 7. 所有 Tensor view 在 BM handle 释放前销毁，进程正常退出且不出现
    segfault/double free。
+
+MemFabric 1.1.2 的 DRAM segment 要求按 1 GiB 对齐，因此探针默认创建 1 GiB
+BM pool，但只初始化和检查 Full-KV 布局实际覆盖的区域。该版本返回的
+`LOCAL_HOST` VA 不应由 Python `ctypes` 直接解引用；这不是目标数据路径的必要
+条件，CPU 侧初始化与校验统一使用 BM `H2G/G2H`，而核心门槛仍是
+`LOCAL_DEVICE` alias 能否被 NPU copy 和真实 Gather 读取。
 
 只有输出包含：
 

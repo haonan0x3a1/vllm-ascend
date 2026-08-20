@@ -24,13 +24,16 @@ normal, evidence-rich pytest failure.
 The gate covers the local contracts needed before implementing a remote
 Host-to-Host connector:
 
-* one MemFabric BM DRAM allocation exposes LOCAL_HOST and LOCAL_DEVICE views;
+* one MemFabric BM DRAM allocation exposes a Host GVA plus LOCAL_HOST and
+  LOCAL_DEVICE address translations;
 * the LOCAL_DEVICE view can be wrapped as raw int8 torch NPU storage and
   reshaped like model_runner_v1.py;
 * SparseKVOffloadWorkspace.persist_updated_slots can perform copy 1 from an
   ordinary NPU staging cache into the Host-backed allocation;
 * a MemFabric H2G write to the same Host allocation is visible to the real
   GatherSelectionKvCache operator through the NPU Tensor alias;
+* CPU-side initialization and verification use MemFabric H2G/G2H instead of
+  directly dereferencing an externally managed LOCAL_HOST VA;
 * guard regions and teardown remain valid.
 
 This is G1 only.  It uses a single-rank SDMA BM pool and does not prove remote
@@ -40,7 +43,6 @@ HOST_RDMA, cross-host completion, or production stream ordering (G2).
 from __future__ import annotations
 
 import argparse
-import ctypes
 import gc
 import json
 import math
@@ -80,7 +82,7 @@ ROPE_OFFSET_BYTES = (
 REQUIRED_POOL_BYTES = (
     (ROPE_OFFSET_BYTES + ROPE_BYTES + POOL_ALIGNMENT_BYTES - 1) // POOL_ALIGNMENT_BYTES * POOL_ALIGNMENT_BYTES
 )
-DEFAULT_POOL_BYTES = 64 * 1024 * 1024
+DEFAULT_POOL_BYTES = 1024 * 1024 * 1024
 
 TOUCHED_BLOCKS = (2, 1)
 LOGICAL_BLOCK_START = {2: 0, 1: BLOCK_SIZE}
@@ -258,6 +260,31 @@ def _copy_global_to_cpu(
     return target
 
 
+def _initialize_guard_region(
+    torch_module,
+    bm_module,
+    handle,
+    *,
+    host_gva: int,
+):
+    source = torch_module.full(
+        (REQUIRED_POOL_BYTES,),
+        GUARD_SENTINEL,
+        dtype=torch_module.uint8,
+    )
+    result = handle.copy_data(
+        source.data_ptr(),
+        host_gva,
+        source.numel(),
+        _copy_type(bm_module, "H2G"),
+        0,
+    )
+    if result != 0:
+        raise RuntimeError(f"MemFabric BM guard H2G initialization failed: result={result}")
+    _wait_bm(handle)
+    return source
+
+
 def _verify_copy_one(
     torch_module,
     bm_module,
@@ -343,47 +370,58 @@ def _populate_via_memfabric_h2g(
     return owners
 
 
-def _guard_samples(host_va: int) -> dict[str, tuple[int, int]]:
+def _guard_samples(host_gva: int) -> dict[str, tuple[int, int]]:
     nope_block_bytes = NOPE_BYTES // NUM_BLOCKS
     rope_block_bytes = ROPE_BYTES // NUM_BLOCKS
     return {
-        "prefix": (host_va, GUARD_SAMPLE_BYTES),
+        "prefix": (host_gva, GUARD_SAMPLE_BYTES),
         "before_nope": (
-            host_va + NOPE_OFFSET_BYTES - GUARD_SAMPLE_BYTES,
+            host_gva + NOPE_OFFSET_BYTES - GUARD_SAMPLE_BYTES,
             GUARD_SAMPLE_BYTES,
         ),
         "between_nope_rope": (
-            host_va + NOPE_OFFSET_BYTES + NOPE_BYTES,
+            host_gva + NOPE_OFFSET_BYTES + NOPE_BYTES,
             GUARD_SAMPLE_BYTES,
         ),
         "nope_block_0": (
-            host_va + NOPE_OFFSET_BYTES,
+            host_gva + NOPE_OFFSET_BYTES,
             nope_block_bytes,
         ),
         "nope_block_3": (
-            host_va + NOPE_OFFSET_BYTES + 3 * nope_block_bytes,
+            host_gva + NOPE_OFFSET_BYTES + 3 * nope_block_bytes,
             nope_block_bytes,
         ),
         "rope_block_0": (
-            host_va + ROPE_OFFSET_BYTES,
+            host_gva + ROPE_OFFSET_BYTES,
             rope_block_bytes,
         ),
         "rope_block_3": (
-            host_va + ROPE_OFFSET_BYTES + 3 * rope_block_bytes,
+            host_gva + ROPE_OFFSET_BYTES + 3 * rope_block_bytes,
             rope_block_bytes,
         ),
         "suffix": (
-            host_va + ROPE_OFFSET_BYTES + ROPE_BYTES,
+            host_gva + ROPE_OFFSET_BYTES + ROPE_BYTES,
             GUARD_SAMPLE_BYTES,
         ),
     }
 
 
-def _verify_guards(host_va: int) -> dict[str, bool]:
-    return {
-        name: ctypes.string_at(address, size) == bytes([GUARD_SENTINEL]) * size
-        for name, (address, size) in _guard_samples(host_va).items()
-    }
+def _verify_guards(torch_module, bm_module, handle, *, host_gva: int) -> dict[str, bool]:
+    checks: dict[str, bool] = {}
+    for name, (address, size) in _guard_samples(host_gva).items():
+        target = torch_module.empty((size,), dtype=torch_module.uint8)
+        result = handle.copy_data(
+            address,
+            target.data_ptr(),
+            size,
+            _copy_type(bm_module, "G2H"),
+            0,
+        )
+        if result != 0:
+            raise RuntimeError(f"MemFabric BM guard G2H verification failed: name={name}, result={result}")
+        _wait_bm(handle)
+        checks[name] = bool(torch_module.all(target == GUARD_SENTINEL).item())
+    return checks
 
 
 def _gather_and_verify(
@@ -644,7 +682,12 @@ def _run_child(args: argparse.Namespace) -> int:
             "rope_device_alignment_mod": (device_va + ROPE_OFFSET_BYTES) % POOL_ALIGNMENT_BYTES,
         }
 
-        ctypes.memset(host_va, GUARD_SENTINEL, REQUIRED_POOL_BYTES)
+        owners["guard_source"] = _initialize_guard_region(
+            torch,
+            bm,
+            handle,
+            host_gva=host_gva,
+        )
 
         raw_nope = _construct_raw_npu_alias(
             torch,
@@ -763,7 +806,12 @@ def _run_child(args: argparse.Namespace) -> int:
             device=device,
             generation=host_generation,
         )
-        guard_checks = _verify_guards(host_va)
+        guard_checks = _verify_guards(
+            torch,
+            bm,
+            handle,
+            host_gva=host_gva,
+        )
         result["host_population"] = host_population_checks
         result["gather"] = gather_checks
         result["guards"] = guard_checks
@@ -824,7 +872,7 @@ def _run_child(args: argparse.Namespace) -> int:
 def test_memfabric_bm_dual_view_host_full_kv_gather_gate():
     module_name = "tests.ut.distributed.kv_transfer.a3_2.test_memfabric_bm_dual_view_gather_npu"
     completed = subprocess.run(
-        [sys.executable, "-m", module_name, "--child"],
+        [sys.executable, "-X", "faulthandler", "-m", module_name, "--child"],
         capture_output=True,
         text=True,
         timeout=PROCESS_TIMEOUT_SECONDS,
