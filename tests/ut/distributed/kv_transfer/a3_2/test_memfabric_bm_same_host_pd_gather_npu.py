@@ -21,10 +21,15 @@ physical NPU each. Rank 0 acts as Prefill and rank 1 acts as Decode:
 P NPU staging -> P BM Host allocation -> BM G2G -> D BM Host allocation
               -> D LOCAL_DEVICE alias -> real GatherSelectionKvCache
 
-The default HOST_SHM protocol validates the two-rank BM data and completion
-semantics available on a single physical server. HOST_RDMA can be selected as
-an additional same-host smoke, but it does not prove cross-host registration,
+The default HOST_TCP protocol validates the two-rank BM Host transport and
+completion semantics available on a single physical server without routing the
+Full KV through a remote NPU allocation. HOST_RDMA can be selected as an
+additional same-host smoke, but it does not prove cross-host registration,
 RNIC traffic, remote visibility, or performance. Those remain G2b.
+
+HOST_SHM is intentionally not offered here. MemFabric Hybrid 1.1.2 maps its
+DRAM pool into CPU processes, but that segment does not publish the
+LOCAL_DEVICE alias required by GatherSelectionKvCache.
 """
 
 from __future__ import annotations
@@ -63,7 +68,6 @@ from tests.ut.distributed.kv_transfer.a3_2.test_memfabric_bm_dual_view_gather_np
     _reshape_raw_cache,
     _verify_copy_one,
     _verify_guards,
-    _wait_bm,
 )
 
 MODULE_NAME = "tests.ut.distributed.kv_transfer.a3_2.test_memfabric_bm_same_host_pd_gather_npu"
@@ -102,7 +106,7 @@ def _wait_json(path: Path, timeout_seconds: int) -> dict[str, Any]:
 
 def _protocol_value(bm_module, name: str):
     values = {
-        "host_shm": bm_module.BmDataOpType.HOST_SHM,
+        "host_tcp": bm_module.BmDataOpType.HOST_TCP,
         "host_rdma": bm_module.BmDataOpType.HOST_RDMA,
     }
     return values[name]
@@ -203,7 +207,6 @@ def _copy_touched_blocks_g2g(
                     "bytes": block_bytes,
                 }
             )
-    _wait_bm(handle)
     return copies
 
 
@@ -230,6 +233,8 @@ def _run_rank(args: argparse.Namespace) -> int:
     peer_rank = DECODE_RANK if rank == PREFILL_RANK else PREFILL_RANK
     own_ready = sync_dir / f"rank-{rank}.ready.json"
     peer_ready = sync_dir / f"rank-{peer_rank}.ready.json"
+    own_joined = sync_dir / f"rank-{rank}.joined.json"
+    peer_joined = sync_dir / f"rank-{peer_rank}.joined.json"
     transfer_done = sync_dir / "transfer.done.json"
     decode_result_path = sync_dir / "decode.result.json"
     prefill_ack = sync_dir / "prefill.ack.json"
@@ -271,7 +276,7 @@ def _run_rank(args: argparse.Namespace) -> int:
         config.rank_id = rank
         config.start_store = rank == PREFILL_RANK
         config.unified_address_space = True
-        if args.protocol == "host_rdma":
+        if args.protocol in ("host_tcp", "host_rdma"):
             config.set_nic(f"tcp://{args.nic_ip}:{args.nic_port_base + rank}")
         bm_result = bm.initialize(args.store_url, WORLD_SIZE, 0, config)
         if bm_result != 0:
@@ -292,6 +297,14 @@ def _run_rank(args: argparse.Namespace) -> int:
         joined = True
 
         local_gva = handle.peer_rank_ptr(rank, bm.BmMemType.HOST)
+        if not local_gva:
+            raise RuntimeError("MemFabric BM did not expose the local Host GVA")
+        _write_json(
+            own_joined,
+            {"rank": rank, "role": role, "local_gva": local_gva, "status": "joined"},
+        )
+        _wait_json(peer_joined, args.timeout_seconds)
+
         local_host_va = handle.gva_to_va(local_gva, bm.BmMemType.LOCAL_HOST)
         local_device_va = handle.gva_to_va(local_gva, bm.BmMemType.LOCAL_DEVICE)
         if not local_gva or not local_host_va or not local_device_va:
@@ -562,7 +575,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--child-rank", type=int, choices=(0, 1))
     parser.add_argument("--sync-dir")
     parser.add_argument("--store-url")
-    parser.add_argument("--protocol", choices=("host_shm", "host_rdma"), default="host_shm")
+    parser.add_argument("--protocol", choices=("host_tcp", "host_rdma"), default="host_tcp")
     parser.add_argument("--prefill-physical-device", type=int, default=0)
     parser.add_argument("--decode-physical-device", type=int, default=8)
     parser.add_argument("--pool-bytes", type=int, default=DEFAULT_POOL_BYTES)

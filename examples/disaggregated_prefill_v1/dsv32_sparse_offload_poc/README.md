@@ -237,17 +237,30 @@ P BM Host Full KV
 - G2b：未来两台物理 Host 上使用相同数据契约和 `HOST_RDMA`，补测 RNIC、远端
   注册、跨机可见性、fence 和性能。
 
-G2a 默认使用适合同机语义的 `HOST_SHM`。确认两张空闲 NPU 后，例如使用物理
-0 卡作为 P、物理 8 卡作为 D：
+第一次真实运行已经确认 `HOST_SHM` 不适合作为这个门槛：它能在 `/dev/shm`
+建立 CPU 共享映射，但 MemFabric Hybrid 1.1.2 没有为该 segment 发布
+`LOCAL_DEVICE` alias，因此两个 rank 的 `gva_to_va(..., LOCAL_DEVICE)` 都返回 0，
+程序在 copy①、G2G 和 Gather 之前停止。这是协议与 Gather 内存契约不兼容，
+不是 NPU 占用或 `/dev/hugepages` 回退导致的失败。
+
+G2a 改为默认使用 `HOST_TCP`：它仍然传输 P/D 两份 BM Host allocation，且复用
+与 `HOST_RDMA` 相同的双视图 DRAM allocator；区别仅是同机功能门槛先走 TCP，
+不把它表述为 RDMA 性能结果。测试还会先等待两个 rank 都完成 `join()`，再检查
+地址和开始数据阶段，避免先启动的 rank 只看到自己的 group snapshot。
+
+确认两张空闲 NPU 后，例如使用物理 0 卡作为 P、物理 8 卡作为 D：
 
 ```bash
 cd /workspace/w50062541/code/vllm-ascend
+
+export MF_LIB_DIR=/usr/local/python3.11.10/lib/python3.11/site-packages/memfabric_hybrid/lib
+export LD_LIBRARY_PATH="${MF_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 
 python -X faulthandler -m \
   tests.ut.distributed.kv_transfer.a3_2.test_memfabric_bm_same_host_pd_gather_npu \
   --prefill-physical-device 0 \
   --decode-physical-device 8 \
-  --protocol host_shm
+  --protocol host_tcp
 ```
 
 只有输出包含以下内容才判定 G2a 为 Go：
@@ -256,9 +269,8 @@ python -X faulthandler -m \
 MemFabric BM same-host P -> D Host Full-KV -> Gather G2a PASSED
 ```
 
-也可以把协议切成 `host_rdma` 做同机 HCOM 兼容性 smoke；运行前需要把 wheel
-内的 `memfabric_hybrid/lib` 加入 `LD_LIBRARY_PATH`。即使该 smoke 通过，也不能
-替代 G2b 的真实跨机 `HOST_RDMA` 验收。
+`HOST_TCP` 通过后，也可以把协议切成 `host_rdma` 做同机 HCOM 兼容性 smoke。
+即使该 smoke 通过，也不能替代 G2b 的真实跨机 `HOST_RDMA` 验收。
 
 ## 选择生产传输路径
 
