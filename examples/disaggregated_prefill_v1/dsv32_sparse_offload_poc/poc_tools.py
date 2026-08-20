@@ -192,6 +192,14 @@ def memfabric_bm_required_ports(
     return (*store_ports, *hcom_ports)
 
 
+def resolve_memfabric_bm_api(memfabric_hybrid: ModuleType) -> object:
+    """Resolve the BM API exported by memfabric_hybrid 1.1.x."""
+    memfabric_bm = getattr(memfabric_hybrid, "bm", None)
+    if memfabric_bm is None:
+        raise ImportError("memfabric_hybrid does not export the bm API")
+    return memfabric_bm
+
+
 def preflight(args: argparse.Namespace) -> int:
     errors: list[str] = []
     prefill_devices = parse_devices(args.prefill_devices)
@@ -269,7 +277,7 @@ def preflight(args: argparse.Namespace) -> int:
             errors.append("torch.ops.custom.npu_swiglu_clip_quant is unavailable.")
         if args.transfer_mode == "memfabric_bm":
             memfabric_hybrid = import_module("memfabric_hybrid")
-            memfabric_bm = import_module("memfabric_hybrid.bm")
+            memfabric_bm = resolve_memfabric_bm_api(memfabric_hybrid)
             if not hasattr(memfabric_hybrid, "initialize"):
                 errors.append("memfabric_hybrid.initialize is unavailable.")
             if not hasattr(memfabric_bm, "create2"):

@@ -69,6 +69,14 @@ def test_memfabric_same_host_ports_are_distinct_per_tp_role():
     assert len(ports) == len(set(ports))
 
 
+def test_memfabric_bm_api_is_resolved_from_package_export():
+    package = ModuleType("memfabric_hybrid")
+    bm_api = ModuleType("bm")
+    setattr(package, "bm", bm_api)
+
+    assert POC_TOOLS.resolve_memfabric_bm_api(package) is bm_api
+
+
 def test_count_lifecycle_records_uses_specific_completion_events():
     request_id = "chatcmpl-test"
     prefill_log = "\n".join(
