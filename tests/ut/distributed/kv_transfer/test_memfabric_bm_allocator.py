@@ -286,7 +286,7 @@ def test_store_owner_waits_for_peer_stage_without_querying_bm(monkeypatch) -> No
         port=allocator.config.create_rendezvous_port,
     )
 
-    assert ("bind", ("172.16.0.146", 37414)) in listener_calls
+    assert ("bind", ("172.16.0.146", 22314)) in listener_calls
     assert connection.sent == [MEMFABRIC_BM_ACK]
 
 
@@ -310,5 +310,5 @@ def test_non_store_rank_announces_stage_and_waits_for_ack(monkeypatch) -> None:
         port=allocator.config.create_rendezvous_port,
     )
 
-    assert connect_calls[0][0] == ("172.16.0.146", 37414)
+    assert connect_calls[0][0] == ("172.16.0.146", 22314)
     assert connection.sent == [allocator._ready_message("created", 1)]
