@@ -227,6 +227,39 @@ P BM Host Full KV
 → D Gather
 ```
 
+## MemFabric BM 同机双进程 G2a
+
+当前开发环境是一台 16-NPU 服务器，Prefill/Decode 只是用不同 NPU 和独立进程
+模拟分离，因此不能宣称跨机 `HOST_RDMA` 已验证。G2 拆成两个门槛：
+
+- G2a：同一物理 Host 上的双进程、双 NPU、两份 BM Host allocation；验证
+  P copy①、BM `G2G`、完成通知以及 D `LOCAL_DEVICE` alias 的真实 Gather；
+- G2b：未来两台物理 Host 上使用相同数据契约和 `HOST_RDMA`，补测 RNIC、远端
+  注册、跨机可见性、fence 和性能。
+
+G2a 默认使用适合同机语义的 `HOST_SHM`。确认两张空闲 NPU 后，例如使用物理
+0 卡作为 P、物理 8 卡作为 D：
+
+```bash
+cd /workspace/w50062541/code/vllm-ascend
+
+python -X faulthandler -m \
+  tests.ut.distributed.kv_transfer.a3_2.test_memfabric_bm_same_host_pd_gather_npu \
+  --prefill-physical-device 0 \
+  --decode-physical-device 8 \
+  --protocol host_shm
+```
+
+只有输出包含以下内容才判定 G2a 为 Go：
+
+```text
+MemFabric BM same-host P -> D Host Full-KV -> Gather G2a PASSED
+```
+
+也可以把协议切成 `host_rdma` 做同机 HCOM 兼容性 smoke；运行前需要把 wheel
+内的 `memfabric_hybrid/lib` 加入 `LD_LIBRARY_PATH`。即使该 smoke 通过，也不能
+替代 G2b 的真实跨机 `HOST_RDMA` 验收。
+
 ## 选择生产传输路径
 
 `config.env` 中的 `SPARSE_KV_TRANSFER_MODE` 控制 Full KV 的逐层 P/D 路径：
