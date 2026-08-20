@@ -34,9 +34,9 @@ def _runtime_config(role: str, *, tp_rank: int = 3, **overrides):
     raw = {
         "protocol": "host_tcp",
         "store_host": "172.16.0.146",
-        "store_port_base": 37200,
+        "store_port_base": 22200,
         "nic_ip": "172.16.0.146",
-        "hcom_port_base": 37400,
+        "hcom_port_base": 22300,
         "pool_bytes": MEMFABRIC_BM_DRAM_ALIGNMENT_BYTES,
         "bm_id": 74,
         "start_store_role": "kv_consumer",
@@ -71,18 +71,18 @@ def test_same_host_tp_pair_uses_store_rank_and_one_hcom_base() -> None:
 
     assert producer.rank_id == 1
     assert consumer.rank_id == 0
-    assert producer.store_url == consumer.store_url == "tcp://172.16.0.146:37203"
-    assert producer.nic_url == "tcp://172.16.0.146:37412"
-    assert consumer.nic_url == "tcp://172.16.0.146:37412"
+    assert producer.store_url == consumer.store_url == "tcp://172.16.0.146:22203"
+    assert producer.nic_url == "tcp://172.16.0.146:22312"
+    assert consumer.nic_url == "tcp://172.16.0.146:22312"
     assert (
         producer.create_rendezvous_port
         == consumer.create_rendezvous_port
-        == 37414
+        == 22314
     )
     assert (
         producer.join_rendezvous_port
         == consumer.join_rendezvous_port
-        == 37415
+        == 22315
     )
     assert not producer.starts_store
     assert consumer.starts_store

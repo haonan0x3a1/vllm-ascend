@@ -132,9 +132,9 @@ class MemFabricBMRuntimeConfig:
         config = cls(
             protocol=str(raw.get("protocol", "host_tcp")),
             store_host=str(raw.get("store_host", "")),
-            store_port_base=int(raw.get("store_port_base", 37200)),
+            store_port_base=int(raw.get("store_port_base", 22200)),
             nic_ip=str(raw.get("nic_ip", "")),
-            hcom_port_base=int(raw.get("hcom_port_base", 37400)),
+            hcom_port_base=int(raw.get("hcom_port_base", 22300)),
             pool_bytes=int(raw.get("pool_bytes", MEMFABRIC_BM_DRAM_ALIGNMENT_BYTES)),
             bm_id=int(raw.get("bm_id", 74)),
             start_store_role=str(raw.get("start_store_role", "kv_consumer")),

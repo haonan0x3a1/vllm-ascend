@@ -54,6 +54,9 @@ RUNTIME_IMPORT_ORDER = (
     "vllm_ascend",
 )
 DEVICE_VISIBILITY_ENV = "ASCEND_RT_VISIBLE_DEVICES"
+LINUX_EPHEMERAL_PORT_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
+LINUX_RESERVED_PORTS = Path("/proc/sys/net/ipv4/ip_local_reserved_ports")
+MAX_TCP_PORT = 65535
 
 
 @dataclass(frozen=True)
@@ -122,6 +125,42 @@ def can_bind(port: int) -> tuple[bool, str | None]:
     finally:
         sock.close()
     return True, None
+
+
+def parse_port_range(value: str) -> tuple[int, int]:
+    fields = value.split()
+    if len(fields) != 2:
+        raise ValueError(f"Expected two port-range bounds, got: {value!r}")
+    start, end = (int(field) for field in fields)
+    if not 0 < start <= end <= MAX_TCP_PORT:
+        raise ValueError(f"Invalid TCP port range: {value!r}")
+    return start, end
+
+
+def parse_reserved_port_ranges(value: str) -> tuple[tuple[int, int], ...]:
+    ranges = []
+    for item in (item.strip() for item in value.split(",")):
+        if not item:
+            continue
+        bounds = item.split("-", maxsplit=1)
+        ranges.append(parse_port_range(" ".join((bounds[0], bounds[-1]))))
+    return tuple(ranges)
+
+
+def find_unreserved_ephemeral_ports(
+    ports: list[int],
+    ephemeral_range: tuple[int, int],
+    reserved_ranges: tuple[tuple[int, int], ...],
+) -> list[int]:
+    ephemeral_start, ephemeral_end = ephemeral_range
+    return sorted(
+        {
+            port
+            for port in ports
+            if ephemeral_start <= port <= ephemeral_end
+            and not any(start <= port <= end for start, end in reserved_ranges)
+        }
+    )
 
 
 def count_lifecycle_records(
@@ -310,6 +349,31 @@ def preflight(args: argparse.Namespace) -> int:
                 args.memfabric_bm_hcom_port_base,
             )
         )
+    try:
+        ephemeral_range = parse_port_range(
+            LINUX_EPHEMERAL_PORT_RANGE.read_text(encoding="utf-8")
+        )
+        reserved_ranges = parse_reserved_port_ranges(
+            LINUX_RESERVED_PORTS.read_text(encoding="utf-8")
+        )
+        unsafe_ports = find_unreserved_ephemeral_ports(
+            required_ports,
+            ephemeral_range,
+            reserved_ranges,
+        )
+        print(
+            "Linux ephemeral TCP port range: "
+            f"{ephemeral_range[0]}-{ephemeral_range[1]}"
+        )
+        if unsafe_ports:
+            errors.append(
+                "Fixed application/control ports overlap the unreserved Linux "
+                f"ephemeral range {ephemeral_range[0]}-{ephemeral_range[1]}: "
+                f"{unsafe_ports}. Choose ports outside that range or reserve "
+                "them with net.ipv4.ip_local_reserved_ports."
+            )
+    except (OSError, ValueError) as exc:
+        errors.append(f"Could not validate the Linux ephemeral TCP port policy: {exc}")
     for port in required_ports:
         free, reason = can_bind(port)
         print(f"  {port}: {'FREE' if free else f'BUSY ({reason})'}")

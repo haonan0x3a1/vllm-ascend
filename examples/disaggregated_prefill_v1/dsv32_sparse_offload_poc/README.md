@@ -33,6 +33,12 @@ cp --update=none config.example.env config.env
 KV 控制端口基址。共享服务器上的端口和 NPU 所有权是动态状态，
 不能写死为“永远可用”。
 
+所有固定 listener 端口必须位于 `/proc/sys/net/ipv4/ip_local_port_range`
+之外，或显式加入 `net.ipv4.ip_local_reserved_ports`。否则 Mooncake/MemFabric
+启动期间的出站 TCP 连接可能先随机占用这些端口，造成 preflight 时空闲、随后
+ZMQ/HCOM bind 随机失败。示例默认使用 22000–22331，并避开 NPU 0–15 的
+Mooncake ADXL 20000–21599 端口段。
+
 ## 每次启动
 
 先确保 Prefill、Decode 和 Proxy 均未运行，然后执行：

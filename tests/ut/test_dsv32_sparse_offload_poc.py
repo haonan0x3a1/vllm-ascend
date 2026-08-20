@@ -86,24 +86,37 @@ def test_port_probe_matches_runtime_socket_reuse(monkeypatch):
     ]
 
 
+def test_unreserved_ephemeral_ports_are_rejected():
+    assert POC_TOOLS.parse_port_range("32768 60999\n") == (32768, 60999)
+    assert POC_TOOLS.parse_reserved_port_ranges("36000-36007, 37400") == (
+        (36000, 36007),
+        (37400, 37400),
+    )
+    assert POC_TOOLS.find_unreserved_ephemeral_ports(
+        [18000, 36000, 36007, 36401, 37400, 61000],
+        (32768, 60999),
+        ((36000, 36007), (37400, 37400)),
+    ) == [36401]
+
+
 def test_memfabric_same_host_ports_are_distinct_per_tp_role():
     ports = POC_TOOLS.memfabric_bm_required_ports(
         tp_size=2,
-        store_port_base=37200,
-        hcom_port_base=37400,
+        store_port_base=22200,
+        hcom_port_base=22300,
     )
 
     assert ports == (
-        37200,
-        37201,
-        37400,
-        37401,
-        37404,
-        37405,
-        37402,
-        37403,
-        37406,
-        37407,
+        22200,
+        22201,
+        22300,
+        22301,
+        22304,
+        22305,
+        22302,
+        22303,
+        22306,
+        22307,
     )
     assert len(ports) == len(set(ports))
 
