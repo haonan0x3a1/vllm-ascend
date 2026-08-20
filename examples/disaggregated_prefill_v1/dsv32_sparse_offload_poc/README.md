@@ -248,6 +248,13 @@ G2a 改为默认使用 `HOST_TCP`：它仍然传输 P/D 两份 BM Host allocatio
 不把它表述为 RDMA 性能结果。测试还会先等待两个 rank 都完成 `join()`，再检查
 地址和开始数据阶段，避免先启动的 rank 只看到自己的 group snapshot。
 
+第二次真实运行确认双 rank join、HCOM TCP 建链和 `LOCAL_HOST`/`LOCAL_DEVICE`
+双地址均成功，但 MemFabric 的本地 `H2G` 辅助初始化在 `HOST_TCP` 下返回
+`507899`。该动作只用于测试 guard 初始化，不属于目标数据路径。G2a 因此改为用
+`LOCAL_HOST` 直接初始化和校验本地 BM 页；核心 copy①仍由 P NPU staging 写入
+P `LOCAL_DEVICE` alias，copy②仍由 BM `G2G` 执行 P Host→D Host 传输，D 端仍由
+真实 Gather 读取 `LOCAL_DEVICE` alias。
+
 确认两张空闲 NPU 后，例如使用物理 0 卡作为 P、物理 8 卡作为 D：
 
 ```bash

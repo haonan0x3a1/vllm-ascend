@@ -35,8 +35,10 @@ LOCAL_DEVICE alias required by GatherSelectionKvCache.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import gc
 import json
+import math
 import os
 import socket
 import subprocess
@@ -51,23 +53,25 @@ from tests.ut.distributed.kv_transfer.a3_2.test_memfabric_bm_dual_view_gather_np
     DEFAULT_POOL_BYTES,
     FULL_NOPE_SHAPE,
     FULL_ROPE_SHAPE,
+    GUARD_SENTINEL,
     INDEX_TOPK,
+    KV_LORA_RANK,
     NOPE_BYTES,
     NOPE_OFFSET_BYTES,
     NUM_BLOCKS,
     REQUIRED_POOL_BYTES,
     ROPE_BYTES,
+    ROPE_HEAD_DIM,
     ROPE_OFFSET_BYTES,
     TOUCHED_BLOCKS,
     _construct_raw_npu_alias,
     _distribution_version,
+    _expected_block,
     _fill_npu_staging,
     _gather_and_verify,
-    _initialize_guard_region,
+    _guard_samples,
     _physical_slots,
     _reshape_raw_cache,
-    _verify_copy_one,
-    _verify_guards,
 )
 
 MODULE_NAME = "tests.ut.distributed.kv_transfer.a3_2.test_memfabric_bm_same_host_pd_gather_npu"
@@ -173,6 +177,72 @@ def _construct_workspace(
         "workspace": workspace,
     }
     return workspace, owners
+
+
+def _initialize_local_guard(*, local_host_va: int) -> None:
+    """Initialize BM-owned local Host pages without a BM transport copy."""
+    ctypes.memset(local_host_va, GUARD_SENTINEL, REQUIRED_POOL_BYTES)
+
+
+def _read_local_bfloat16(
+    torch_module,
+    *,
+    local_host_va: int,
+    offset: int,
+    shape: tuple[int, ...],
+):
+    nbytes = math.prod(shape) * torch_module.empty((), dtype=torch_module.bfloat16).element_size()
+    payload = bytearray(ctypes.string_at(local_host_va + offset, nbytes))
+    return torch_module.frombuffer(payload, dtype=torch_module.bfloat16).clone().reshape(shape)
+
+
+def _verify_local_payload(
+    torch_module,
+    *,
+    local_host_va: int,
+    generation: int,
+) -> dict[str, bool]:
+    checks: dict[str, bool] = {}
+    for block_id in TOUCHED_BLOCKS:
+        nope_offset = NOPE_OFFSET_BYTES + block_id * NOPE_BYTES // NUM_BLOCKS
+        rope_offset = ROPE_OFFSET_BYTES + block_id * ROPE_BYTES // NUM_BLOCKS
+        actual_nope = _read_local_bfloat16(
+            torch_module,
+            local_host_va=local_host_va,
+            offset=nope_offset,
+            shape=(BLOCK_SIZE, 1, KV_LORA_RANK),
+        )
+        actual_rope = _read_local_bfloat16(
+            torch_module,
+            local_host_va=local_host_va,
+            offset=rope_offset,
+            shape=(BLOCK_SIZE, 1, ROPE_HEAD_DIM),
+        )
+        expected_nope = _expected_block(
+            torch_module,
+            block_id=block_id,
+            width=KV_LORA_RANK,
+            rope=False,
+            generation=generation,
+        )
+        expected_rope = _expected_block(
+            torch_module,
+            block_id=block_id,
+            width=ROPE_HEAD_DIM,
+            rope=True,
+            generation=generation,
+        )
+        checks[f"nope_block_{block_id}"] = bool(torch_module.equal(actual_nope, expected_nope))
+        checks[f"rope_block_{block_id}"] = bool(torch_module.equal(actual_rope, expected_rope))
+    return checks
+
+
+def _verify_local_guards(*, local_host_va: int, local_gva: int) -> dict[str, bool]:
+    checks: dict[str, bool] = {}
+    for name, (gva, size) in _guard_samples(local_gva).items():
+        payload = ctypes.string_at(local_host_va + gva - local_gva, size)
+        checks[name] = payload == bytes((GUARD_SENTINEL,)) * size
+    return checks
 
 
 def _copy_touched_blocks_g2g(
@@ -319,12 +389,7 @@ def _run_rank(args: argparse.Namespace) -> int:
             "local_device_va": hex(local_device_va),
         }
 
-        owners["guard_source"] = _initialize_guard_region(
-            torch,
-            bm,
-            handle,
-            host_gva=local_gva,
-        )
+        _initialize_local_guard(local_host_va=local_host_va)
         workspace, tensor_owners = _construct_workspace(
             torch,
             torch_npu,
@@ -351,11 +416,9 @@ def _run_rank(args: argparse.Namespace) -> int:
                 num_actual_tokens=2 * BLOCK_SIZE,
             )
             torch.npu.synchronize()
-            copy_one_checks = _verify_copy_one(
+            copy_one_checks = _verify_local_payload(
                 torch,
-                bm,
-                handle,
-                host_gva=local_gva,
+                local_host_va=local_host_va,
                 generation=TRANSFER_GENERATION,
             )
             if set(updated_blocks) != set(TOUCHED_BLOCKS) or not all(copy_one_checks.values()):
@@ -393,18 +456,14 @@ def _run_rank(args: argparse.Namespace) -> int:
                 device=device,
                 generation=int(transfer["generation"]),
             )
-            host_checks = _verify_copy_one(
+            host_checks = _verify_local_payload(
                 torch,
-                bm,
-                handle,
-                host_gva=local_gva,
+                local_host_va=local_host_va,
                 generation=int(transfer["generation"]),
             )
-            guard_checks = _verify_guards(
-                torch,
-                bm,
-                handle,
-                host_gva=local_gva,
+            guard_checks = _verify_local_guards(
+                local_host_va=local_host_va,
+                local_gva=local_gva,
             )
             result["gather"] = gather_checks
             result["host_payload"] = host_checks
