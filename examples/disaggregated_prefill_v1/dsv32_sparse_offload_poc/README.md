@@ -431,6 +431,9 @@ NPU 状态和传输生命周期归档到 `OUTPUT_DIR` 下的带时间戳目录�
 
 通过后，在 Proxy、Prefill、Decode 三个服务终端依次按 `Ctrl+C`。不要在共享服务器
 使用会影响同事 Ray/Python 进程的宽泛 `pkill`。
+`run.sh` 使用 `tee -i` 让日志采集进程忽略终端的 `SIGINT`；服务进程完成 worker
+shutdown 并关闭输出管道后，`tee` 才退出，因此 allocator 的最终释放日志不会在
+按下 `Ctrl+C` 时被截断。
 `memfabric_bm` 还必须在 P/D 日志中分别看到 8 条
 `Released MemFabric BM Full-KV allocator`，且进程正常返回、没有 segfault 或
 double free，才算 allocator 生命周期完整通过。M2 首个真实请求还必须分别看到

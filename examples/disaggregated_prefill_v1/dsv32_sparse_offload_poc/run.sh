@@ -300,7 +300,7 @@ serve_role() {
         --enforce-eager \
         --additional-config "$additional_config" \
         --kv-transfer-config "$kv_transfer_config" \
-        2>&1 | tee "$log_file"
+        2>&1 | tee -i "$log_file"
 }
 
 ready() {
@@ -406,7 +406,7 @@ case "$ACTION" in
             --prefiller-ports "$PREFILL_API_PORT" \
             --decoder-hosts "$HOST_IP" \
             --decoder-ports "$DECODE_API_PORT" \
-            2>&1 | tee "$PROXY_LOG"
+            2>&1 | tee -i "$PROXY_LOG"
         ;;
     ready)
         ready "${2:-}"

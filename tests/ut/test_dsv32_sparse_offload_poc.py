@@ -26,11 +26,19 @@ MODULE_PATH = (
     / "dsv32_sparse_offload_poc"
     / "poc_tools.py"
 )
+RUN_SCRIPT_PATH = MODULE_PATH.with_name("run.sh")
 SPEC = importlib.util.spec_from_file_location("dsv32_sparse_offload_poc_tools", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 POC_TOOLS = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = POC_TOOLS
 SPEC.loader.exec_module(POC_TOOLS)
+
+
+def test_service_log_capture_ignores_sigint_until_cleanup_finishes():
+    run_script = RUN_SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert '2>&1 | tee -i "$log_file"' in run_script
+    assert '2>&1 | tee -i "$PROXY_LOG"' in run_script
 
 
 def test_runtime_modules_load_torch_before_custom_extensions():
