@@ -36,6 +36,7 @@ Commands:
   proxy                 Start the P/D proxy in the foreground.
   ready <role>          Check decode, prefill, or proxy readiness.
   validate              Run the final below/above-Top-K request suite.
+  verify-shutdown       Verify every MemFabric BM worker released its allocator.
   collect               Archive logs, results, revisions, and checksums.
   help                  Show this help.
 
@@ -422,6 +423,16 @@ case "$ACTION" in
             --prefill-log "$PREFILL_LOG" \
             --decode-log "$DECODE_LOG" \
             --proxy-log "$PROXY_LOG"
+        ;;
+    verify-shutdown)
+        if [[ "$SPARSE_KV_TRANSFER_MODE" != "memfabric_bm" ]]; then
+            echo "verify-shutdown requires SPARSE_KV_TRANSFER_MODE=memfabric_bm" >&2
+            exit 1
+        fi
+        "$MOONCAKE_PYTHON" "$SCRIPT_DIR/poc_tools.py" verify-shutdown \
+            --tp-size "$TP_SIZE" \
+            --prefill-log "$PREFILL_LOG" \
+            --decode-log "$DECODE_LOG"
         ;;
     collect)
         "$MOONCAKE_PYTHON" "$SCRIPT_DIR/poc_tools.py" collect \

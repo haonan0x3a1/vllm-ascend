@@ -158,6 +158,79 @@ def test_count_lifecycle_records_uses_specific_completion_events():
     assert POC_TOOLS.count_lifecycle_records(request_id, prefill_log, decode_log) == (8, 8)
 
 
+def test_memfabric_runtime_markers_require_every_tp_worker():
+    tp_size = 2
+    prefill_log = "\n".join(
+        (
+            *(POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_INIT_MARKER for _ in range(tp_size)),
+            *(POC_TOOLS.MEMFABRIC_BM_DATA_PLANE_MARKER for _ in range(tp_size)),
+        )
+    )
+    decode_log = "\n".join(
+        (
+            *(POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_INIT_MARKER for _ in range(tp_size)),
+            *(POC_TOOLS.MEMFABRIC_BM_VISIBILITY_FENCE_MARKER for _ in range(tp_size)),
+        )
+    )
+
+    assert POC_TOOLS.require_memfabric_bm_runtime_markers(prefill_log, decode_log, tp_size) == {
+        "prefill_allocators": 2,
+        "decode_allocators": 2,
+        "prefill_data_plane": 2,
+        "decode_visibility_fence": 2,
+    }
+
+
+def test_memfabric_runtime_markers_reject_a_silent_data_plane_fallback():
+    tp_size = 2
+    prefill_log = "\n".join(
+        POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_INIT_MARKER for _ in range(tp_size)
+    )
+    decode_log = "\n".join(
+        (
+            *(POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_INIT_MARKER for _ in range(tp_size)),
+            *(POC_TOOLS.MEMFABRIC_BM_VISIBILITY_FENCE_MARKER for _ in range(tp_size)),
+        )
+    )
+
+    try:
+        POC_TOOLS.require_memfabric_bm_runtime_markers(prefill_log, decode_log, tp_size)
+    except RuntimeError as exc:
+        assert "prefill_data_plane" in str(exc)
+    else:
+        raise AssertionError("missing BM data-plane markers must fail validation")
+
+
+def test_memfabric_shutdown_markers_require_every_tp_worker():
+    tp_size = 2
+    prefill_log = "\n".join(
+        POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER for _ in range(tp_size)
+    )
+    decode_log = "\n".join(
+        POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER for _ in range(tp_size)
+    )
+
+    assert POC_TOOLS.require_memfabric_bm_shutdown_markers(prefill_log, decode_log, tp_size) == {
+        "prefill_releases": 2,
+        "decode_releases": 2,
+    }
+
+
+def test_memfabric_shutdown_markers_reject_a_missing_worker_release():
+    tp_size = 2
+    prefill_log = POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER
+    decode_log = "\n".join(
+        POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER for _ in range(tp_size)
+    )
+
+    try:
+        POC_TOOLS.require_memfabric_bm_shutdown_markers(prefill_log, decode_log, tp_size)
+    except RuntimeError as exc:
+        assert "prefill_releases" in str(exc)
+    else:
+        raise AssertionError("missing allocator release markers must fail validation")
+
+
 def test_find_fatal_lines_ignores_unrelated_warnings():
     matches = POC_TOOLS.find_fatal_lines(
         (

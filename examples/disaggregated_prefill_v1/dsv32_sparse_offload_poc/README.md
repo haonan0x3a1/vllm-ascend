@@ -292,10 +292,8 @@ python -X faulthandler -m \
 MemFabric BM same-host P -> D Host Full-KV -> Gather G2a PASSED
 ```
 
-当前服务器已在 MemFabric Hybrid 1.1.2、物理 NPU 0/8、`HOST_TCP` 下通过以 P
-启动 config store 的原始 G2a。M2 在真实模型前还要用上面的
-`--start-store-role decode` 重跑一次，使 BM rank/store ownership 与 `run.sh`
-一致。
+当前服务器已在 MemFabric Hybrid 1.1.2、物理 NPU 0/8、`HOST_TCP` 下通过
+`--start-store-role decode` 的 G2a，使 BM rank/store ownership 与 `run.sh` 一致。
 结果确认 P/D 两端 `LOCAL_HOST == LOCAL_DEVICE == GVA`、P NPU copy①、BM
 `G2G` copy②、D 端真实 Gather、非目标块/guard 和完整清理均通过。这个结果证明
 同机双进程功能链路，不是跨机或 RDMA 性能证据。
@@ -419,15 +417,13 @@ bash run.sh ready proxy
 
 ```bash
 bash run.sh validate
-bash run.sh collect
 ```
 
 `validate` 包含 Top-K 阈值以下、阈值以上、约 3K、约 3.6K 和请求状态重置
-五个用例，并检查每个请求的 P/D rank 生命周期及目标致命错误签名。
+五个用例，并检查每个请求的 P/D rank 生命周期、目标致命错误签名、P/D allocator
+初始化，以及 P BM data-plane / D visibility-fence 各 `TP_SIZE` 条。缺少任一 marker
+都会直接失败，避免把回退到旧 Full-KV 路径的请求误判为 M2 通过。
 计时仅用于发现异常卡顿，不构成性能结论。
-
-`collect` 将日志、验收 JSON、Git revision、运行时版本、模型元数据哈希、
-NPU 状态和传输生命周期归档到 `OUTPUT_DIR` 下的带时间戳目录。
 
 通过后，在 Proxy、Prefill、Decode 三个服务终端依次按 `Ctrl+C`。不要在共享服务器
 使用会影响同事 Ray/Python 进程的宽泛 `pkill`。
@@ -436,10 +432,24 @@ shutdown 并关闭输出管道后，`tee` 才退出，因此 allocator 的最终
 按下 `Ctrl+C` 时被截断。
 `memfabric_bm` 还必须在 P/D 日志中分别看到 8 条
 `Released MemFabric BM Full-KV allocator`，且进程正常返回、没有 segfault 或
-double free，才算 allocator 生命周期完整通过。M2 首个真实请求还必须分别看到
-8 条 `MemFabric BM data plane active` 和 8 条
-`Decode MemFabric BM Full-KV visibility fence active`；否则即使请求成功，也不能
-证明 Full-KV 已切到 BM G2G。
+double free，才算 allocator 生命周期完整通过。停服后执行：
+
+```bash
+bash run.sh verify-shutdown
+bash run.sh collect
+```
+
+`collect` 将完整日志、验收 JSON、Git revision、运行时版本、模型元数据哈希、
+停服后的 NPU 状态和传输生命周期 marker 归档到 `OUTPUT_DIR` 下的带时间戳目录。
+
+真实 16 卡 M2 已在 revision `67e01b7b8686e0cee008424dc1e9224bf7bdb6f5`
+完成五用例验收：DeepSeek-V3.2 W4A8C8、61 层、TP8 Prefill + TP8 Decode、
+`max_model_len=4096`，每个请求 P/D rank 生命周期均为 `8/8`，P BM data-plane 与
+D visibility-fence marker 也均为 `8/8`。运行中证据目录为
+`/workspace/w50062541/output/dsv32-pd-real61-4k-memfabric_bm-20260821-104138`。
+该次停服还确认 16 张 NPU 无残留进程、全部应用/BM 端口恢复空闲且 preflight
+重新通过；release 日志采集修复位于后续 revision `cbdbf422d`，等待下一次自然运行
+顺带执行 `verify-shutdown`，不阻塞同机 M2 功能正确性结论。
 
 ## 当前边界
 
@@ -450,8 +460,7 @@ double free，才算 allocator 生命周期完整通过。M2 首个真实请求�
 - `host_relay` 只是默认关闭的兼容性诊断路径，不是性能候选；它使用 TCP 验证
   pinned Host relay 传输，尚未证明跨节点 RDMA/RoCE/UB Host transport，也不使用
   Mooncake Store。
-- `memfabric_bm` 当前是默认关闭的 M2 候选：BM `G2G/HOST_TCP` 数据面已接入
-  Connector，但真实 16 卡模型验收尚待本提交在服务器完成；G2b 跨机
-  `HOST_RDMA` 也尚未验证。
+- `memfabric_bm` 当前是默认关闭的 M2 候选：BM `G2G/HOST_TCP` 数据面和真实
+  16 卡模型正确性均已在同节点通过；G2b 跨机 `HOST_RDMA` 与性能收益尚未验证。
 - 如果端口被 Ray 等共享服务占用，应修改 `config.env` 选择完整空闲端口段，
   不要终止不属于本任务的进程。

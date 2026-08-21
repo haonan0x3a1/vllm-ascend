@@ -57,6 +57,10 @@ DEVICE_VISIBILITY_ENV = "ASCEND_RT_VISIBLE_DEVICES"
 LINUX_EPHEMERAL_PORT_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
 LINUX_RESERVED_PORTS = Path("/proc/sys/net/ipv4/ip_local_reserved_ports")
 MAX_TCP_PORT = 65535
+MEMFABRIC_BM_ALLOCATOR_INIT_MARKER = "Initialized MemFabric BM Full-KV allocator:"
+MEMFABRIC_BM_DATA_PLANE_MARKER = "MemFabric BM data plane active:"
+MEMFABRIC_BM_VISIBILITY_FENCE_MARKER = "Decode MemFabric BM Full-KV visibility fence active:"
+MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER = "Released MemFabric BM Full-KV allocator:"
 
 
 @dataclass(frozen=True)
@@ -185,6 +189,46 @@ def find_fatal_lines(named_logs: tuple[tuple[str, str], ...]) -> list[str]:
         for line in text.splitlines()
         if FATAL_PATTERN.search(line)
     ]
+
+
+def require_memfabric_bm_runtime_markers(
+    prefill_log: str,
+    decode_log: str,
+    tp_size: int,
+) -> dict[str, int]:
+    """Require every TP worker to initialize and exercise the M2 data plane."""
+    counts = {
+        "prefill_allocators": prefill_log.count(MEMFABRIC_BM_ALLOCATOR_INIT_MARKER),
+        "decode_allocators": decode_log.count(MEMFABRIC_BM_ALLOCATOR_INIT_MARKER),
+        "prefill_data_plane": prefill_log.count(MEMFABRIC_BM_DATA_PLANE_MARKER),
+        "decode_visibility_fence": decode_log.count(MEMFABRIC_BM_VISIBILITY_FENCE_MARKER),
+    }
+    mismatches = {name: count for name, count in counts.items() if count != tp_size}
+    if mismatches:
+        raise RuntimeError(
+            "MemFabric BM M2 expected one runtime marker per TP worker, "
+            f"got {counts}, expected_each={tp_size}."
+        )
+    return counts
+
+
+def require_memfabric_bm_shutdown_markers(
+    prefill_log: str,
+    decode_log: str,
+    tp_size: int,
+) -> dict[str, int]:
+    """Require every TP worker to explicitly release its BM allocator."""
+    counts = {
+        "prefill_releases": prefill_log.count(MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER),
+        "decode_releases": decode_log.count(MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER),
+    }
+    mismatches = {name: count for name, count in counts.items() if count != tp_size}
+    if mismatches:
+        raise RuntimeError(
+            "MemFabric BM expected one allocator release per TP worker, "
+            f"got {counts}, expected_each={tp_size}."
+        )
+    return counts
 
 
 def run_command(command: list[str], *, cwd: Path | None = None) -> str:
@@ -505,18 +549,39 @@ def validate(args: argparse.Namespace) -> int:
         raise RuntimeError(f"Found {len(fatal_lines)} fatal log matches")
 
     if args.transfer_mode == "memfabric_bm":
-        allocator_marker = "Initialized MemFabric BM Full-KV allocator:"
-        prefill_allocators = prefill_log.count(allocator_marker)
-        decode_allocators = decode_log.count(allocator_marker)
-        if prefill_allocators != args.tp_size or decode_allocators != args.tp_size:
-            raise RuntimeError(
-                "MemFabric BM M1 expected one allocator per TP worker, got "
-                f"Prefill={prefill_allocators}, Decode={decode_allocators}, "
-                f"expected={args.tp_size}."
-            )
+        marker_counts = require_memfabric_bm_runtime_markers(
+            prefill_log,
+            decode_log,
+            args.tp_size,
+        )
+        print(f"MemFabric BM M2 runtime markers: {marker_counts}")
 
     print(f"Results saved to: {output_path}")
     print("FINAL 4K ONLINE PD SUITE: PASSED")
+    return 0
+
+
+def verify_shutdown(args: argparse.Namespace) -> int:
+    prefill_log = Path(args.prefill_log).read_text(errors="replace")
+    decode_log = Path(args.decode_log).read_text(errors="replace")
+    fatal_lines = find_fatal_lines(
+        (
+            ("prefill", prefill_log),
+            ("decode", decode_log),
+        )
+    )
+    if fatal_lines:
+        print("Fatal log matches:")
+        print("\n".join(fatal_lines[-200:]))
+        raise RuntimeError(f"Found {len(fatal_lines)} fatal log matches")
+
+    marker_counts = require_memfabric_bm_shutdown_markers(
+        prefill_log,
+        decode_log,
+        args.tp_size,
+    )
+    print(f"MemFabric BM shutdown markers: {marker_counts}")
+    print("MEMFABRIC BM SHUTDOWN: PASSED")
     return 0
 
 
@@ -581,10 +646,18 @@ def collect(args: argparse.Namespace) -> int:
 
     prefill_text = Path(args.prefill_log).read_text(errors="replace")
     decode_text = Path(args.decode_log).read_text(errors="replace")
+    lifecycle_markers = (
+        "done_sending_msg",
+        "Number of completed KV cache recv requests",
+        MEMFABRIC_BM_ALLOCATOR_INIT_MARKER,
+        MEMFABRIC_BM_DATA_PLANE_MARKER,
+        MEMFABRIC_BM_VISIBILITY_FENCE_MARKER,
+        MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER,
+    )
     lifecycle_lines = [
         line
         for line in (*prefill_text.splitlines(), *decode_text.splitlines())
-        if "done_sending_msg" in line or "Number of completed KV cache recv requests" in line
+        if any(marker in line for marker in lifecycle_markers)
     ]
     (evidence_dir / "transport-lifecycle.txt").write_text("\n".join(lifecycle_lines) + "\n")
 
@@ -667,6 +740,12 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--decode-log", required=True)
     validate_parser.add_argument("--proxy-log", required=True)
     validate_parser.set_defaults(func=validate)
+
+    shutdown_parser = subparsers.add_parser("verify-shutdown")
+    shutdown_parser.add_argument("--tp-size", type=int, required=True)
+    shutdown_parser.add_argument("--prefill-log", required=True)
+    shutdown_parser.add_argument("--decode-log", required=True)
+    shutdown_parser.set_defaults(func=verify_shutdown)
 
     collect_parser = subparsers.add_parser("collect")
     collect_parser.add_argument("--output-dir", required=True)
