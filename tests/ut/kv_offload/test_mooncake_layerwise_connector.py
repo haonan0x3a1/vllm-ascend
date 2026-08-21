@@ -190,8 +190,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
         )
 
     @patch(
-        "vllm_ascend.distributed.kv_transfer.kv_p2p."
-        "mooncake_layerwise_connector.get_world_group",
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_world_group",
         side_effect=RuntimeError("world group unavailable"),
     )
     def test_run_reports_device_setup_failure_to_startup_waiter(
@@ -395,10 +394,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             0,
         )
 
-    @patch(
-        "vllm_ascend.distributed.kv_transfer.kv_p2p."
-        "mooncake_layerwise_connector.torch.npu.synchronize"
-    )
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.torch.npu.synchronize")
     def test_host_relay_splits_full_kv_and_indexer_transfers(self, mock_sync):
         host_engine = MagicMock()
         host_engine.batch_transfer_sync_write.return_value = 0
@@ -501,6 +497,97 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
         self.assertEqual(ascend_args[3], [64])
         layer_callback.assert_called_once_with(
             "req-host-relay",
+            req_meta,
+            "layer0",
+            0,
+        )
+
+    def test_memfabric_bm_splits_full_kv_from_indexer_transfer(self):
+        allocator = MagicMock()
+        layer_callback = MagicMock()
+        thread = KVCacheSendingLayerThread(
+            engine=self.engine,
+            vllm_config=self.vllm_config,
+            kv_cache_config=self.kv_cache_config,
+            kv_cache_specs=self.kv_cache_specs,
+            attn_resharding_group_idx=set(),
+            total_layers=1,
+            ready_event=threading.Event(),
+            tp_size=1,
+            tp_rank=0,
+            pd_head_ratio=1,
+            num_head_replica=1,
+            layer_metadata={
+                "layer0": _make_layer_metadata(
+                    tensor_group_idx=[0],
+                    kv_caches_base_addr=[6000],
+                    block_len=[32],
+                    block_size_scale=[1],
+                )
+            },
+            use_mla=True,
+            use_attn_mamba_hybrid=False,
+            k_buffer=self.fake_k_buffer,
+            v_buffer=self.fake_v_buffer,
+            enable_kv_quant=False,
+            enable_c8_quant=False,
+            resharding_stream=MagicMock(),
+            memfabric_bm_allocator=allocator,
+            memfabric_bm_layer_metadata={
+                "layer0": _make_layer_metadata(
+                    tensor_group_idx=[0, 0],
+                    kv_caches_base_addr=[1000, 2000],
+                    block_len=[16, 16],
+                    block_size_scale=[1, 1],
+                )
+            },
+            layer_callback_func=layer_callback,
+        )
+        req_meta = self.req_meta_base
+        req_meta.local_block_ids = [[1, 2]]
+        req_meta.remote_block_ids = [[3, 4]]
+        req_meta.remote_te_rpc_port = 6000
+        req_meta.remote_layer_metadata = {
+            "layer0": _make_layer_metadata(
+                tensor_group_idx=[0],
+                kv_caches_base_addr=[9000],
+                block_len=[32],
+                block_size_scale=[1],
+            )
+        }
+        req_meta.remote_memfabric_bm_layer_metadata = {
+            "layer0": _make_layer_metadata(
+                tensor_group_idx=[0, 0],
+                kv_caches_base_addr=[7000, 8000],
+                block_len=[16, 16],
+                block_size_scale=[1, 1],
+            )
+        }
+        wait_event = MagicMock()
+
+        thread._transfer_kv_cache(
+            SendTask(
+                send_request={"req-memfabric": req_meta},
+                wait_event=wait_event,
+                layer_idx=0,
+                layer_name="layer0",
+            )
+        )
+
+        wait_event.synchronize.assert_called_once()
+        allocator.copy_gva_ranges.assert_called_once_with(
+            [1016, 2016],
+            [7048, 8048],
+            [32, 32],
+        )
+        self.engine.batch_transfer_sync_write.assert_called_once_with(
+            "127.0.0.1:6000",
+            [6032],
+            [9096],
+            [64],
+        )
+        layer_callback.assert_called_once_with(
+            "req-memfabric",
             req_meta,
             "layer0",
             0,
@@ -634,10 +721,38 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
         )
         mock_sync.assert_called_once()
 
-    @patch(
-        "vllm_ascend.distributed.kv_transfer.kv_p2p."
-        "mooncake_layerwise_connector.torch.npu.synchronize"
-    )
+    def test_memfabric_bm_layer_ack_fences_without_staging_copy(self):
+        staging = (
+            torch.full((4, 4), -3, dtype=torch.float32),
+            torch.full((4, 4), -4, dtype=torch.float32),
+        )
+        final = (
+            torch.arange(16, dtype=torch.float32).view(4, 4),
+            torch.arange(16, 32, dtype=torch.float32).view(4, 4),
+            torch.zeros((4, 4), dtype=torch.float32),
+        )
+        expected = (final[0].clone(), final[1].clone())
+        allocator = MagicMock()
+        thread = KVCacheRecvingLayerThread(
+            tp_rank=0,
+            side_channel_port=5555,
+            tp_size=1,
+            pd_head_ratio=1,
+            local_engine_id="engineA",
+            metadata=self.meta,
+            ready_event=self.ready_event,
+            sparse_host_final_kv_caches={"layer0": final},
+            sparse_host_staging_kv=staging,
+            memfabric_bm_allocator=allocator,
+        )
+
+        thread.persist_staged_layer("layer0", [3, 1, 1])
+
+        torch.testing.assert_close(final[0], expected[0])
+        torch.testing.assert_close(final[1], expected[1])
+        allocator.synchronize_device_visibility.assert_called_once_with()
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.torch.npu.synchronize")
     def test_persist_host_relay_bridges_through_npu_staging(self, mock_sync):
         relay = (
             torch.arange(16, dtype=torch.float32).view(4, 4),
@@ -721,13 +836,11 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
         mock_sync.assert_not_called()
 
     @patch(
-        "vllm_ascend.distributed.kv_transfer.kv_p2p."
-        "mooncake_layerwise_connector.zmq_ctx",
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.zmq_ctx",
         side_effect=zmq.ZMQError("Address already in use"),
     )
     @patch(
-        "vllm_ascend.distributed.kv_transfer.kv_p2p."
-        "mooncake_layerwise_connector.get_ip",
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_ip",
         return_value="127.0.0.1",
     )
     def test_run_reports_socket_bind_failure_to_startup_waiter(
@@ -1411,9 +1524,7 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         self.mock_host_transfer_engine = MagicMock()
         self.mock_host_transfer_engine.get_rpc_port.return_value = 9191
         self.mock_host_transfer_engine.register_memory.return_value = 0
-        self.mock_create_host_transfer_engine = MagicMock(
-            return_value=self.mock_host_transfer_engine
-        )
+        self.mock_create_host_transfer_engine = MagicMock(return_value=self.mock_host_transfer_engine)
 
         self.patches = [
             patch("torch.Tensor.size", return_value=(10, 16, 8, 16)),
@@ -1446,8 +1557,7 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
                 return_value=None,
             ),
             patch(
-                "vllm_ascend.distributed.kv_transfer.kv_p2p."
-                "mooncake_layerwise_connector.create_host_transfer_engine",
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.create_host_transfer_engine",
                 self.mock_create_host_transfer_engine,
             ),
             patch(
@@ -1539,8 +1649,7 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         )
         with (
             patch(
-                "vllm_ascend.distributed.kv_transfer.kv_p2p."
-                "mooncake_layerwise_connector.KVCacheRecvingLayerThread",
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.KVCacheRecvingLayerThread",
                 FailingReceiverThread,
             ),
             self.assertRaisesRegex(
@@ -1559,13 +1668,11 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         self.assertFalse(worker.enable_c8_quant)
 
     def test_init_host_relay_creates_second_transfer_engine(self):
-        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = (
-            lambda key, default: {
-                "prefill": {"tp_size": 2, "dp_size": 1},
-                "decode": {"tp_size": 2, "dp_size": 1},
-                "sparse_kv_transfer_mode": "host_relay",
-            }.get(key, default)
-        )
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: {
+            "prefill": {"tp_size": 2, "dp_size": 1},
+            "decode": {"tp_size": 2, "dp_size": 1},
+            "sparse_kv_transfer_mode": "host_relay",
+        }.get(key, default)
 
         worker = MooncakeLayerwiseConnectorWorker(
             self.vllm_config,
@@ -1581,9 +1688,7 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
 
     def test_init_memfabric_bm_keeps_existing_mooncake_engine(self):
         self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = (
-            lambda key, default: "memfabric_bm"
-            if key == "sparse_kv_transfer_mode"
-            else default
+            lambda key, default: "memfabric_bm" if key == "sparse_kv_transfer_mode" else default
         )
 
         worker = MooncakeLayerwiseConnectorWorker(
@@ -1647,14 +1752,8 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         ):
             worker.register_kv_caches(self.kv_caches)
 
-    @patch(
-        "vllm_ascend.distributed.kv_transfer.kv_p2p."
-        "mooncake_layerwise_connector.ensure_zmq_send"
-    )
-    @patch(
-        "vllm_ascend.distributed.kv_transfer.kv_p2p."
-        "mooncake_layerwise_connector.ensure_zmq_recv"
-    )
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.ensure_zmq_send")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.ensure_zmq_recv")
     def test_update_decoder_info_propagates_host_metadata(
         self,
         mock_recv,
@@ -1714,6 +1813,68 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         self.assertEqual(updated.remote_host_te_rpc_port, 7000)
         self.assertEqual(updated.remote_host_layer_metadata, host_metadata)
 
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.ensure_zmq_send")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.ensure_zmq_recv")
+    def test_update_decoder_info_propagates_memfabric_bm_metadata(
+        self,
+        mock_recv,
+        _mock_send,
+    ):
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = (
+            lambda key, default: "memfabric_bm" if key == "sparse_kv_transfer_mode" else default
+        )
+        worker = MooncakeLayerwiseConnectorWorker(
+            self.vllm_config,
+            self.kv_cache_config,
+            self.engine_id,
+        )
+        worker._get_remote_socket = MagicMock(return_value=MagicMock())
+        indexer_metadata = {
+            "encoder.layer.0": _make_layer_metadata(
+                kv_caches_base_addr=[6000],
+                block_len=[32],
+                block_size_scale=[1],
+            )
+        }
+        bm_metadata = {
+            "encoder.layer.0": _make_layer_metadata(
+                kv_caches_base_addr=[7000, 8000],
+                block_len=[16, 16],
+                block_size_scale=[1, 1],
+            )
+        }
+        mock_recv.return_value = worker.encoder.encode(
+            MooncakeAgentMetadata(
+                te_rpc_port=6000,
+                layer_metadata=indexer_metadata,
+                memfabric_bm_layer_metadata=bm_metadata,
+            )
+        )
+        req_meta = ReqMeta(
+            local_block_ids=[[1]],
+            token_ids=[],
+            remote_block_ids=[[2]],
+            remote_block_size=[[16]],
+            remote_engine_id="remote-engine",
+            remote_host="127.0.0.1",
+            remote_port=8888,
+            remote_te_rpc_port=None,
+            remote_layer_metadata=None,
+            metaserver=None,
+            remote_tp_size=1,
+            remote_pcp_size=1,
+            remote_dcp_size=1,
+        )
+
+        updated = worker.update_decoder_info("req-memfabric", req_meta)
+
+        self.assertEqual(updated.remote_te_rpc_port, 6000)
+        self.assertEqual(updated.remote_layer_metadata, indexer_metadata)
+        self.assertEqual(
+            updated.remote_memfabric_bm_layer_metadata,
+            bm_metadata,
+        )
+
     def test_register_kv_caches_mla_case(self):
         mla_cache1 = MagicMock()
         mla_cache1.size.return_value = (10, 16, 1, 16)
@@ -1758,6 +1919,42 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
             worker.sparse_host_final_kv_caches["encoder.layer.0"][0],
             final[0],
         )
+
+    def test_memfabric_bm_registers_only_indexer_with_mooncake(self):
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = (
+            lambda key, default: "memfabric_bm" if key == "sparse_kv_transfer_mode" else default
+        )
+        worker = MooncakeLayerwiseConnectorWorker(
+            self.vllm_config,
+            self.kv_cache_config,
+            self.engine_id,
+        )
+        staging = (
+            torch.zeros((10, 4), dtype=torch.float32),
+            torch.zeros((10, 2), dtype=torch.float32),
+        )
+        final = (
+            torch.ones((10, 4), dtype=torch.float32),
+            torch.ones((10, 2), dtype=torch.float32),
+            torch.ones((10, 8), dtype=torch.float32),
+        )
+        allocator = MagicMock()
+        allocator.owns_device_range.return_value = True
+        worker.sparse_host_staging_kv = staging
+        worker.memfabric_bm_allocator = allocator
+
+        transfer = worker._build_sparse_host_transfer_caches({"encoder.layer.0": final})
+        metadata = worker._build_memfabric_bm_layer_metadata(
+            worker.sparse_host_final_kv_caches,
+            {"encoder.layer.0": 0},
+        )
+
+        self.assertEqual(transfer["encoder.layer.0"], (final[2],))
+        self.assertEqual(
+            len(metadata["encoder.layer.0"].kv_caches_base_addr),
+            2,
+        )
+        self.assertEqual(allocator.owns_device_range.call_count, 2)
 
     def test_sparse_host_transfer_cache_rejects_layout_mismatch(self):
         worker = MooncakeLayerwiseConnectorWorker(

@@ -114,6 +114,7 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     layer_metadata: dict[str, LayerMetadata]
     host_te_rpc_port: int | None = None
     host_layer_metadata: dict[str, LayerMetadata] | None = None
+    memfabric_bm_layer_metadata: dict[str, LayerMetadata] | None = None
 
 
 @dataclass
@@ -141,6 +142,7 @@ class ReqMeta:
     do_virtual: bool = False
     remote_host_te_rpc_port: int | None = None
     remote_host_layer_metadata: dict[str, LayerMetadata] | None = None
+    remote_memfabric_bm_layer_metadata: dict[str, LayerMetadata] | None = None
 
 
 @dataclass
@@ -250,6 +252,8 @@ class KVCacheSendingLayerThread(threading.Thread):
         host_layer_metadata: dict[str, LayerMetadata] | None = None,
         sparse_host_staging_kv: tuple[torch.Tensor, ...] | None = None,
         sparse_host_relay_kv: tuple[torch.Tensor, ...] | None = None,
+        memfabric_bm_allocator: Any | None = None,
+        memfabric_bm_layer_metadata: dict[str, LayerMetadata] | None = None,
         callback_func: Callable[..., None] = lambda x: None,
         layer_callback_func: Callable[..., None] | None = None,
     ):
@@ -292,10 +296,13 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.host_layer_metadata = host_layer_metadata
         self.sparse_host_staging_kv = sparse_host_staging_kv
         self.sparse_host_relay_kv = sparse_host_relay_kv
+        self.memfabric_bm_allocator = memfabric_bm_allocator
+        self.memfabric_bm_layer_metadata = memfabric_bm_layer_metadata
         self.ready_event = ready_event
         self.startup_error: BaseException | None = None
         self.callback_func = callback_func
         self.layer_callback_func = layer_callback_func
+        self._memfabric_bm_transfer_logged = False
         self._stop_event = threading.Event()
 
         host_relay_state = (
@@ -304,17 +311,28 @@ class KVCacheSendingLayerThread(threading.Thread):
             self.sparse_host_relay_kv,
         )
         if any(value is not None for value in host_relay_state) and (
-            not all(value is not None for value in host_relay_state)
-            or self.sparse_host_staging_kv is None
+            not all(value is not None for value in host_relay_state) or self.sparse_host_staging_kv is None
         ):
             raise ValueError(
                 "Mooncake sparse Host relay requires the Host engine, Host "
                 "metadata, NPU staging, and pinned Host relay buffers together."
             )
+        memfabric_bm_state = (
+            self.memfabric_bm_allocator,
+            self.memfabric_bm_layer_metadata,
+        )
+        if any(value is not None for value in memfabric_bm_state) and not all(
+            value is not None for value in memfabric_bm_state
+        ):
+            raise ValueError("MemFabric BM Full-KV transfer requires the allocator and BM layer metadata together.")
 
     @property
     def uses_sparse_host_relay(self) -> bool:
         return self.host_engine is not None
+
+    @property
+    def uses_memfabric_bm(self) -> bool:
+        return self.memfabric_bm_allocator is not None
 
     def run(self):
         try:
@@ -339,12 +357,11 @@ class KVCacheSendingLayerThread(threading.Thread):
         if self.is_alive() and threading.current_thread() is not self:
             self.join(timeout=MOONCAKE_THREAD_SHUTDOWN_TIMEOUT_SECONDS)
         if self.is_alive():
-            raise RuntimeError(
-                "Mooncake sparse KV sender did not stop before KV memory "
-                "teardown."
-            )
+            raise RuntimeError("Mooncake sparse KV sender did not stop before KV memory teardown.")
         self.sparse_host_staging_kv = None
         self.sparse_host_relay_kv = None
+        self.memfabric_bm_allocator = None
+        self.memfabric_bm_layer_metadata = None
 
     def _handle_request(self, send_task: SendTask):
         try:
@@ -523,7 +540,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         return (src_list, dst_list, length_list)
 
     @staticmethod
-    def _append_sparse_host_block_transfers(
+    def _append_block_transfers(
         transfer_meta: TransferMeta,
         *,
         local_metadata: LayerMetadata,
@@ -541,7 +558,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             remote_block_len = remote_metadata.block_len[tensor_index]
             if local_block_len != remote_block_len:
                 raise ValueError(
-                    "Sparse Host relay requires identical P/D tensor block "
+                    "Sparse KV transfer requires identical P/D tensor block "
                     f"sizes, got local={local_block_len}, "
                     f"remote={remote_block_len}, tensor_index={tensor_index}."
                 )
@@ -572,10 +589,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         num_blocks = self.sparse_host_staging_kv[0].shape[0]
         for block_id in block_ids:
             if block_id < 0 or block_id >= num_blocks:
-                raise ValueError(
-                    f"Local block id {block_id} is outside sparse Host "
-                    f"relay capacity [0, {num_blocks})."
-                )
+                raise ValueError(f"Local block id {block_id} is outside sparse Host relay capacity [0, {num_blocks}).")
             for staging, relay in zip(
                 self.sparse_host_staging_kv,
                 self.sparse_host_relay_kv,
@@ -634,15 +648,9 @@ class KVCacheSendingLayerThread(threading.Thread):
             if req_meta.remote_host is None:
                 raise RuntimeError(f"Sparse Host relay request {req_id} has no remote host.")
             if req_meta.remote_host_te_rpc_port is None or req_meta.remote_host_layer_metadata is None:
-                raise RuntimeError(
-                    f"Sparse Host relay request {req_id} has no remote Host "
-                    "TransferEngine metadata."
-                )
+                raise RuntimeError(f"Sparse Host relay request {req_id} has no remote Host TransferEngine metadata.")
             if req_meta.remote_te_rpc_port is None or req_meta.remote_layer_metadata is None:
-                raise RuntimeError(
-                    f"Sparse Host relay request {req_id} has no remote Ascend "
-                    "TransferEngine metadata."
-                )
+                raise RuntimeError(f"Sparse Host relay request {req_id} has no remote Ascend TransferEngine metadata.")
 
             local_block_ids = req_meta.local_block_ids[layer_group_idx]
             remote_block_ids = req_meta.remote_block_ids[layer_group_idx]
@@ -659,7 +667,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             host_transfer.req_ids.append(req_id)
             ascend_transfer.req_ids.append(req_id)
 
-            self._append_sparse_host_block_transfers(
+            self._append_block_transfers(
                 host_transfer,
                 local_metadata=self.host_layer_metadata[layer_name],
                 remote_metadata=req_meta.remote_host_layer_metadata[layer_name],
@@ -669,7 +677,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             )
             local_ascend_metadata = self.layer_metadata[layer_name]
             remote_ascend_metadata = req_meta.remote_layer_metadata[layer_name]
-            self._append_sparse_host_block_transfers(
+            self._append_block_transfers(
                 ascend_transfer,
                 local_metadata=local_ascend_metadata,
                 remote_metadata=remote_ascend_metadata,
@@ -693,9 +701,126 @@ class KVCacheSendingLayerThread(threading.Thread):
             layer_idx=send_task.layer_idx,
             transport_name="Ascend Indexer",
         )
+        if self.layer_callback_func is not None:
+            for req_id, req_meta in send_task.send_request.items():
+                self.layer_callback_func(
+                    req_id,
+                    req_meta,
+                    layer_name,
+                    layer_group_idx,
+                )
+        if send_task.layer_idx == (self.total_layers - 1):
+            for req_id, req_meta in send_task.send_request.items():
+                if req_meta.chunk_finish:
+                    self.callback_func(
+                        req_id,
+                        req_meta,
+                        layer_group_idx,
+                        trans_flag=True,
+                    )
+
+    def _append_memfabric_request_transfers(
+        self,
+        *,
+        bm_transfer: TransferMeta,
+        indexer_sessions: dict[str, TransferMeta],
+        req_id: str,
+        req_meta: ReqMeta,
+        layer_name: str,
+        layer_group_idx: int,
+    ) -> None:
+        assert self.memfabric_bm_layer_metadata is not None
+        if req_meta.remote_host is None or req_meta.remote_te_rpc_port is None:
+            raise RuntimeError(f"MemFabric BM request {req_id} has no remote Mooncake endpoint.")
+        if req_meta.remote_layer_metadata is None:
+            raise RuntimeError(f"MemFabric BM request {req_id} has no remote Indexer metadata.")
+        if req_meta.remote_memfabric_bm_layer_metadata is None:
+            raise RuntimeError(f"MemFabric BM request {req_id} has no remote Full-KV metadata.")
+
+        local_block_ids = req_meta.local_block_ids[layer_group_idx]
+        remote_block_ids = req_meta.remote_block_ids[layer_group_idx]
+        bm_transfer.req_ids.append(req_id)
+        self._append_block_transfers(
+            bm_transfer,
+            local_metadata=self.memfabric_bm_layer_metadata[layer_name],
+            remote_metadata=req_meta.remote_memfabric_bm_layer_metadata[layer_name],
+            local_block_ids=local_block_ids,
+            remote_block_ids=remote_block_ids,
+            tensor_indices=range(SPARSE_HOST_CACHE_TENSOR_COUNT),
+        )
+
+        session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
+        indexer_transfer = indexer_sessions.setdefault(
+            session_id,
+            TransferMeta(src=[], dst=[], length=[], req_ids=[]),
+        )
+        indexer_transfer.req_ids.append(req_id)
+        local_indexer_metadata = self.layer_metadata[layer_name]
+        self._append_block_transfers(
+            indexer_transfer,
+            local_metadata=local_indexer_metadata,
+            remote_metadata=req_meta.remote_layer_metadata[layer_name],
+            local_block_ids=local_block_ids,
+            remote_block_ids=remote_block_ids,
+            tensor_indices=range(len(local_indexer_metadata.kv_caches_base_addr)),
+        )
+
+    def _transfer_memfabric_bm(self, send_task: SendTask) -> None:
+        """Transfer Full KV through BM G2G and Indexer KV through Mooncake."""
+        assert self.memfabric_bm_allocator is not None
+        layer_name = send_task.layer_name
+        layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
+
+        if send_task.wait_event is None:
+            raise RuntimeError("MemFabric BM Full-KV transfer requires a producer visibility event.")
+        # SFA has already copied this layer's touched rows from ordinary NPU
+        # staging into the producer BM Full-KV alias before recording the event.
+        send_task.wait_event.synchronize()
+
+        bm_transfer = TransferMeta(src=[], dst=[], length=[], req_ids=[])
+        indexer_sessions: dict[str, TransferMeta] = {}
+        for req_id, req_meta in send_task.send_request.items():
+            self._append_memfabric_request_transfers(
+                bm_transfer=bm_transfer,
+                indexer_sessions=indexer_sessions,
+                req_id=req_id,
+                req_meta=req_meta,
+                layer_name=layer_name,
+                layer_group_idx=layer_group_idx,
+            )
+
+        start_time = time.perf_counter()
+        self.memfabric_bm_allocator.copy_gva_ranges(
+            bm_transfer.src,
+            bm_transfer.dst,
+            bm_transfer.length,
+        )
+        logger.debug(
+            "Layer%d MemFabric BM Full-KV G2G transfer %dKB took %.3f ms.",
+            send_task.layer_idx,
+            sum(bm_transfer.length) // 1024,
+            (time.perf_counter() - start_time) * 1000,
+        )
+        self._execute_sparse_host_transfer_sessions(
+            engine=self.engine,
+            session_meta=indexer_sessions,
+            layer_idx=send_task.layer_idx,
+            transport_name="Ascend Indexer",
+        )
+        if not self._memfabric_bm_transfer_logged:
+            logger.info(
+                "MemFabric BM data plane active: layer=%s, Full-KV G2G "
+                "ranges=%d, bytes=%d; Mooncake carries Indexer KV only.",
+                layer_name,
+                len(bm_transfer.length),
+                sum(bm_transfer.length),
+            )
+            self._memfabric_bm_transfer_logged = True
 
         if self.layer_callback_func is not None:
             for req_id, req_meta in send_task.send_request.items():
+                # Decode fences the peer Host writes before acknowledging this
+                # signal, so this layer cannot reach Gather with stale Full KV.
                 self.layer_callback_func(
                     req_id,
                     req_meta,
@@ -715,6 +840,9 @@ class KVCacheSendingLayerThread(threading.Thread):
     def _transfer_kv_cache(self, send_task: SendTask):
         if self.uses_sparse_host_relay:
             self._transfer_sparse_host_relay(send_task)
+            return
+        if self.uses_memfabric_bm:
+            self._transfer_memfabric_bm(send_task)
             return
 
         layer_name = send_task.layer_name
@@ -825,6 +953,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         sparse_host_final_kv_caches: dict[str, tuple[torch.Tensor, ...]] | None = None,
         sparse_host_staging_kv: tuple[torch.Tensor, ...] | None = None,
         sparse_host_relay_kv: tuple[torch.Tensor, ...] | None = None,
+        memfabric_bm_allocator: Any | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingLayerThread")
         self.tp_rank = tp_rank
@@ -843,6 +972,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.sparse_host_final_kv_caches = sparse_host_final_kv_caches
         self.sparse_host_staging_kv = sparse_host_staging_kv
         self.sparse_host_relay_kv = sparse_host_relay_kv
+        self.memfabric_bm_allocator = memfabric_bm_allocator
+        self._memfabric_bm_fence_logged = False
         self._stop_event = threading.Event()
 
     @property
@@ -852,6 +983,10 @@ class KVCacheRecvingLayerThread(threading.Thread):
     @property
     def uses_sparse_host_relay(self) -> bool:
         return self.uses_sparse_host_staging and self.sparse_host_relay_kv is not None
+
+    @property
+    def uses_memfabric_bm(self) -> bool:
+        return self.uses_sparse_host_staging and self.memfabric_bm_allocator is not None
 
     def persist_staged_layer(
         self,
@@ -877,13 +1012,26 @@ class KVCacheRecvingLayerThread(threading.Thread):
         final_kv = self.sparse_host_final_kv_caches[layer_name]
         staging_kv = self.sparse_host_staging_kv[:SPARSE_HOST_CACHE_TENSOR_COUNT]
         final_full_kv = final_kv[:SPARSE_HOST_CACHE_TENSOR_COUNT]
-        num_blocks = staging_kv[0].shape[0]
+        num_blocks = final_full_kv[0].shape[0]
         block_ids = sorted(set(remote_block_ids))
         for block_id in block_ids:
             if block_id < 0 or block_id >= num_blocks:
                 raise ValueError(
                     f"Remote block id {block_id} is outside sparse Host staging capacity [0, {num_blocks})."
                 )
+
+        if self.uses_memfabric_bm:
+            # The producer's synchronous BM G2G copy completed before it sent
+            # LAYER_STAGED_MSG. Fence the Decode NPU view before acknowledging
+            # the layer and allowing Gather to consume the peer-written pages.
+            self.memfabric_bm_allocator.synchronize_device_visibility()
+            if not self._memfabric_bm_fence_logged:
+                logger.info(
+                    "Decode MemFabric BM Full-KV visibility fence active: layer=%s.",
+                    layer_name,
+                )
+                self._memfabric_bm_fence_logged = True
+            return
 
         if self.uses_sparse_host_relay:
             assert self.sparse_host_relay_kv is not None
@@ -1043,13 +1191,11 @@ class KVCacheRecvingLayerThread(threading.Thread):
         if self.is_alive() and threading.current_thread() is not self:
             self.join(timeout=MOONCAKE_THREAD_SHUTDOWN_TIMEOUT_SECONDS)
         if self.is_alive():
-            raise RuntimeError(
-                "Mooncake sparse KV receiver did not stop before KV memory "
-                "teardown."
-            )
+            raise RuntimeError("Mooncake sparse KV receiver did not stop before KV memory teardown.")
         self.sparse_host_final_kv_caches = None
         self.sparse_host_staging_kv = None
         self.sparse_host_relay_kv = None
+        self.memfabric_bm_allocator = None
 
 
 class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
@@ -1161,6 +1307,11 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         """Register the cross-layer NPU staging cache before final KV caches."""
         assert self.connector_worker is not None
         self.connector_worker.register_sparse_kv_offload_staging(staging_kv)
+
+    def register_memfabric_bm_full_kv_allocator(self, allocator: Any) -> None:
+        """Share the model runner's BM owner with the layerwise data plane."""
+        assert self.connector_worker is not None
+        self.connector_worker.register_memfabric_bm_full_kv_allocator(allocator)
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
@@ -1592,10 +1743,8 @@ class MooncakeLayerwiseConnectorWorker:
                 f"one of {sorted(SPARSE_KV_TRANSFER_MODES)}, got "
                 f"{self.sparse_kv_transfer_mode!r}."
             )
-        self.uses_sparse_host_relay = (
-            self.sparse_kv_transfer_mode
-            == SPARSE_KV_TRANSFER_MODE_HOST_RELAY
-        )
+        self.uses_sparse_host_relay = self.sparse_kv_transfer_mode == SPARSE_KV_TRANSFER_MODE_HOST_RELAY
+        self.uses_memfabric_bm = self.sparse_kv_transfer_mode == SPARSE_KV_TRANSFER_MODE_MEMFABRIC_BM
         logger.info(
             "Mooncake sparse KV transfer mode: %s.",
             self.sparse_kv_transfer_mode,
@@ -1615,8 +1764,7 @@ class MooncakeLayerwiseConnectorWorker:
             self.host_te_rpc_port = self.host_engine.get_rpc_port()
             if self.host_te_rpc_port == self.te_rpc_port:
                 raise RuntimeError(
-                    "Mooncake Ascend and Host TransferEngines returned the same "
-                    f"RPC port {self.te_rpc_port}."
+                    f"Mooncake Ascend and Host TransferEngines returned the same RPC port {self.te_rpc_port}."
                 )
 
         # Background thread for sending or receiving KV caches.
@@ -1646,6 +1794,7 @@ class MooncakeLayerwiseConnectorWorker:
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
         self.remote_host_layer_metadata: dict[str, dict[int, dict[str, LayerMetadata]]] = SizedDict()
         self.remote_host_te_port: dict[str, dict[int, int]] = SizedDict()
+        self.remote_memfabric_bm_layer_metadata: dict[str, dict[int, dict[str, LayerMetadata]]] = SizedDict()
         self.remote_sockets_lock = threading.Lock()
         self.remote_sockets: dict[  # type: ignore
             str, deque[zmq.Socket]
@@ -1666,6 +1815,8 @@ class MooncakeLayerwiseConnectorWorker:
         self.sparse_host_relay_storage: torch.Tensor | None = None
         self.sparse_host_relay_kv: tuple[torch.Tensor, ...] | None = None
         self.host_layer_metadata: dict[str, LayerMetadata] | None = None
+        self.memfabric_bm_allocator: Any | None = None
+        self.memfabric_bm_layer_metadata: dict[str, LayerMetadata] | None = None
 
     def register_sparse_kv_offload_staging(
         self,
@@ -1679,6 +1830,16 @@ class MooncakeLayerwiseConnectorWorker:
         self.sparse_host_staging_kv = staging_kv
         if self.uses_sparse_host_relay:
             self._allocate_sparse_host_relay(staging_kv)
+
+    def register_memfabric_bm_full_kv_allocator(self, allocator: Any) -> None:
+        """Register the one BM pool already owned by this model runner."""
+        if not self.uses_memfabric_bm:
+            raise RuntimeError(
+                "A MemFabric BM allocator can only be registered when sparse_kv_transfer_mode='memfabric_bm'."
+            )
+        if self.memfabric_bm_allocator is not None:
+            raise RuntimeError("The MemFabric BM Full-KV allocator was registered more than once.")
+        self.memfabric_bm_allocator = allocator
 
     def _allocate_sparse_host_relay(
         self,
@@ -1703,11 +1864,7 @@ class MooncakeLayerwiseConnectorWorker:
         relay_tensors = []
         byte_offset = 0
         for staging, num_bytes in zip(staging_kv, tensor_bytes):
-            relay_tensors.append(
-                storage[byte_offset : byte_offset + num_bytes]
-                .view(staging.dtype)
-                .view(staging.shape)
-            )
+            relay_tensors.append(storage[byte_offset : byte_offset + num_bytes].view(staging.dtype).view(staging.shape))
             byte_offset += num_bytes
 
         ret_value = self.host_engine.register_memory(
@@ -1716,10 +1873,7 @@ class MooncakeLayerwiseConnectorWorker:
             "cpu",
         )
         if ret_value != 0:
-            raise RuntimeError(
-                "Mooncake Host relay memory registration failed with "
-                f"ret_value={ret_value}."
-            )
+            raise RuntimeError(f"Mooncake Host relay memory registration failed with ret_value={ret_value}.")
         self.sparse_host_relay_owner = owner
         self.sparse_host_relay_storage = storage
         self.sparse_host_relay_kv = tuple(relay_tensors)
@@ -1742,12 +1896,46 @@ class MooncakeLayerwiseConnectorWorker:
                 block_shape = relay_tensor.shape[1:]
                 single_layer_meta.tensor_group_idx.append(layer_group_id)
                 single_layer_meta.kv_caches_base_addr.append(relay_tensor.data_ptr())
-                single_layer_meta.block_len.append(
-                    relay_tensor.element_size() * math.prod(block_shape)
-                )
+                single_layer_meta.block_len.append(relay_tensor.element_size() * math.prod(block_shape))
                 single_layer_meta.block_size_scale.append(1)
             host_layer_metadata[layer_name] = single_layer_meta
         return host_layer_metadata
+
+    def _build_memfabric_bm_layer_metadata(
+        self,
+        final_caches: dict[str, tuple[torch.Tensor, ...]],
+        layer2group_ids: dict[str, int],
+    ) -> dict[str, LayerMetadata]:
+        if self.memfabric_bm_allocator is None:
+            raise RuntimeError("MemFabric BM allocator must be registered before KV caches.")
+        bm_layer_metadata = {}
+        num_blocks = self.kv_cache_config.num_blocks
+        for layer_name, final_cache in final_caches.items():
+            single_layer_meta = LayerMetadata([], [], [], [])
+            for full_kv in final_cache[:SPARSE_HOST_CACHE_TENSOR_COUNT]:
+                nbytes = full_kv.numel() * full_kv.element_size()
+                if not self.memfabric_bm_allocator.owns_device_range(
+                    full_kv.data_ptr(),
+                    nbytes,
+                ):
+                    raise ValueError(
+                        "MemFabric BM Full-KV tensor is outside the registered "
+                        f"allocator pool: layer={layer_name}, "
+                        f"data_ptr=0x{full_kv.data_ptr():x}, nbytes={nbytes}."
+                    )
+                tensor_num_blocks = full_kv.shape[0]
+                if tensor_num_blocks % num_blocks:
+                    raise ValueError(
+                        "MemFabric BM Full-KV tensor block count must be an "
+                        f"integer multiple of framework blocks: layer={layer_name}, "
+                        f"tensor_blocks={tensor_num_blocks}, num_blocks={num_blocks}."
+                    )
+                single_layer_meta.tensor_group_idx.append(layer2group_ids[layer_name])
+                single_layer_meta.kv_caches_base_addr.append(full_kv.data_ptr())
+                single_layer_meta.block_len.append(full_kv.element_size() * math.prod(full_kv.shape[1:]))
+                single_layer_meta.block_size_scale.append(tensor_num_blocks // num_blocks)
+            bm_layer_metadata[layer_name] = single_layer_meta
+        return bm_layer_metadata
 
     def _build_sparse_host_transfer_caches(
         self,
@@ -1781,11 +1969,20 @@ class MooncakeLayerwiseConnectorWorker:
                         f"staging={tuple(staging.shape)}/{staging.dtype}, "
                         f"final={tuple(final.shape)}/{final.dtype}."
                     )
+            if self.uses_memfabric_bm and len(final_cache) == SPARSE_HOST_CACHE_TENSOR_COUNT:
+                raise ValueError(
+                    f"MemFabric BM mode requires at least one Indexer KV tensor for Mooncake transfer in {layer_name}."
+                )
             final_caches[layer_name] = final_cache
-            transfer_caches[layer_name] = (
-                *self.sparse_host_staging_kv,
-                *final_cache[SPARSE_HOST_CACHE_TENSOR_COUNT:],
-            )
+            if self.uses_memfabric_bm:
+                # Full KV is transported by BM G2G. Keep only Indexer KV in the
+                # Mooncake registration and transfer metadata.
+                transfer_caches[layer_name] = final_cache[SPARSE_HOST_CACHE_TENSOR_COUNT:]
+            else:
+                transfer_caches[layer_name] = (
+                    *self.sparse_host_staging_kv,
+                    *final_cache[SPARSE_HOST_CACHE_TENSOR_COUNT:],
+                )
 
         self.sparse_host_final_kv_caches = final_caches
         return transfer_caches
@@ -1832,17 +2029,25 @@ class MooncakeLayerwiseConnectorWorker:
                 f"{MOONCAKE_THREAD_STARTUP_TIMEOUT_SECONDS:.1f} seconds."
             )
         if isinstance(thread.startup_error, BaseException):
-            raise RuntimeError(
-                f"Mooncake {thread_name} thread failed to start."
-            ) from thread.startup_error
+            raise RuntimeError(f"Mooncake {thread_name} thread failed to start.") from thread.startup_error
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data."""
         self.kv_caches = kv_caches
         if self.uses_sparse_host_relay and self.sparse_host_staging_kv is None:
             raise RuntimeError(
-                "Sparse Host relay requires register_sparse_kv_offload_staging() "
-                "before register_kv_caches()."
+                "Sparse Host relay requires register_sparse_kv_offload_staging() before register_kv_caches()."
+            )
+        if self.uses_memfabric_bm and (self.sparse_host_staging_kv is None or self.memfabric_bm_allocator is None):
+            raise RuntimeError(
+                "MemFabric BM mode requires both "
+                "register_sparse_kv_offload_staging() and "
+                "register_memfabric_bm_full_kv_allocator() before "
+                "register_kv_caches()."
+            )
+        if self.uses_memfabric_bm and (self.enable_kv_quant or self.enable_c8_quant):
+            raise ValueError(
+                "MemFabric BM Full-KV transfer does not yet support the legacy KV-cache quantization/resharding path."
             )
         transfer_kv_caches: dict[str, Any] = kv_caches
         if self.sparse_host_staging_kv is not None:
@@ -1857,6 +2062,12 @@ class MooncakeLayerwiseConnectorWorker:
         for i, kv_cache_group_spec in enumerate(kv_cache_groups):
             for layer_name in kv_cache_group_spec.layer_names:
                 layer2group_ids[layer_name] = i
+        if self.uses_memfabric_bm:
+            assert self.sparse_host_final_kv_caches is not None
+            self.memfabric_bm_layer_metadata = self._build_memfabric_bm_layer_metadata(
+                self.sparse_host_final_kv_caches,
+                layer2group_ids,
+            )
 
         use_mamba, use_attn = False, False
         conv_total_padding_size = 0
@@ -1958,9 +2169,7 @@ class MooncakeLayerwiseConnectorWorker:
             self.total_layers = len(self.layer_metadata.keys())
 
         if self.uses_sparse_host_relay:
-            self.host_layer_metadata = self._build_sparse_host_layer_metadata(
-                layer2group_ids
-            )
+            self.host_layer_metadata = self._build_sparse_host_layer_metadata(layer2group_ids)
 
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
@@ -1968,6 +2177,7 @@ class MooncakeLayerwiseConnectorWorker:
             layer_metadata=self.layer_metadata,
             host_te_rpc_port=self.host_te_rpc_port,
             host_layer_metadata=self.host_layer_metadata,
+            memfabric_bm_layer_metadata=self.memfabric_bm_layer_metadata,
         )
         if self.vllm_config.kv_transfer_config.is_kv_producer:
             ready_event = threading.Event()
@@ -1995,6 +2205,8 @@ class MooncakeLayerwiseConnectorWorker:
                 host_layer_metadata=self.host_layer_metadata,
                 sparse_host_staging_kv=self.sparse_host_staging_kv,
                 sparse_host_relay_kv=self.sparse_host_relay_kv,
+                memfabric_bm_allocator=self.memfabric_bm_allocator,
+                memfabric_bm_layer_metadata=self.memfabric_bm_layer_metadata,
                 callback_func=self.send_done_send_signal,
                 layer_callback_func=(
                     self.send_layer_staged_signal if self.sparse_host_staging_kv is not None else None
@@ -2020,6 +2232,7 @@ class MooncakeLayerwiseConnectorWorker:
                 sparse_host_final_kv_caches=self.sparse_host_final_kv_caches,
                 sparse_host_staging_kv=self.sparse_host_staging_kv,
                 sparse_host_relay_kv=self.sparse_host_relay_kv,
+                memfabric_bm_allocator=self.memfabric_bm_allocator,
             )
             self.kv_recv_layer_thread.start()
             self._wait_for_background_thread_start(
@@ -2083,6 +2296,8 @@ class MooncakeLayerwiseConnectorWorker:
         self.sparse_host_relay_kv = None
         self.sparse_host_relay_storage = None
         self.sparse_host_relay_owner = None
+        self.memfabric_bm_layer_metadata = None
+        self.memfabric_bm_allocator = None
 
     # {(ip, port)]: {local_block_ids: [], remote_block_ids: {}}}
     def _get_kv_split_metadata(self, req_meta: ReqMeta, req_idx: int, req_id: str, group_idx: int):
@@ -2452,6 +2667,14 @@ class MooncakeLayerwiseConnectorWorker:
                         quant_keys = self.get_nz_cache(keys, layer_group_idx)
                         quant_values = self.get_nz_cache(values, layer_group_idx)
 
+            if self.uses_memfabric_bm:
+                # The attention reshape event predates SFA's local
+                # NPU-staging -> BM Full-KV copy. Record a new event here, after
+                # maybe_save_kv_layer_to_connector() is reached, so G2G never
+                # reads the producer BM alias before that copy is complete.
+                reshape_cache_event = torch.npu.Event()
+                reshape_cache_event.record()
+
             assert self.kv_send_layer_thread is not None
             assert reshape_cache_event is not None
             layer_send_task = SendTask(
@@ -2542,10 +2765,13 @@ class MooncakeLayerwiseConnectorWorker:
         )
         host_metadata_missing = self.uses_sparse_host_relay and (
             req_meta.remote_engine_id not in self.remote_host_layer_metadata
-            or req_meta.remote_port
-            not in self.remote_host_layer_metadata[req_meta.remote_engine_id]
+            or req_meta.remote_port not in self.remote_host_layer_metadata[req_meta.remote_engine_id]
         )
-        if standard_metadata_missing or host_metadata_missing:
+        memfabric_bm_metadata_missing = self.uses_memfabric_bm and (
+            req_meta.remote_engine_id not in self.remote_memfabric_bm_layer_metadata
+            or req_meta.remote_port not in self.remote_memfabric_bm_layer_metadata[req_meta.remote_engine_id]
+        )
+        if standard_metadata_missing or host_metadata_missing or memfabric_bm_metadata_missing:
             try:
                 encoded_data = self.encoder.encode((GET_META_MSG, req_id))
                 sock = self._get_remote_socket(req_meta.remote_host, req_meta.remote_port)
@@ -2568,20 +2794,21 @@ class MooncakeLayerwiseConnectorWorker:
             self.remote_layer_metadata[req_meta.remote_engine_id][req_meta.remote_port] = agent_meta.layer_metadata
             self.remote_te_port[req_meta.remote_engine_id][req_meta.remote_port] = agent_meta.te_rpc_port
             if self.uses_sparse_host_relay:
-                if (
-                    agent_meta.host_te_rpc_port is None
-                    or agent_meta.host_layer_metadata is None
-                ):
+                if agent_meta.host_te_rpc_port is None or agent_meta.host_layer_metadata is None:
                     raise RuntimeError(
                         "Remote Mooncake consumer did not advertise the Host "
                         "TransferEngine metadata required by sparse Host relay."
                     )
-                self.remote_host_layer_metadata[req_meta.remote_engine_id][
-                    req_meta.remote_port
-                ] = agent_meta.host_layer_metadata
-                self.remote_host_te_port[req_meta.remote_engine_id][
-                    req_meta.remote_port
-                ] = agent_meta.host_te_rpc_port
+                self.remote_host_layer_metadata[req_meta.remote_engine_id][req_meta.remote_port] = (
+                    agent_meta.host_layer_metadata
+                )
+                self.remote_host_te_port[req_meta.remote_engine_id][req_meta.remote_port] = agent_meta.host_te_rpc_port
+            if self.uses_memfabric_bm:
+                if agent_meta.memfabric_bm_layer_metadata is None:
+                    raise RuntimeError("Remote Mooncake consumer did not advertise the MemFabric BM Full-KV metadata.")
+                self.remote_memfabric_bm_layer_metadata[req_meta.remote_engine_id][req_meta.remote_port] = (
+                    agent_meta.memfabric_bm_layer_metadata
+                )
             logger.debug(
                 "Query to port and kv base addr for request %s from %s:%s success "
                 "agent_meta.layer_metadata=%r agent_meta.te_rpc_port=%r",
@@ -2606,10 +2833,12 @@ class MooncakeLayerwiseConnectorWorker:
         req_meta.remote_te_rpc_port = self.remote_te_port[req_meta.remote_engine_id][req_meta.remote_port]
         req_meta.remote_layer_metadata = self.remote_layer_metadata[req_meta.remote_engine_id][req_meta.remote_port]
         if self.uses_sparse_host_relay:
-            req_meta.remote_host_te_rpc_port = self.remote_host_te_port[
-                req_meta.remote_engine_id
-            ][req_meta.remote_port]
-            req_meta.remote_host_layer_metadata = self.remote_host_layer_metadata[
+            req_meta.remote_host_te_rpc_port = self.remote_host_te_port[req_meta.remote_engine_id][req_meta.remote_port]
+            req_meta.remote_host_layer_metadata = self.remote_host_layer_metadata[req_meta.remote_engine_id][
+                req_meta.remote_port
+            ]
+        if self.uses_memfabric_bm:
+            req_meta.remote_memfabric_bm_layer_metadata = self.remote_memfabric_bm_layer_metadata[
                 req_meta.remote_engine_id
             ][req_meta.remote_port]
         return req_meta

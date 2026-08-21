@@ -282,6 +282,7 @@ python -X faulthandler -m \
   tests.ut.distributed.kv_transfer.a3_2.test_memfabric_bm_same_host_pd_gather_npu \
   --prefill-physical-device 0 \
   --decode-physical-device 8 \
+  --start-store-role decode \
   --protocol host_tcp
 ```
 
@@ -291,7 +292,10 @@ python -X faulthandler -m \
 MemFabric BM same-host P -> D Host Full-KV -> Gather G2a PASSED
 ```
 
-当前服务器已在 MemFabric Hybrid 1.1.2、物理 NPU 0/8、`HOST_TCP` 下通过 G2a。
+当前服务器已在 MemFabric Hybrid 1.1.2、物理 NPU 0/8、`HOST_TCP` 下通过以 P
+启动 config store 的原始 G2a。M2 在真实模型前还要用上面的
+`--start-store-role decode` 重跑一次，使 BM rank/store ownership 与 `run.sh`
+一致。
 结果确认 P/D 两端 `LOCAL_HOST == LOCAL_DEVICE == GVA`、P NPU copy①、BM
 `G2G` copy②、D 端真实 Gather、非目标块/guard 和完整清理均通过。这个结果证明
 同机双进程功能链路，不是跨机或 RDMA 性能证据。
@@ -315,7 +319,7 @@ SPARSE_KV_TRANSFER_MODE=npu_staging
 # 新的 Host relay 对照路径
 SPARSE_KV_TRANSFER_MODE=host_relay
 
-# M1：BM Full-KV allocator + 既有 Mooncake NPU staging 传输
+# M2：BM Full-KV Host-to-Host 数据面 + Mooncake Indexer 传输
 SPARSE_KV_TRANSFER_MODE=memfabric_bm
 ```
 
@@ -337,37 +341,41 @@ Decode 只有在 Host relay 已桥接到 swapped Full KV、Indexer 也已传完�
 这个实现仍让 Full KV 经过 Decode NPU，不是 mentor 所指的最终 Host 路径，当前
 不得用它得出性能收益结论。
 
-`memfabric_bm` 当前对应 M1 allocator 集成门槛。它把每个 TP worker 的 Full-KV
-底层 allocation 从 `empty_with_swapped_memory` 换成一份 1 GiB MemFabric BM DRAM
-pool，并将 `LOCAL_DEVICE` view 包装成原布局的 NPU Tensor。当前真实模型路径是：
+M1 allocator 门槛已经验证：每个 TP worker 的 Full-KV 底层 allocation 从
+`empty_with_swapped_memory` 换成一份 1 GiB MemFabric BM DRAM pool，并将
+`LOCAL_DEVICE` view 包装成原布局的 NPU Tensor；真实 61 层模型和 Gather/SFA 均通过。
+M1 当时仍由 Mooncake 搬运 Full-KV NPU staging，只证明 allocator/Gather 兼容性。
+
+`memfabric_bm` 现在进入 M2，实现的数据路径为：
 
 ```text
 P 模型算子
   -> P 普通 NPU staging
-  -> Mooncake Ascend NPU-to-NPU
-  -> D 普通 NPU staging
   -> 本地 NPU copy
+  -> P MemFabric BM dual-view Full KV
+  -> MemFabric BM G2G/HOST_TCP
   -> D MemFabric BM dual-view Full KV
+  -> Decode visibility fence + layer ACK
   -> Gather selected NPU KV
   -> SFA
+
+P Indexer NPU KV
+  -> Mooncake Ascend NPU-to-NPU
+  -> D Indexer NPU KV
 ```
 
-因此 M1 只回答“真实 61 层模型能否把 BM alias 当成原 Full-KV cache，并在正常
-退出时安全释放”；它仍有 NPU-to-NPU Full-KV 传输，不得做性能收益声明。
+Connector 通过既有 side channel 发布 D 端 BM Full-KV GVA；Mooncake 只注册和传输
+Full-KV 之后的 Indexer Tensor，不再注册 P/D Full-KV staging。P 端等待本层
+NPU→BM copy 的新 visibility event 后发起同步 G2G；D 端在 ACK 前执行 NPU alias
+可见性 fence，因此 Gather 不会在远端 Host 写完成前读取。M2 仍采用逐层同步 ACK，
+当前只验证正确性，不得据此声明性能收益或通信计算重叠。
+
 Host 模式会把 4K 配置限制为 33 个物理 block，61 层 BF16 Full-KV 的有效数据约
 283 MiB，加上每个 tensor 的 2 MiB 对齐仍落在 1 GiB BM pool 内。若修改层数、
 最大长度或 block 数，必须相应增大 `MEMFABRIC_BM_POOL_BYTES`，且保持 1 GiB 整数倍。
 
-M1 通过后才进入 M2，把 Full-KV payload 改成：
-
-```text
-P NPU staging -> P BM Full KV -> BM G2G/HOST_TCP -> D BM Full KV -> Gather
-Indexer NPU KV ----------------> Mooncake Ascend ----------------> D Indexer KV
-```
-
 M2 同机正确后保留相同 block-offset/fence 契约，在两台真实服务器上把协议切到
-`HOST_RDMA` 完成 G2b。当前实现不会把“初始化了 HOST_TCP BM group”误写成
-“Full-KV 已经走 BM Host-to-Host”。
+`HOST_RDMA` 完成 G2b。HOST_TCP 通过只代表同机功能正确，不代表跨机 RDMA 或性能。
 
 `run.sh` 会主动清除外部 `MC_FORCE_TCP`；不要手工导出它，否则现有
 Ascend engine 可能被错误初始化成 TCP。两种模式使用带模式名的独立日志和结果
@@ -423,9 +431,12 @@ NPU 状态和传输生命周期归档到 `OUTPUT_DIR` 下的带时间戳目录�
 
 通过后，在 Proxy、Prefill、Decode 三个服务终端依次按 `Ctrl+C`。不要在共享服务器
 使用会影响同事 Ray/Python 进程的宽泛 `pkill`。
-M1 `memfabric_bm` 还必须在 P/D 日志中分别看到 8 条
+`memfabric_bm` 还必须在 P/D 日志中分别看到 8 条
 `Released MemFabric BM Full-KV allocator`，且进程正常返回、没有 segfault 或
-double free，才算 allocator 生命周期完整通过。
+double free，才算 allocator 生命周期完整通过。M2 首个真实请求还必须分别看到
+8 条 `MemFabric BM data plane active` 和 8 条
+`Decode MemFabric BM Full-KV visibility fence active`；否则即使请求成功，也不能
+证明 Full-KV 已切到 BM G2G。
 
 ## 当前边界
 
@@ -436,8 +447,8 @@ double free，才算 allocator 生命周期完整通过。
 - `host_relay` 只是默认关闭的兼容性诊断路径，不是性能候选；它使用 TCP 验证
   pinned Host relay 传输，尚未证明跨节点 RDMA/RoCE/UB Host transport，也不使用
   Mooncake Store。
-- `memfabric_bm` 当前是默认关闭的 M1 allocator 门槛；Full-KV payload 仍走
-  Mooncake NPU staging。M2 BM `G2G` 尚未接入生产 Connector，G2b 跨机
+- `memfabric_bm` 当前是默认关闭的 M2 候选：BM `G2G/HOST_TCP` 数据面已接入
+  Connector，但真实 16 卡模型验收尚待本提交在服务器完成；G2b 跨机
   `HOST_RDMA` 也尚未验证。
 - 如果端口被 Ray 等共享服务占用，应修改 `config.env` 选择完整空闲端口段，
   不要终止不属于本任务的进程。

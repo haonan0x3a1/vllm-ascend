@@ -105,12 +105,11 @@ class MemFabricBMRuntimeConfig:
         *,
         tp_rank: int,
         device_id: int,
-    ) -> "MemFabricBMRuntimeConfig":
+    ) -> MemFabricBMRuntimeConfig:
         raw = kv_transfer_config.get_from_extra_config("memfabric_bm", None)
         if not isinstance(raw, dict):
             raise ValueError(
-                "sparse_kv_transfer_mode='memfabric_bm' requires a "
-                "kv_connector_extra_config.memfabric_bm dictionary."
+                "sparse_kv_transfer_mode='memfabric_bm' requires a kv_connector_extra_config.memfabric_bm dictionary."
             )
         supported_keys = {
             "protocol",
@@ -141,9 +140,7 @@ class MemFabricBMRuntimeConfig:
             role=str(role),
             tp_rank=tp_rank,
             device_id=device_id,
-            peer_join_timeout_seconds=float(
-                raw.get("peer_join_timeout_seconds", 600.0)
-            ),
+            peer_join_timeout_seconds=float(raw.get("peer_join_timeout_seconds", 600.0)),
             log_level=int(raw.get("log_level", 1)),
         )
         config.validate()
@@ -151,19 +148,12 @@ class MemFabricBMRuntimeConfig:
 
     def validate(self) -> None:
         if self.protocol not in {"host_tcp", "host_rdma"}:
-            raise ValueError(
-                "memfabric_bm.protocol must be 'host_tcp' or 'host_rdma', "
-                f"got {self.protocol!r}"
-            )
+            raise ValueError(f"memfabric_bm.protocol must be 'host_tcp' or 'host_rdma', got {self.protocol!r}")
         if self.role not in {"kv_producer", "kv_consumer"}:
-            raise ValueError(
-                "memfabric_bm requires kv_role='kv_producer' or "
-                f"'kv_consumer', got {self.role!r}"
-            )
+            raise ValueError(f"memfabric_bm requires kv_role='kv_producer' or 'kv_consumer', got {self.role!r}")
         if self.start_store_role not in {"kv_producer", "kv_consumer"}:
             raise ValueError(
-                "memfabric_bm.start_store_role must be 'kv_producer' or "
-                f"'kv_consumer', got {self.start_store_role!r}"
+                f"memfabric_bm.start_store_role must be 'kv_producer' or 'kv_consumer', got {self.start_store_role!r}"
             )
         for name, value in (
             ("store_host", self.store_host),
@@ -178,10 +168,7 @@ class MemFabricBMRuntimeConfig:
         if self.protocol == "host_rdma" and ipaddress.ip_address(self.nic_ip).is_loopback:
             raise ValueError("memfabric_bm HOST_RDMA requires a non-loopback RDMA NIC IPv4 address")
         if self.pool_bytes <= 0 or self.pool_bytes % MEMFABRIC_BM_DRAM_ALIGNMENT_BYTES:
-            raise ValueError(
-                "memfabric_bm.pool_bytes must be a positive multiple of 1 GiB, "
-                f"got {self.pool_bytes}"
-            )
+            raise ValueError(f"memfabric_bm.pool_bytes must be a positive multiple of 1 GiB, got {self.pool_bytes}")
         if self.tp_rank < 0 or self.device_id < 0:
             raise ValueError(
                 "memfabric_bm tp_rank and device_id must be non-negative, "
@@ -189,10 +176,7 @@ class MemFabricBMRuntimeConfig:
             )
         if self.bm_id < 0:
             raise ValueError(f"memfabric_bm.bm_id must be non-negative, got {self.bm_id}")
-        if (
-            not math.isfinite(self.peer_join_timeout_seconds)
-            or self.peer_join_timeout_seconds <= 0
-        ):
+        if not math.isfinite(self.peer_join_timeout_seconds) or self.peer_join_timeout_seconds <= 0:
             raise ValueError(
                 "memfabric_bm.peer_join_timeout_seconds must be a positive "
                 f"finite number, got {self.peer_join_timeout_seconds}"
@@ -302,8 +286,7 @@ class MemFabricBMFullKVAllocator:
             if mapping_start <= self.local_host_va and end_address <= mapping_end:
                 if "r" not in permissions or "w" not in permissions:
                     raise RuntimeError(
-                        "MemFabric BM LOCAL_HOST mapping is not CPU read/write: "
-                        f"permissions={permissions}"
+                        f"MemFabric BM LOCAL_HOST mapping is not CPU read/write: permissions={permissions}"
                     )
                 return permissions
         raise RuntimeError(
@@ -323,33 +306,25 @@ class MemFabricBMFullKVAllocator:
             try:
                 self.close()
             except BaseException:
-                logger.exception(
-                    "Failed to release a partially initialized MemFabric BM "
-                    "Full-KV allocator."
-                )
+                logger.exception("Failed to release a partially initialized MemFabric BM Full-KV allocator.")
             raise
 
     @staticmethod
     def _recv_control_message(connection: Any) -> bytes:
         message = bytearray()
         while len(message) < MEMFABRIC_BM_MAX_CONTROL_MESSAGE_BYTES:
-            chunk = connection.recv(
-                MEMFABRIC_BM_MAX_CONTROL_MESSAGE_BYTES - len(message)
-            )
+            chunk = connection.recv(MEMFABRIC_BM_MAX_CONTROL_MESSAGE_BYTES - len(message))
             if not chunk:
                 break
             message.extend(chunk)
             if b"\n" in chunk:
                 return bytes(message[: message.index(b"\n") + 1])
-        raise RuntimeError(
-            "MemFabric BM peer rendezvous received an incomplete control message"
-        )
+        raise RuntimeError("MemFabric BM peer rendezvous received an incomplete control message")
 
     def _ready_message(self, stage: str, rank_id: int) -> bytes:
-        return (
-            f"{MEMFABRIC_BM_READY_PREFIX} {self.config.bm_id} "
-            f"{self.config.tp_rank} {stage} {rank_id}\n"
-        ).encode("ascii")
+        return (f"{MEMFABRIC_BM_READY_PREFIX} {self.config.bm_id} {self.config.tp_rank} {stage} {rank_id}\n").encode(
+            "ascii"
+        )
 
     def _rendezvous_with_peer(self, *, stage: str, port: int) -> None:
         """Synchronize one BM lifecycle stage without querying native state."""
@@ -423,9 +398,7 @@ class MemFabricBMFullKVAllocator:
             try:
                 with connection:
                     connection.settimeout(max(0.1, deadline - time.monotonic()))
-                    connection.sendall(
-                        self._ready_message(stage, self.config.rank_id)
-                    )
+                    connection.sendall(self._ready_message(stage, self.config.rank_id))
                     message = self._recv_control_message(connection)
                     if message != MEMFABRIC_BM_ACK:
                         raise RuntimeError(
@@ -442,8 +415,7 @@ class MemFabricBMFullKVAllocator:
                 ) from exc
 
         logger.info(
-            "MemFabric BM %s rendezvous completed: role=%s, tp_rank=%d, "
-            "rank_id=%d.",
+            "MemFabric BM %s rendezvous completed: role=%s, tp_rank=%d, rank_id=%d.",
             stage,
             self.config.role,
             self.config.tp_rank,
@@ -520,9 +492,7 @@ class MemFabricBMFullKVAllocator:
             port=self.config.join_rendezvous_port,
         )
         self._resolve_local_addresses()
-        if not (
-            self.local_gva == self.local_host_va == self.local_device_va
-        ):
+        if not (self.local_gva == self.local_host_va == self.local_device_va):
             raise RuntimeError(
                 "MemFabric BM Full-KV integration requires one unified local "
                 "GVA/Host/NPU address, got "
@@ -530,10 +500,7 @@ class MemFabricBMFullKVAllocator:
                 f"device=0x{self.local_device_va:x}"
             )
         if self.local_device_va % MEMFABRIC_BM_TENSOR_ALIGNMENT_BYTES:
-            raise RuntimeError(
-                "MemFabric BM LOCAL_DEVICE base must be 2 MiB aligned, got "
-                f"0x{self.local_device_va:x}"
-            )
+            raise RuntimeError(f"MemFabric BM LOCAL_DEVICE base must be 2 MiB aligned, got 0x{self.local_device_va:x}")
         permissions = self._assert_cpu_mapping()
         logger.info(
             "Initialized MemFabric BM Full-KV allocator: role=%s, tp_rank=%d, "
@@ -570,8 +537,7 @@ class MemFabricBMFullKVAllocator:
         )
         if not callable(construct_storage) or not callable(construct_tensor):
             raise RuntimeError(
-                "MemFabric BM Full-KV allocation requires torch_npu external "
-                "storage and Tensor construction APIs."
+                "MemFabric BM Full-KV allocation requires torch_npu external storage and Tensor construction APIs."
             )
         storage = construct_storage(data_ptr, device, nbytes)
         metadata = {
@@ -599,6 +565,62 @@ class MemFabricBMFullKVAllocator:
         start = self.local_device_va
         return start <= data_ptr and data_ptr + nbytes <= start + self.config.pool_bytes
 
+    def copy_gva_ranges(
+        self,
+        source_gvas: list[int],
+        destination_gvas: list[int],
+        lengths: list[int],
+    ) -> None:
+        """Synchronously copy local Full-KV ranges to the joined peer BM.
+
+        ``copy_data(..., G2G, ...)`` uses the Host transport selected when the
+        BM was created (HOST_TCP for the same-node gate, HOST_RDMA later).  The
+        source addresses must belong to this allocator's local unified DRAM
+        pool.  Destination addresses are peer GVAs advertised through the
+        connector control plane.
+        """
+        self.initialize()
+        if self.config.role != "kv_producer":
+            raise RuntimeError(
+                f"MemFabric BM Full-KV G2G copies must be initiated by the kv_producer, got role={self.config.role!r}."
+            )
+        if not (len(source_gvas) == len(destination_gvas) == len(lengths)):
+            raise ValueError("MemFabric BM G2G source, destination, and length lists must have identical sizes.")
+        assert self._handle is not None
+        assert self._bm is not None
+        for index, (source_gva, destination_gva, length) in enumerate(zip(source_gvas, destination_gvas, lengths)):
+            if length <= 0:
+                raise ValueError(f"MemFabric BM G2G range {index} has invalid length {length}.")
+            if not self.owns_device_range(source_gva, length):
+                raise ValueError(
+                    "MemFabric BM G2G source range is outside the local Full-KV "
+                    f"pool: index={index}, source=0x{source_gva:x}, length={length}."
+                )
+            if destination_gva <= 0:
+                raise ValueError(
+                    "MemFabric BM G2G destination must be a positive peer GVA: "
+                    f"index={index}, destination={destination_gva}."
+                )
+            result = self._handle.copy_data(
+                source_gva,
+                destination_gva,
+                length,
+                self._bm.BmCopyType.G2G,
+                0,
+            )
+            if result != 0:
+                raise RuntimeError(
+                    "MemFabric BM Full-KV G2G copy failed: "
+                    f"index={index}, source=0x{source_gva:x}, "
+                    f"destination=0x{destination_gva:x}, length={length}, "
+                    f"result={result}."
+                )
+
+    @staticmethod
+    def synchronize_device_visibility() -> None:
+        """Fence peer Host writes before Decode reads through the NPU alias."""
+        torch.npu.synchronize()
+
     def close(self) -> None:
         """Release BM after every external Tensor alias has been destroyed."""
         if self._closed:
@@ -621,8 +643,7 @@ class MemFabricBMFullKVAllocator:
             self._mf_initialized = False
         self._closed = True
         logger.info(
-            "Released MemFabric BM Full-KV allocator: role=%s, tp_rank=%d, "
-            "allocations=%d, used_bytes=%d.",
+            "Released MemFabric BM Full-KV allocator: role=%s, tp_rank=%d, allocations=%d, used_bytes=%d.",
             self.config.role,
             self.config.tp_rank,
             len(self.allocations),

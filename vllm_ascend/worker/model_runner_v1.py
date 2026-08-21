@@ -3946,6 +3946,23 @@ class NPUModelRunner(GPUModelRunner):
 
         if has_kv_transfer_group():
             kv_transfer_group = get_kv_transfer_group()
+            memfabric_bm_allocator = getattr(
+                self,
+                "_memfabric_bm_full_kv_allocator",
+                None,
+            )
+            if memfabric_bm_allocator is not None:
+                register_memfabric_bm_allocator = getattr(
+                    kv_transfer_group,
+                    "register_memfabric_bm_full_kv_allocator",
+                    None,
+                )
+                if not callable(register_memfabric_bm_allocator):
+                    raise RuntimeError(
+                        "sparse_kv_transfer_mode='memfabric_bm' requires a KV "
+                        "connector that supports the BM Full-KV data plane."
+                    )
+                register_memfabric_bm_allocator(memfabric_bm_allocator)
             sparse_staging = getattr(
                 self,
                 "_sparse_kv_offload_transfer_staging",

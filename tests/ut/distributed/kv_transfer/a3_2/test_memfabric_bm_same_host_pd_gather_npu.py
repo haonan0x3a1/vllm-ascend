@@ -330,6 +330,8 @@ def _run_rank(args: argparse.Namespace) -> int:
 
     rank = args.child_rank
     role = "prefill" if rank == PREFILL_RANK else "decode"
+    starts_store = role == args.start_store_role
+    bm_rank_id = PREFILL_RANK if starts_store else DECODE_RANK
     sync_dir = Path(args.sync_dir)
     peer_rank = DECODE_RANK if rank == PREFILL_RANK else PREFILL_RANK
     own_ready = sync_dir / f"rank-{rank}.ready.json"
@@ -358,6 +360,8 @@ def _run_rank(args: argparse.Namespace) -> int:
         "gate": "G2a",
         "rank": rank,
         "role": role,
+        "bm_rank_id": bm_rank_id,
+        "start_store_role": args.start_store_role,
         "protocol": args.protocol,
         "physical_device": os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "unknown"),
         "logical_device": str(device),
@@ -377,8 +381,8 @@ def _run_rank(args: argparse.Namespace) -> int:
         mf_initialized = True
 
         config = bm.BmConfig()
-        config.rank_id = rank
-        config.start_store = rank == PREFILL_RANK
+        config.rank_id = bm_rank_id
+        config.start_store = starts_store
         config.unified_address_space = True
         if args.protocol in ("host_tcp", "host_rdma"):
             config.set_nic(f"tcp://{args.nic_ip}:{args.nic_port_base + rank}")
@@ -401,7 +405,7 @@ def _run_rank(args: argparse.Namespace) -> int:
             raise RuntimeError(f"MemFabric BM join failed: result={join_result}")
         joined = True
 
-        local_gva = handle.peer_rank_ptr(rank, bm.BmMemType.HOST)
+        local_gva = handle.peer_rank_ptr(bm_rank_id, bm.BmMemType.HOST)
         if not local_gva:
             raise RuntimeError("MemFabric BM did not expose the local Host GVA")
         _write_json(
@@ -604,6 +608,8 @@ def _run_parent(args: argparse.Namespace) -> int:
                     store_url,
                     "--protocol",
                     args.protocol,
+                    "--start-store-role",
+                    args.start_store_role,
                     "--pool-bytes",
                     str(args.pool_bytes),
                     "--bm-id",
@@ -672,6 +678,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sync-dir")
     parser.add_argument("--store-url")
     parser.add_argument("--protocol", choices=("host_tcp", "host_rdma"), default="host_tcp")
+    parser.add_argument(
+        "--start-store-role",
+        choices=("prefill", "decode"),
+        default="prefill",
+    )
     parser.add_argument("--prefill-physical-device", type=int, default=0)
     parser.add_argument("--decode-physical-device", type=int, default=8)
     parser.add_argument("--pool-bytes", type=int, default=DEFAULT_POOL_BYTES)

@@ -74,16 +74,8 @@ def test_same_host_tp_pair_uses_store_rank_and_one_hcom_base() -> None:
     assert producer.store_url == consumer.store_url == "tcp://172.16.0.146:22203"
     assert producer.nic_url == "tcp://172.16.0.146:22312"
     assert consumer.nic_url == "tcp://172.16.0.146:22312"
-    assert (
-        producer.create_rendezvous_port
-        == consumer.create_rendezvous_port
-        == 22314
-    )
-    assert (
-        producer.join_rendezvous_port
-        == consumer.join_rendezvous_port
-        == 22315
-    )
+    assert producer.create_rendezvous_port == consumer.create_rendezvous_port == 22314
+    assert producer.join_rendezvous_port == consumer.join_rendezvous_port == 22315
     assert not producer.starts_store
     assert consumer.starts_store
 
@@ -312,3 +304,46 @@ def test_non_store_rank_announces_stage_and_waits_for_ack(monkeypatch) -> None:
 
     assert connect_calls[0][0] == ("172.16.0.146", 22314)
     assert connection.sent == [allocator._ready_message("created", 1)]
+
+
+def test_producer_copies_local_gva_ranges_to_peer() -> None:
+    allocator = MemFabricBMFullKVAllocator(_runtime_config("kv_producer"))
+    copy_calls = []
+
+    def _copy_data(*args):
+        copy_calls.append(args)
+        return 0
+
+    handle = SimpleNamespace(copy_data=_copy_data)
+    allocator._handle = handle
+    allocator._bm = SimpleNamespace(
+        BmCopyType=SimpleNamespace(G2G="g2g"),
+    )
+    allocator.local_device_va = 0x280040000000
+
+    allocator.copy_gva_ranges(
+        [0x280040200000, 0x280040400000],
+        [0x280080200000, 0x280080400000],
+        [4096, 8192],
+    )
+
+    assert copy_calls == [
+        (0x280040200000, 0x280080200000, 4096, "g2g", 0),
+        (0x280040400000, 0x280080400000, 8192, "g2g", 0),
+    ]
+
+
+def test_g2g_rejects_source_outside_local_pool() -> None:
+    allocator = MemFabricBMFullKVAllocator(_runtime_config("kv_producer"))
+    allocator._handle = SimpleNamespace(copy_data=lambda *args: 0)
+    allocator._bm = SimpleNamespace(
+        BmCopyType=SimpleNamespace(G2G="g2g"),
+    )
+    allocator.local_device_va = 0x280040000000
+
+    with pytest.raises(ValueError, match="outside the local Full-KV pool"):
+        allocator.copy_gva_ranges(
+            [0x1000],
+            [0x280080200000],
+            [4096],
+        )
