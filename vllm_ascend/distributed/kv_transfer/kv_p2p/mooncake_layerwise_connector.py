@@ -51,6 +51,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -775,7 +776,8 @@ class KVCacheSendingLayerThread(threading.Thread):
             raise RuntimeError("MemFabric BM Full-KV transfer requires a producer visibility event.")
         # SFA has already copied this layer's touched rows from ordinary NPU
         # staging into the producer BM Full-KV alias before recording the event.
-        send_task.wait_event.synchronize()
+        with record_function_or_nullcontext("dsv32_pd_transfer:wait_prefill_full_kv_visible"):
+            send_task.wait_event.synchronize()
 
         bm_transfer = TransferMeta(src=[], dst=[], length=[], req_ids=[])
         indexer_sessions: dict[str, TransferMeta] = {}
@@ -790,23 +792,25 @@ class KVCacheSendingLayerThread(threading.Thread):
             )
 
         start_time = time.perf_counter()
-        self.memfabric_bm_allocator.copy_gva_ranges(
-            bm_transfer.src,
-            bm_transfer.dst,
-            bm_transfer.length,
-        )
+        with record_function_or_nullcontext("dsv32_pd_transfer:memfabric_full_kv_host_to_host"):
+            self.memfabric_bm_allocator.copy_gva_ranges(
+                bm_transfer.src,
+                bm_transfer.dst,
+                bm_transfer.length,
+            )
         logger.debug(
             "Layer%d MemFabric BM Full-KV G2G transfer %dKB took %.3f ms.",
             send_task.layer_idx,
             sum(bm_transfer.length) // 1024,
             (time.perf_counter() - start_time) * 1000,
         )
-        self._execute_sparse_host_transfer_sessions(
-            engine=self.engine,
-            session_meta=indexer_sessions,
-            layer_idx=send_task.layer_idx,
-            transport_name="Ascend Indexer",
-        )
+        with record_function_or_nullcontext("dsv32_pd_transfer:mooncake_indexer_npu_to_npu"):
+            self._execute_sparse_host_transfer_sessions(
+                engine=self.engine,
+                session_meta=indexer_sessions,
+                layer_idx=send_task.layer_idx,
+                transport_name="Ascend Indexer",
+            )
         if not self._memfabric_bm_transfer_logged:
             logger.info(
                 "MemFabric BM data plane active: layer=%s, Full-KV G2G "
@@ -821,12 +825,13 @@ class KVCacheSendingLayerThread(threading.Thread):
             for req_id, req_meta in send_task.send_request.items():
                 # Decode fences the peer Host writes before acknowledging this
                 # signal, so this layer cannot reach Gather with stale Full KV.
-                self.layer_callback_func(
-                    req_id,
-                    req_meta,
-                    layer_name,
-                    layer_group_idx,
-                )
+                with record_function_or_nullcontext("dsv32_pd_transfer:layer_ack_round_trip"):
+                    self.layer_callback_func(
+                        req_id,
+                        req_meta,
+                        layer_name,
+                        layer_group_idx,
+                    )
         if send_task.layer_idx == (self.total_layers - 1):
             for req_id, req_meta in send_task.send_request.items():
                 if req_meta.chunk_finish:
@@ -1024,7 +1029,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
             # The producer's synchronous BM G2G copy completed before it sent
             # LAYER_STAGED_MSG. Fence the Decode NPU view before acknowledging
             # the layer and allowing Gather to consume the peer-written pages.
-            self.memfabric_bm_allocator.synchronize_device_visibility()
+            with record_function_or_nullcontext("dsv32_pd_transfer:decode_full_kv_visibility_fence"):
+                self.memfabric_bm_allocator.synchronize_device_visibility()
             if not self._memfabric_bm_fence_logged:
                 logger.info(
                     "Decode MemFabric BM Full-KV visibility fence active: layer=%s.",

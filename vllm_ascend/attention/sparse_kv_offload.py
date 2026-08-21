@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import torch
 import torch_npu
+from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
@@ -648,12 +649,13 @@ class SparseKVOffloadWorkspace:
         if self.mode != "host":
             raise RuntimeError("persist_updated_slots is only valid in sparse KV offload host mode.")
         assert self.prefill_kv_cache is not None
-        return self._copy_updated_slots(
-            self.prefill_kv_cache,
-            (full_kv_cache[0], full_kv_cache[1]),
-            slot_mapping_cpu,
-            num_actual_tokens,
-        )
+        with record_function_or_nullcontext("dsv32_pd_transfer:copy_full_kv_npu_to_host"):
+            return self._copy_updated_slots(
+                self.prefill_kv_cache,
+                (full_kv_cache[0], full_kv_cache[1]),
+                slot_mapping_cpu,
+                num_actual_tokens,
+            )
 
     def restore_prefill_context(
         self,
@@ -740,19 +742,20 @@ class SparseKVOffloadWorkspace:
                 f"got block table shape {tuple(full_block_table.shape)}."
             )
 
-        selected_actual_seq_lengths = self.gather_op(
-            selection_k_rope=self.selected_rope,
-            selection_kv_cache=self.selected_nope,
-            selection_kv_block_table=self.selection_block_table,
-            selection_kv_block_status=self.selection_block_status,
-            selection_topk_indices=topk_indices.to(torch.int32).contiguous(),
-            full_k_rope=self.full_rope_source.squeeze(2),
-            full_kv_cache=self.full_nope_source.squeeze(2),
-            full_kv_block_table=full_block_table.to(torch.int32).contiguous(),
-            full_kv_actual_seq=full_actual_seq_lengths.to(torch.int32).contiguous(),
-            full_q_actual_seq=full_query_actual_seq_lengths.to(torch.int32).contiguous(),
-            selection_topk_block_size=SELECTION_TOPK_BLOCK_SIZE,
-        )
+        with record_function_or_nullcontext("dsv32_pd_transfer:gather_selected_kv_host_to_npu"):
+            selected_actual_seq_lengths = self.gather_op(
+                selection_k_rope=self.selected_rope,
+                selection_kv_cache=self.selected_nope,
+                selection_kv_block_table=self.selection_block_table,
+                selection_kv_block_status=self.selection_block_status,
+                selection_topk_indices=topk_indices.to(torch.int32).contiguous(),
+                full_k_rope=self.full_rope_source.squeeze(2),
+                full_kv_cache=self.full_nope_source.squeeze(2),
+                full_kv_block_table=full_block_table.to(torch.int32).contiguous(),
+                full_kv_actual_seq=full_actual_seq_lengths.to(torch.int32).contiguous(),
+                full_q_actual_seq=full_query_actual_seq_lengths.to(torch.int32).contiguous(),
+                selection_topk_block_size=SELECTION_TOPK_BLOCK_SIZE,
+            )
 
         local_sparse_indices = torch.where(
             self.default_topk_indices < selected_actual_seq_lengths.unsqueeze(1),

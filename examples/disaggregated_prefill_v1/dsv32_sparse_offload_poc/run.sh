@@ -72,6 +72,13 @@ MEMFABRIC_BM_POOL_BYTES=${MEMFABRIC_BM_POOL_BYTES:-1073741824}
 MEMFABRIC_BM_STORE_PORT_BASE=${MEMFABRIC_BM_STORE_PORT_BASE:-22200}
 MEMFABRIC_BM_HCOM_PORT_BASE=${MEMFABRIC_BM_HCOM_PORT_BASE:-22300}
 MEMFABRIC_BM_ID=${MEMFABRIC_BM_ID:-74}
+ENABLE_TORCH_PROFILER=${ENABLE_TORCH_PROFILER:-false}
+TORCH_PROFILER_DIR=${TORCH_PROFILER_DIR:-"$OUTPUT_DIR/dsv32-pd-transfer-profile/traces"}
+
+if [[ "$ENABLE_TORCH_PROFILER" != "true" && "$ENABLE_TORCH_PROFILER" != "false" ]]; then
+    echo "ENABLE_TORCH_PROFILER must be true or false, got: $ENABLE_TORCH_PROFILER" >&2
+    exit 1
+fi
 
 required_variables=(
     WORKSPACE_DIR REPO_DIR MODEL_PATH LOG_DIR OUTPUT_DIR CANN_ENV CUSTOM_OPP_ENV
@@ -167,6 +174,14 @@ prepare_environment() {
     export ASCEND_TRANSFER_TIMEOUT
     export VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
     export ASCEND_TRANSPORT_PRINT=1
+
+    if [[ "$ENABLE_TORCH_PROFILER" == "true" ]]; then
+        # record_function_or_nullcontext emits the PD stage labels only when
+        # vLLM custom profiling scopes are enabled before worker startup.
+        export VLLM_CUSTOM_SCOPES_FOR_PROFILING=1
+    else
+        unset VLLM_CUSTOM_SCOPES_FOR_PROFILING
+    fi
 
     if [[ "$SPARSE_KV_TRANSFER_MODE" == "memfabric_bm" ]]; then
         if [[ ! -d "$MEMFABRIC_HYBRID_LIB_DIR" ]]; then
@@ -280,6 +295,25 @@ serve_role() {
     additional_config=$(build_additional_config)
     local kv_transfer_config
     kv_transfer_config=$(build_kv_transfer_config "$kv_role" "$kv_port" "$engine_id")
+    local profiler_args=()
+    if [[ "$ENABLE_TORCH_PROFILER" == "true" ]]; then
+        local role_profiler_dir="$TORCH_PROFILER_DIR/$SPARSE_KV_TRANSFER_MODE/$role"
+        mkdir -p "$role_profiler_dir"
+        local profiler_config
+        profiler_config=$("$MOONCAKE_PYTHON" -c '
+import json
+import sys
+print(json.dumps({
+    "profiler": "torch",
+    "torch_profiler_dir": sys.argv[1],
+    "torch_profiler_with_stack": False,
+    "torch_profiler_record_shapes": False,
+    "ignore_frontend": True,
+}, separators=(",", ":")))
+' "$role_profiler_dir")
+        profiler_args=(--profiler-config "$profiler_config")
+        echo "Torch profiler enabled for $role: $role_profiler_dir"
+    fi
 
     cd "$WORKSPACE_DIR"
     "$MOONCAKE_PYTHON" -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
@@ -300,6 +334,7 @@ serve_role() {
         --no-enable-prefix-caching \
         --enforce-eager \
         --additional-config "$additional_config" \
+        "${profiler_args[@]}" \
         --kv-transfer-config "$kv_transfer_config" \
         2>&1 | tee -i "$log_file"
 }
