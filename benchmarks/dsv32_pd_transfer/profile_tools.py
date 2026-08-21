@@ -139,13 +139,15 @@ def validate_result(result: dict[str, Any], source: Path) -> None:
             raise ValueError(f"{source}: missing numeric metric {metric!r}")
 
 
+def load_result(source: Path) -> dict[str, Any]:
+    result = json.loads(source.read_text(encoding="utf-8"))
+    validate_result(result, source)
+    result["_source"] = str(source)
+    return result
+
+
 def load_results(result_dir: Path) -> list[dict[str, Any]]:
-    results = []
-    for source in sorted(result_dir.glob("*.json")):
-        result = json.loads(source.read_text(encoding="utf-8"))
-        validate_result(result, source)
-        result["_source"] = str(source)
-        results.append(result)
+    results = [load_result(source) for source in sorted(result_dir.glob("*.json"))]
     if not results:
         raise ValueError(f"No benchmark JSON files found in {result_dir}")
     return results
@@ -228,6 +230,8 @@ def main() -> None:
     summarize = subparsers.add_parser("summarize")
     summarize.add_argument("--result-dir", type=Path, required=True)
     summarize.add_argument("--output", type=Path, required=True)
+    validate = subparsers.add_parser("validate-result")
+    validate.add_argument("--result", type=Path, required=True)
     args = parser.parse_args()
 
     if args.command == "preflight":
@@ -242,6 +246,14 @@ def main() -> None:
             max_concurrency=args.max_concurrency,
         )
         print(f"PD profiling config: PASS; Prefill={prefill}, Decode={decode}, inputs={inputs}")
+        return
+
+    if args.command == "validate-result":
+        result = load_result(args.result)
+        print(
+            "Benchmark result: PASS; "
+            f"source={args.result}, completed={result['completed']}, failed={result['failed']}"
+        )
         return
 
     summary = summarize_results(load_results(args.result_dir))

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -32,11 +33,21 @@ def test_targeted_profiler_enables_custom_scopes_without_changing_default() -> N
     assert 'profiler_args=(--profiler-config "$profiler_config")' in run_script
 
 
-def test_benchmark_readiness_uses_the_proxy_healthcheck_route() -> None:
+def test_benchmark_readiness_checks_both_roles_and_proxy_health() -> None:
     run_script = PROFILE_RUN_SCRIPT_PATH.read_text(encoding="utf-8")
 
+    assert '"http://127.0.0.1:$PREFILL_API_PORT/v1/models"' in run_script
+    assert '"http://127.0.0.1:$DECODE_API_PORT/v1/models"' in run_script
     assert '"http://$HOST_IP:$PROXY_PORT/healthcheck"' in run_script
     assert '"http://$HOST_IP:$PROXY_PORT/v1/models"' not in run_script
+
+
+def test_benchmark_validates_each_result_before_continuing() -> None:
+    run_script = PROFILE_RUN_SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert 'profile_tools.py" validate-result' in run_script
+    assert '--result "$result_dir/$result_file"' in run_script
+    assert 'ready >/dev/null' in run_script
 
 
 def test_profile_scopes_cover_every_target_data_path_stage() -> None:
@@ -142,6 +153,17 @@ def test_summary_pairs_equal_repetitions_and_reports_delta() -> None:
     assert comparison["npu_staging_mean"]["mean_ttft_ms"] == 101.5
     assert comparison["memfabric_bm_mean"]["mean_ttft_ms"] == 111.5
     assert comparison["memfabric_vs_npu_staging_pct"]["mean_ttft_ms"] == pytest.approx(9.8522167488)
+
+
+def test_result_validation_rejects_failed_requests(tmp_path: Path) -> None:
+    result = _result("memfabric_bm", 1)
+    result["completed"] = 0
+    result["failed"] = 5
+    source = tmp_path / "failed.json"
+    source.write_text(json.dumps(result), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"completed=0, failed=5, expected=5"):
+        PROFILE_TOOLS.load_result(source)
 
 
 def test_summary_refuses_to_compare_different_revisions() -> None:

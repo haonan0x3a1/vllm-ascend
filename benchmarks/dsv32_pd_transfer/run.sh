@@ -13,7 +13,7 @@ Usage: bash run.sh <command> [arguments]
 
 Commands:
   preflight                     Validate the paired A/B configuration.
-  ready                         Check the running P/D proxy.
+  ready                         Check Prefill, Decode, and the P/D proxy.
   bench <mode> <input> <run>    Run one headline measurement.
   bench-suite <mode>            Run every configured input and repetition.
   profile-one <input>           Capture one MemFabric BM profiler request.
@@ -102,6 +102,10 @@ prepare_environment() {
 }
 
 ready() {
+    curl --noproxy '*' --max-time 30 --fail-with-body --show-error \
+        "http://127.0.0.1:$PREFILL_API_PORT/v1/models" >/dev/null
+    curl --noproxy '*' --max-time 30 --fail-with-body --show-error \
+        "http://127.0.0.1:$DECODE_API_PORT/v1/models" >/dev/null
     curl --noproxy '*' --max-time 30 --fail-with-body --show-error \
         "http://$HOST_IP:$PROXY_PORT/healthcheck"
     echo
@@ -219,6 +223,9 @@ print(version("vllm"), version("vllm-ascend"), version("torch-npu"))
             "sparse_kv_offload_mode=$SPARSE_KV_OFFLOAD_MODE" \
             "memfabric_bm_protocol=$MEMFABRIC_BM_PROTOCOL" \
         2>&1 | tee "$bench_log"
+    "$MOONCAKE_PYTHON" "$SCRIPT_DIR/profile_tools.py" validate-result \
+        --result "$result_dir/$result_file"
+    ready >/dev/null
 }
 
 capture_snapshot() {

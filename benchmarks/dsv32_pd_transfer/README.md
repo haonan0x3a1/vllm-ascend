@@ -45,6 +45,8 @@ bash run.sh summarize
 The summary refuses to pair results if the revision, model hash, device map,
 request shape, or important serving settings differ. Positive latency deltas
 mean MemFabric is slower; positive throughput deltas mean it is faster.
+Each repetition must complete every request and leave Prefill, Decode, and the
+proxy healthy; the suite stops immediately when either check fails.
 
 ## One profiled MemFabric request
 
