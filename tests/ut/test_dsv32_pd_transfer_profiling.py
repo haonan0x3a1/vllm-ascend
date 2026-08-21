@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 PROFILE_TOOLS_PATH = Path(__file__).parents[2] / "benchmarks" / "dsv32_pd_transfer" / "profile_tools.py"
+PROFILE_RUN_SCRIPT_PATH = Path(__file__).parents[2] / "benchmarks" / "dsv32_pd_transfer" / "run.sh"
 RUNTIME_RUN_SCRIPT_PATH = (
     Path(__file__).parents[2] / "examples" / "disaggregated_prefill_v1" / "dsv32_sparse_offload_poc" / "run.sh"
 )
@@ -29,6 +30,13 @@ def test_targeted_profiler_enables_custom_scopes_without_changing_default() -> N
     assert "ENABLE_TORCH_PROFILER=${ENABLE_TORCH_PROFILER:-false}" in run_script
     assert "export VLLM_CUSTOM_SCOPES_FOR_PROFILING=1" in run_script
     assert 'profiler_args=(--profiler-config "$profiler_config")' in run_script
+
+
+def test_benchmark_readiness_uses_the_proxy_healthcheck_route() -> None:
+    run_script = PROFILE_RUN_SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert '"http://$HOST_IP:$PROXY_PORT/healthcheck"' in run_script
+    assert '"http://$HOST_IP:$PROXY_PORT/v1/models"' not in run_script
 
 
 def test_profile_scopes_cover_every_target_data_path_stage() -> None:

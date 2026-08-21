@@ -103,7 +103,7 @@ prepare_environment() {
 
 ready() {
     curl --noproxy '*' --max-time 30 --fail-with-body --show-error \
-        "http://$HOST_IP:$PROXY_PORT/v1/models"
+        "http://$HOST_IP:$PROXY_PORT/healthcheck"
     echo
 }
 
