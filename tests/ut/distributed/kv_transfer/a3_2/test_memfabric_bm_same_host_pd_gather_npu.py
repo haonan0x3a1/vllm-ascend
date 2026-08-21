@@ -385,7 +385,7 @@ def _run_rank(args: argparse.Namespace) -> int:
         config.start_store = starts_store
         config.unified_address_space = True
         if args.protocol in ("host_tcp", "host_rdma"):
-            config.set_nic(f"tcp://{args.nic_ip}:{args.nic_port_base + rank}")
+            config.set_nic(_hcom_nic_url(args.nic_ip, args.nic_port_base))
         bm_result = bm.initialize(args.store_url, WORLD_SIZE, 0, config)
         if bm_result != 0:
             raise RuntimeError(f"MemFabric BM initialize failed: result={bm_result}")
@@ -561,6 +561,20 @@ def _extract_result(output: str) -> dict[str, Any]:
         if line.startswith(RESULT_MARKER):
             return json.loads(line.removeprefix(RESULT_MARKER))
     raise RuntimeError(f"Missing {RESULT_MARKER!r} in child output:\n{output}")
+
+
+def _hcom_nic_url(nic_ip: str, nic_port_base: int) -> str:
+    """Return the shared HCOM base URL for both BM ranks.
+
+    MemFabric adds its BM rank to this base internally. Adding the logical
+    Prefill/Decode rank here as well makes reversed store ownership map both
+    processes to the same effective listen port.
+    """
+    return f"tcp://{nic_ip}:{nic_port_base}"
+
+
+def test_hcom_nic_url_is_shared_by_bm_ranks() -> None:
+    assert _hcom_nic_url("127.0.0.1", 12400) == "tcp://127.0.0.1:12400"
 
 
 def _terminate(processes: list[subprocess.Popen[Any]]) -> None:
