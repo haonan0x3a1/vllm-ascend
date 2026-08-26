@@ -6,6 +6,7 @@ import gzip
 import json
 import statistics
 from collections import defaultdict
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -224,6 +225,60 @@ def _trace_role(source: Path) -> str:
     return "unknown"
 
 
+def analyze_ascend_trace_dirs(
+    trace_dir: Path,
+    analysis_log: Path,
+    analyse_func: Any | None = None,
+) -> dict[str, Any]:
+    raw_trace_dirs = sorted(
+        source
+        for source in trace_dir.rglob("*_ascend_pt")
+        if source.is_dir()
+    )
+    if not raw_trace_dirs:
+        raise ValueError(f"No *_ascend_pt raw trace directories found under {trace_dir}")
+
+    if analyse_func is None:
+        from torch_npu.profiler.profiler import analyse as analyse_func
+
+    analysis_log.parent.mkdir(parents=True, exist_ok=True)
+    analyzed = []
+    skipped = []
+    with analysis_log.open("w", encoding="utf-8") as log_file:
+        for index, source in enumerate(raw_trace_dirs, start=1):
+            trace_views = list(source.rglob("trace_view.json"))
+            if trace_views:
+                skipped.append(str(source))
+                print(f"[{index}/{len(raw_trace_dirs)}] Existing analyzed trace: {source}")
+                continue
+
+            print(f"[{index}/{len(raw_trace_dirs)}] Analyzing Ascend trace: {source}")
+            log_file.write(f"===== {source} =====\n")
+            log_file.flush()
+            try:
+                with redirect_stdout(log_file), redirect_stderr(log_file):
+                    analyse_func(str(source))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Ascend trace analysis failed for {source}; see {analysis_log}"
+                ) from exc
+            trace_views = list(source.rglob("trace_view.json"))
+            if not trace_views:
+                raise RuntimeError(
+                    f"Ascend trace analysis produced no trace_view.json for {source}; "
+                    f"see {analysis_log}"
+                )
+            analyzed.append(str(source))
+
+    return {
+        "trace_dir": str(trace_dir),
+        "raw_trace_dirs": len(raw_trace_dirs),
+        "analyzed": len(analyzed),
+        "skipped_existing": len(skipped),
+        "analysis_log": str(analysis_log),
+    }
+
+
 def _load_trace_events(source: Path) -> list[dict[str, Any]]:
     opener = gzip.open if source.suffix == ".gz" else open
     try:
@@ -350,6 +405,9 @@ def main() -> None:
     summarize_traces = subparsers.add_parser("summarize-traces")
     summarize_traces.add_argument("--trace-dir", type=Path, required=True)
     summarize_traces.add_argument("--output", type=Path, required=True)
+    analyze_traces = subparsers.add_parser("analyze-traces")
+    analyze_traces.add_argument("--trace-dir", type=Path, required=True)
+    analyze_traces.add_argument("--log", type=Path, required=True)
     args = parser.parse_args()
 
     if args.command == "preflight":
@@ -380,6 +438,17 @@ def main() -> None:
         args.output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         print_trace_summary(summary)
         print(f"Trace summary saved to: {args.output}")
+        return
+
+    if args.command == "analyze-traces":
+        result = analyze_ascend_trace_dirs(args.trace_dir, args.log)
+        print(
+            "Ascend trace analysis complete: "
+            f"raw_dirs={result['raw_trace_dirs']}, "
+            f"analyzed={result['analyzed']}, "
+            f"skipped_existing={result['skipped_existing']}"
+        )
+        print(f"Detailed analysis log: {result['analysis_log']}")
         return
 
     summary = summarize_results(load_results(args.result_dir))

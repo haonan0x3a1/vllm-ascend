@@ -17,6 +17,7 @@ Commands:
   bench <mode> <input> <run>    Run one headline measurement.
   bench-suite <mode>            Run every configured input and repetition.
   profile-one <input>           Capture one MemFabric BM profiler request.
+  analyze-profile               Convert raw Ascend traces to trace_view.json.
   summarize-profile             Print the captured PD stage timing summary.
   summarize                     Compare npu_staging with memfabric_bm.
   help                          Show this help.
@@ -71,6 +72,7 @@ RAW_RESULT_DIR="$OUTPUT_DIR/dsv32-pd-transfer-profile/raw/$BENCH_CAMPAIGN"
 PROFILE_RESULT_DIR="$OUTPUT_DIR/dsv32-pd-transfer-profile/profiler/$BENCH_CAMPAIGN"
 SUMMARY_PATH="$OUTPUT_DIR/dsv32-pd-transfer-profile/summary-$BENCH_CAMPAIGN.json"
 PROFILE_STAGE_SUMMARY_PATH="$PROFILE_RESULT_DIR/stage-summary.json"
+PROFILE_ANALYSIS_LOG_PATH="$PROFILE_RESULT_DIR/trace-analysis.log"
 
 validate_mode() {
     local mode=$1
@@ -299,6 +301,13 @@ summarize_profile() {
         --output "$PROFILE_STAGE_SUMMARY_PATH"
 }
 
+analyze_profile() {
+    validate_mode memfabric_bm
+    "$MOONCAKE_PYTHON" "$SCRIPT_DIR/profile_tools.py" analyze-traces \
+        --trace-dir "$TORCH_PROFILER_DIR/$SPARSE_KV_TRANSFER_MODE" \
+        --log "$PROFILE_ANALYSIS_LOG_PATH"
+}
+
 prepare_environment
 case "$ACTION" in
     preflight) preflight ;;
@@ -309,6 +318,7 @@ case "$ACTION" in
         ;;
     bench-suite) bench_suite "${2:-}" ;;
     profile-one) profile_one "${2:-}" ;;
+    analyze-profile) analyze_profile ;;
     summarize-profile) summarize_profile ;;
     summarize)
         "$MOONCAKE_PYTHON" "$SCRIPT_DIR/profile_tools.py" summarize \

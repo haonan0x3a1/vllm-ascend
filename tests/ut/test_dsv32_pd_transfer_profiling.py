@@ -247,6 +247,37 @@ def test_trace_summary_reports_per_role_trace_means(tmp_path: Path) -> None:
     assert fence["mean_per_trace_total_ms"] == 0.5
 
 
+def test_analyze_ascend_traces_converts_only_missing_outputs(tmp_path: Path) -> None:
+    traces = tmp_path / "traces" / "memfabric_bm"
+    pending = traces / "prefill" / "rank0_ascend_pt"
+    existing = traces / "decode" / "rank0_ascend_pt"
+    pending.mkdir(parents=True)
+    existing_output = existing / "ASCEND_PROFILER_OUTPUT"
+    existing_output.mkdir(parents=True)
+    (existing_output / "trace_view.json").write_text("{}", encoding="utf-8")
+    calls = []
+
+    def fake_analyse(source: str) -> None:
+        calls.append(source)
+        output = Path(source) / "ASCEND_PROFILER_OUTPUT"
+        output.mkdir()
+        (output / "trace_view.json").write_text("{}", encoding="utf-8")
+        print("verbose analyser output")
+
+    analysis_log = tmp_path / "analysis.log"
+    result = PROFILE_TOOLS.analyze_ascend_trace_dirs(
+        traces,
+        analysis_log,
+        fake_analyse,
+    )
+
+    assert calls == [str(pending)]
+    assert result["raw_trace_dirs"] == 2
+    assert result["analyzed"] == 1
+    assert result["skipped_existing"] == 1
+    assert "verbose analyser output" in analysis_log.read_text(encoding="utf-8")
+
+
 def test_trace_summary_rejects_missing_custom_scopes(tmp_path: Path) -> None:
     source = tmp_path / "trace_view.json"
     source.write_text(

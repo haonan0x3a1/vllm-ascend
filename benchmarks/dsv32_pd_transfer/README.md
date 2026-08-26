@@ -62,6 +62,7 @@ After all services are ready:
 
 ```bash
 bash run.sh profile-one 3018
+bash run.sh analyze-profile
 bash run.sh summarize-profile
 ```
 
@@ -78,6 +79,11 @@ proxy, then stops both profilers. Search the traces for:
 
 The Gather scope must be interpreted from its NPU kernels in the trace. Its CPU
 scope duration is dispatch overhead, not the Host-to-NPU Gather execution time.
+Ascend first writes raw `*_ascend_pt` directories. `analyze-profile` performs
+the documented offline `torch_npu.profiler.profiler.analyse()` conversion for
+each worker and writes its verbose output to
+`profiler/$BENCH_CAMPAIGN/trace-analysis.log`. It does not require a running
+model, but needs additional disk space for `ASCEND_PROFILER_OUTPUT`.
 `summarize-profile` scans the generated Chrome-trace JSON files and prints each
 custom scope's event count, mean per-trace-file total, mean event duration,
 and maximum event duration. It keeps the source-file list in
