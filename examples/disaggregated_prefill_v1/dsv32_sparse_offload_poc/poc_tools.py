@@ -61,6 +61,16 @@ MEMFABRIC_BM_ALLOCATOR_INIT_MARKER = "Initialized MemFabric BM Full-KV allocator
 MEMFABRIC_BM_DATA_PLANE_MARKER = "MemFabric BM data plane active:"
 MEMFABRIC_BM_VISIBILITY_FENCE_MARKER = "Decode MemFabric BM Full-KV visibility fence active:"
 MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER = "Released MemFabric BM Full-KV allocator:"
+PD_TRANSFER_STAGE_METRICS_MARKER = "PD transfer stage metrics:"
+EXPECTED_PD_TRANSFER_STAGES = {
+    "prefill": {
+        "wait_prefill_full_kv_visible",
+        "memfabric_full_kv_host_to_host",
+        "mooncake_indexer_npu_to_npu",
+        "layer_ack_round_trip",
+    },
+    "decode": {"decode_full_kv_visibility_fence"},
+}
 
 
 @dataclass(frozen=True)
@@ -172,23 +182,43 @@ def count_lifecycle_records(
     prefill_log: str,
     decode_log: str,
 ) -> tuple[int, int]:
-    prefill_count = sum(
-        request_id in line and "done_sending_msg" in line for line in prefill_log.splitlines()
-    )
+    prefill_count = sum(request_id in line and "done_sending_msg" in line for line in prefill_log.splitlines())
     decode_count = sum(
-        request_id in line and "Number of completed KV cache recv requests" in line
-        for line in decode_log.splitlines()
+        request_id in line and "Number of completed KV cache recv requests" in line for line in decode_log.splitlines()
     )
     return prefill_count, decode_count
 
 
 def find_fatal_lines(named_logs: tuple[tuple[str, str], ...]) -> list[str]:
-    return [
-        f"{name}: {line}"
-        for name, text in named_logs
-        for line in text.splitlines()
-        if FATAL_PATTERN.search(line)
-    ]
+    return [f"{name}: {line}" for name, text in named_logs for line in text.splitlines() if FATAL_PATTERN.search(line)]
+
+
+def remove_expected_async_llm_shutdown_cascade(text: str) -> str:
+    """Remove the API-side EngineDead cascade after MPClient already stopped."""
+    lines = text.splitlines()
+    manager_stopped = next(
+        (index for index, line in enumerate(lines) if "[shutdown] MPClient: engine manager stopped" in line),
+        None,
+    )
+    if manager_stopped is None:
+        return text
+    async_failure = next(
+        (index for index in range(manager_stopped + 1, len(lines)) if "AsyncLLM output_handler failed" in lines[index]),
+        None,
+    )
+    if async_failure is None:
+        return text
+    client_stopped = next(
+        (
+            index
+            for index in range(async_failure + 1, len(lines))
+            if "[shutdown] API server: engine client stopped" in lines[index]
+        ),
+        None,
+    )
+    if client_stopped is None or not any("EngineDeadError" in line for line in lines[async_failure:client_stopped]):
+        return text
+    return "\n".join(lines[:async_failure] + lines[client_stopped:])
 
 
 def require_memfabric_bm_runtime_markers(
@@ -206,8 +236,7 @@ def require_memfabric_bm_runtime_markers(
     mismatches = {name: count for name, count in counts.items() if count != tp_size}
     if mismatches:
         raise RuntimeError(
-            "MemFabric BM M2 expected one runtime marker per TP worker, "
-            f"got {counts}, expected_each={tp_size}."
+            f"MemFabric BM M2 expected one runtime marker per TP worker, got {counts}, expected_each={tp_size}."
         )
     return counts
 
@@ -225,10 +254,90 @@ def require_memfabric_bm_shutdown_markers(
     mismatches = {name: count for name, count in counts.items() if count != tp_size}
     if mismatches:
         raise RuntimeError(
-            "MemFabric BM expected one allocator release per TP worker, "
-            f"got {counts}, expected_each={tp_size}."
+            f"MemFabric BM expected one allocator release per TP worker, got {counts}, expected_each={tp_size}."
         )
     return counts
+
+
+def summarize_pd_transfer_stage_metrics(
+    prefill_log: str,
+    decode_log: str,
+    tp_size: int,
+) -> dict[str, object]:
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    records = []
+    for expected_role, text in (
+        ("prefill", prefill_log),
+        ("decode", decode_log),
+    ):
+        role_records = []
+        for line in text.splitlines():
+            if PD_TRANSFER_STAGE_METRICS_MARKER not in line:
+                continue
+            payload = json.loads(line.split(PD_TRANSFER_STAGE_METRICS_MARKER, 1)[1].strip())
+            if payload.get("role") == expected_role:
+                role_records.append(payload)
+        if len(role_records) != tp_size:
+            raise RuntimeError(
+                f"PD transfer stage metrics expected {tp_size} {expected_role} worker records, got {len(role_records)}."
+            )
+        observed_ranks = sorted(int(record["tp_rank"]) for record in role_records)
+        expected_ranks = list(range(tp_size))
+        if observed_ranks != expected_ranks:
+            raise RuntimeError(
+                f"PD transfer stage metrics expected {expected_role} TP ranks {expected_ranks}, got {observed_ranks}."
+            )
+        if any(record.get("status") != "completed" for record in role_records):
+            raise RuntimeError(f"PD transfer stage metrics contain failed {expected_role} records.")
+        records.extend(role_records)
+
+    summary_rows = []
+    for role, expected_stages in EXPECTED_PD_TRANSFER_STAGES.items():
+        role_records = [record for record in records if record["role"] == role]
+        observed_stages = {stage for record in role_records for stage in record.get("stages", {})}
+        missing = sorted(expected_stages - observed_stages)
+        if missing:
+            raise RuntimeError(f"PD transfer stage metrics missing {role} stages: {missing}")
+        for stage in sorted(expected_stages):
+            samples = [record["stages"][stage] for record in role_records]
+            total_events = sum(int(sample["count"]) for sample in samples)
+            if total_events <= 0:
+                raise RuntimeError(f"PD transfer stage metrics have no {role} events for {stage}.")
+            total_ms = sum(float(sample["total_ms"]) for sample in samples)
+            summary_rows.append(
+                {
+                    "role": role,
+                    "stage": stage,
+                    "workers": len(samples),
+                    "events": total_events,
+                    "mean_per_worker_total_ms": total_ms / len(samples),
+                    "mean_event_ms": total_ms / total_events,
+                    "max_event_ms": max(float(sample["max_ms"]) for sample in samples),
+                }
+            )
+    return {"tp_size": tp_size, "records": records, "stages": summary_rows}
+
+
+def stage_summary(args: argparse.Namespace) -> int:
+    summary = summarize_pd_transfer_stage_metrics(
+        Path(args.prefill_log).read_text(errors="replace"),
+        Path(args.decode_log).read_text(errors="replace"),
+        args.tp_size,
+    )
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    print("role     workers  events  mean/worker total  mean/event  max/event  stage")
+    for item in summary["stages"]:
+        print(
+            f"{item['role']:<8} {item['workers']:>7}  {item['events']:>6}  "
+            f"{item['mean_per_worker_total_ms']:>17.3f} ms  "
+            f"{item['mean_event_ms']:>10.3f} ms  "
+            f"{item['max_event_ms']:>9.3f} ms  {item['stage']}"
+        )
+    print(f"PD transfer stage summary saved to: {output}")
+    return 0
 
 
 def run_command(command: list[str], *, cwd: Path | None = None) -> str:
@@ -271,16 +380,8 @@ def memfabric_bm_required_ports(
 ) -> tuple[int, ...]:
     """Return BM store, HCOM, and peer-rendezvous listener ports."""
     store_ports = tuple(store_port_base + tp_rank for tp_rank in range(tp_size))
-    hcom_ports = tuple(
-        hcom_port_base + tp_rank * 4 + rank_id
-        for tp_rank in range(tp_size)
-        for rank_id in (0, 1)
-    )
-    rendezvous_ports = tuple(
-        hcom_port_base + tp_rank * 4 + offset
-        for tp_rank in range(tp_size)
-        for offset in (2, 3)
-    )
+    hcom_ports = tuple(hcom_port_base + tp_rank * 4 + rank_id for tp_rank in range(tp_size) for rank_id in (0, 1))
+    rendezvous_ports = tuple(hcom_port_base + tp_rank * 4 + offset for tp_rank in range(tp_size) for offset in (2, 3))
     return (*store_ports, *hcom_ports, *rendezvous_ports)
 
 
@@ -303,13 +404,9 @@ def preflight(args: argparse.Namespace) -> int:
         errors.append(f"HOST_IP is not a valid IP address: {args.host_ip!r}")
 
     if len(prefill_devices) != args.tp_size:
-        errors.append(
-            f"Prefill device count {len(prefill_devices)} does not match TP size {args.tp_size}."
-        )
+        errors.append(f"Prefill device count {len(prefill_devices)} does not match TP size {args.tp_size}.")
     if len(decode_devices) != args.tp_size:
-        errors.append(
-            f"Decode device count {len(decode_devices)} does not match TP size {args.tp_size}."
-        )
+        errors.append(f"Decode device count {len(decode_devices)} does not match TP size {args.tp_size}.")
     overlap = sorted(set(prefill_devices) & set(decode_devices))
     if overlap:
         errors.append(f"Prefill and Decode devices overlap: {overlap}")
@@ -345,8 +442,7 @@ def preflight(args: argparse.Namespace) -> int:
         inherited_visibility = clear_inherited_device_visibility(os.environ)
         if inherited_visibility is not None:
             print(
-                f"Ignoring inherited {DEVICE_VISIBILITY_ENV}="
-                f"{inherited_visibility!r} for the physical topology check."
+                f"Ignoring inherited {DEVICE_VISIBILITY_ENV}={inherited_visibility!r} for the physical topology check."
             )
         runtime_modules = import_runtime_modules()
         torch = runtime_modules["torch"]
@@ -394,21 +490,14 @@ def preflight(args: argparse.Namespace) -> int:
             )
         )
     try:
-        ephemeral_range = parse_port_range(
-            LINUX_EPHEMERAL_PORT_RANGE.read_text(encoding="utf-8")
-        )
-        reserved_ranges = parse_reserved_port_ranges(
-            LINUX_RESERVED_PORTS.read_text(encoding="utf-8")
-        )
+        ephemeral_range = parse_port_range(LINUX_EPHEMERAL_PORT_RANGE.read_text(encoding="utf-8"))
+        reserved_ranges = parse_reserved_port_ranges(LINUX_RESERVED_PORTS.read_text(encoding="utf-8"))
         unsafe_ports = find_unreserved_ephemeral_ports(
             required_ports,
             ephemeral_range,
             reserved_ranges,
         )
-        print(
-            "Linux ephemeral TCP port range: "
-            f"{ephemeral_range[0]}-{ephemeral_range[1]}"
-        )
+        print(f"Linux ephemeral TCP port range: {ephemeral_range[0]}-{ephemeral_range[1]}")
         if unsafe_ports:
             errors.append(
                 "Fixed application/control ports overlap the unreserved Linux "
@@ -432,8 +521,7 @@ def preflight(args: argparse.Namespace) -> int:
         print(f"  device {device:2d}: {start}-{start + 99}, free={free_count:3d}, status={status}")
         if free_count < args.min_adxl_free_ports:
             errors.append(
-                f"Device {device} ADXL range has only {free_count} free ports; "
-                f"requires {args.min_adxl_free_ports}."
+                f"Device {device} ADXL range has only {free_count} free ports; requires {args.min_adxl_free_ports}."
             )
 
     try:
@@ -460,11 +548,7 @@ def validate(args: argparse.Namespace) -> int:
     results: list[dict[str, object]] = []
 
     for case in build_validation_cases():
-        prompt = (
-            case.text
-            + "\nAfter reading the text, answer beginning with only the word "
-            + f"{case.expected}."
-        )
+        prompt = case.text + "\nAfter reading the text, answer beginning with only the word " + f"{case.expected}."
         payload = json.dumps(
             {
                 "model": args.model,
@@ -564,10 +648,21 @@ def validate(args: argparse.Namespace) -> int:
 def verify_shutdown(args: argparse.Namespace) -> int:
     prefill_log = Path(args.prefill_log).read_text(errors="replace")
     decode_log = Path(args.decode_log).read_text(errors="replace")
+    marker_counts = require_memfabric_bm_shutdown_markers(
+        prefill_log,
+        decode_log,
+        args.tp_size,
+    )
     fatal_lines = find_fatal_lines(
         (
-            ("prefill", prefill_log),
-            ("decode", decode_log),
+            (
+                "prefill",
+                remove_expected_async_llm_shutdown_cascade(prefill_log),
+            ),
+            (
+                "decode",
+                remove_expected_async_llm_shutdown_cascade(decode_log),
+            ),
         )
     )
     if fatal_lines:
@@ -575,11 +670,6 @@ def verify_shutdown(args: argparse.Namespace) -> int:
         print("\n".join(fatal_lines[-200:]))
         raise RuntimeError(f"Found {len(fatal_lines)} fatal log matches")
 
-    marker_counts = require_memfabric_bm_shutdown_markers(
-        prefill_log,
-        decode_log,
-        args.tp_size,
-    )
     print(f"MemFabric BM shutdown markers: {marker_counts}")
     print("MEMFABRIC BM SHUTDOWN: PASSED")
     return 0
@@ -595,27 +685,25 @@ def sha256_file(path: Path) -> str:
 
 def collect(args: argparse.Namespace) -> int:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    evidence_dir = (
-        Path(args.output_dir)
-        / f"dsv32-pd-real61-4k-{args.transfer_mode}-{timestamp}"
-    )
+    evidence_dir = Path(args.output_dir) / f"dsv32-pd-real61-4k-{args.transfer_mode}-{timestamp}"
     evidence_dir.mkdir(parents=True, exist_ok=False)
 
-    for value in (
+    evidence_files = [
         args.validation_output,
         args.prefill_log,
         args.decode_log,
         args.proxy_log,
-    ):
+    ]
+    if args.stage_metrics_output:
+        evidence_files.append(args.stage_metrics_output)
+    for value in evidence_files:
         source = Path(value)
         if not source.is_file():
             raise FileNotFoundError(source)
         destination = evidence_dir / source.name
         shutil.copy2(source, destination)
 
-    (evidence_dir / "git-revision.txt").write_text(
-        run_command(["git", "-C", args.repo_dir, "rev-parse", "HEAD"])
-    )
+    (evidence_dir / "git-revision.txt").write_text(run_command(["git", "-C", args.repo_dir, "rev-parse", "HEAD"]))
     (evidence_dir / "git-status.txt").write_text(
         run_command(["git", "-C", args.repo_dir, "status", "--short", "--branch"])
     )
@@ -653,6 +741,7 @@ def collect(args: argparse.Namespace) -> int:
         MEMFABRIC_BM_DATA_PLANE_MARKER,
         MEMFABRIC_BM_VISIBILITY_FENCE_MARKER,
         MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER,
+        PD_TRANSFER_STAGE_METRICS_MARKER,
     )
     lifecycle_lines = [
         line
@@ -747,6 +836,13 @@ def build_parser() -> argparse.ArgumentParser:
     shutdown_parser.add_argument("--decode-log", required=True)
     shutdown_parser.set_defaults(func=verify_shutdown)
 
+    stage_summary_parser = subparsers.add_parser("stage-summary")
+    stage_summary_parser.add_argument("--tp-size", type=int, required=True)
+    stage_summary_parser.add_argument("--prefill-log", required=True)
+    stage_summary_parser.add_argument("--decode-log", required=True)
+    stage_summary_parser.add_argument("--output", required=True)
+    stage_summary_parser.set_defaults(func=stage_summary)
+
     collect_parser = subparsers.add_parser("collect")
     collect_parser.add_argument("--output-dir", required=True)
     collect_parser.add_argument("--repo-dir", required=True)
@@ -765,6 +861,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     collect_parser.add_argument("--validation-output", required=True)
+    collect_parser.add_argument("--stage-metrics-output")
     collect_parser.add_argument("--prefill-log", required=True)
     collect_parser.add_argument("--decode-log", required=True)
     collect_parser.add_argument("--proxy-log", required=True)

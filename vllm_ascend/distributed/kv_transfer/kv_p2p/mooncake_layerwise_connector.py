@@ -3,6 +3,7 @@
 import contextlib
 import copy
 import hashlib
+import json
 import logging
 import math
 import os
@@ -100,6 +101,71 @@ SPARSE_KV_TRANSFER_MODES = {
 MOONCAKE_MEMORY_ALIGNMENT = 2 * 1024 * 1024
 MOONCAKE_THREAD_STARTUP_TIMEOUT_SECONDS = 30.0
 MOONCAKE_THREAD_SHUTDOWN_TIMEOUT_SECONDS = 30.0
+PD_TRANSFER_STAGE_METRICS_MARKER = "PD transfer stage metrics:"
+
+
+@dataclass
+class TransferStageAggregate:
+    count: int = 0
+    total_ns: int = 0
+    max_ns: int = 0
+
+    def observe(self, elapsed_ns: int) -> None:
+        self.count += 1
+        self.total_ns += elapsed_ns
+        self.max_ns = max(self.max_ns, elapsed_ns)
+
+    def as_dict(self) -> dict[str, int | float]:
+        return {
+            "count": self.count,
+            "total_ms": self.total_ns / 1_000_000,
+            "mean_ms": self.total_ns / self.count / 1_000_000,
+            "max_ms": self.max_ns / 1_000_000,
+        }
+
+
+class TransferStageMetrics:
+    """Aggregate background transfer timings without per-layer log noise."""
+
+    def __init__(self, *, enabled: bool, role: str, tp_rank: int) -> None:
+        self.enabled = enabled
+        self.role = role
+        self.tp_rank = tp_rank
+        self.stages: dict[str, TransferStageAggregate] = defaultdict(TransferStageAggregate)
+
+    @contextlib.contextmanager
+    def measure(self, stage: str) -> Iterator[None]:
+        if not self.enabled:
+            yield
+            return
+        start_ns = time.perf_counter_ns()
+        try:
+            yield
+        finally:
+            self.stages[stage].observe(time.perf_counter_ns() - start_ns)
+
+    def emit(
+        self,
+        request_ids: list[str],
+        *,
+        status: str = "completed",
+    ) -> dict[str, Any] | None:
+        if not self.enabled or not self.stages:
+            return None
+        payload = {
+            "role": self.role,
+            "tp_rank": self.tp_rank,
+            "request_ids": sorted(request_ids),
+            "status": status,
+            "stages": {stage: aggregate.as_dict() for stage, aggregate in sorted(self.stages.items())},
+        }
+        logger.info(
+            "%s %s",
+            PD_TRANSFER_STAGE_METRICS_MARKER,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+        self.stages.clear()
+        return payload
 
 
 @dataclass
@@ -255,6 +321,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         sparse_host_relay_kv: tuple[torch.Tensor, ...] | None = None,
         memfabric_bm_allocator: Any | None = None,
         memfabric_bm_layer_metadata: dict[str, LayerMetadata] | None = None,
+        stage_metrics_enabled: bool = False,
         callback_func: Callable[..., None] = lambda x: None,
         layer_callback_func: Callable[..., None] | None = None,
     ):
@@ -304,6 +371,11 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.callback_func = callback_func
         self.layer_callback_func = layer_callback_func
         self._memfabric_bm_transfer_logged = False
+        self.stage_metrics = TransferStageMetrics(
+            enabled=stage_metrics_enabled,
+            role="prefill",
+            tp_rank=tp_rank,
+        )
         self._stop_event = threading.Event()
 
         host_relay_state = (
@@ -369,6 +441,10 @@ class KVCacheSendingLayerThread(threading.Thread):
             self._transfer_kv_cache(send_task)
         except Exception as e:
             send_task.error = e
+            self.stage_metrics.emit(
+                list(send_task.send_request),
+                status="failed",
+            )
             logger.error(
                 "Failed to transfer KV cache. layer_idx=%s, error=%s. Check transfer engine and memory state.",
                 send_task.layer_idx,
@@ -776,7 +852,10 @@ class KVCacheSendingLayerThread(threading.Thread):
             raise RuntimeError("MemFabric BM Full-KV transfer requires a producer visibility event.")
         # SFA has already copied this layer's touched rows from ordinary NPU
         # staging into the producer BM Full-KV alias before recording the event.
-        with record_function_or_nullcontext("dsv32_pd_transfer:wait_prefill_full_kv_visible"):
+        with (
+            self.stage_metrics.measure("wait_prefill_full_kv_visible"),
+            record_function_or_nullcontext("dsv32_pd_transfer:wait_prefill_full_kv_visible"),
+        ):
             send_task.wait_event.synchronize()
 
         bm_transfer = TransferMeta(src=[], dst=[], length=[], req_ids=[])
@@ -792,7 +871,10 @@ class KVCacheSendingLayerThread(threading.Thread):
             )
 
         start_time = time.perf_counter()
-        with record_function_or_nullcontext("dsv32_pd_transfer:memfabric_full_kv_host_to_host"):
+        with (
+            self.stage_metrics.measure("memfabric_full_kv_host_to_host"),
+            record_function_or_nullcontext("dsv32_pd_transfer:memfabric_full_kv_host_to_host"),
+        ):
             self.memfabric_bm_allocator.copy_gva_ranges(
                 bm_transfer.src,
                 bm_transfer.dst,
@@ -804,7 +886,10 @@ class KVCacheSendingLayerThread(threading.Thread):
             sum(bm_transfer.length) // 1024,
             (time.perf_counter() - start_time) * 1000,
         )
-        with record_function_or_nullcontext("dsv32_pd_transfer:mooncake_indexer_npu_to_npu"):
+        with (
+            self.stage_metrics.measure("mooncake_indexer_npu_to_npu"),
+            record_function_or_nullcontext("dsv32_pd_transfer:mooncake_indexer_npu_to_npu"),
+        ):
             self._execute_sparse_host_transfer_sessions(
                 engine=self.engine,
                 session_meta=indexer_sessions,
@@ -825,7 +910,10 @@ class KVCacheSendingLayerThread(threading.Thread):
             for req_id, req_meta in send_task.send_request.items():
                 # Decode fences the peer Host writes before acknowledging this
                 # signal, so this layer cannot reach Gather with stale Full KV.
-                with record_function_or_nullcontext("dsv32_pd_transfer:layer_ack_round_trip"):
+                with (
+                    self.stage_metrics.measure("layer_ack_round_trip"),
+                    record_function_or_nullcontext("dsv32_pd_transfer:layer_ack_round_trip"),
+                ):
                     self.layer_callback_func(
                         req_id,
                         req_meta,
@@ -833,6 +921,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                         layer_group_idx,
                     )
         if send_task.layer_idx == (self.total_layers - 1):
+            completed_request_ids = []
             for req_id, req_meta in send_task.send_request.items():
                 if req_meta.chunk_finish:
                     self.callback_func(
@@ -841,6 +930,9 @@ class KVCacheSendingLayerThread(threading.Thread):
                         layer_group_idx,
                         trans_flag=True,
                     )
+                    completed_request_ids.append(req_id)
+            if completed_request_ids:
+                self.stage_metrics.emit(completed_request_ids)
 
     def _transfer_kv_cache(self, send_task: SendTask):
         if self.uses_sparse_host_relay:
@@ -959,6 +1051,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         sparse_host_staging_kv: tuple[torch.Tensor, ...] | None = None,
         sparse_host_relay_kv: tuple[torch.Tensor, ...] | None = None,
         memfabric_bm_allocator: Any | None = None,
+        stage_metrics_enabled: bool = False,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingLayerThread")
         self.tp_rank = tp_rank
@@ -979,6 +1072,11 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.sparse_host_relay_kv = sparse_host_relay_kv
         self.memfabric_bm_allocator = memfabric_bm_allocator
         self._memfabric_bm_fence_logged = False
+        self.stage_metrics = TransferStageMetrics(
+            enabled=stage_metrics_enabled,
+            role="decode",
+            tp_rank=tp_rank,
+        )
         self._stop_event = threading.Event()
 
     @property
@@ -1029,7 +1127,10 @@ class KVCacheRecvingLayerThread(threading.Thread):
             # The producer's synchronous BM G2G copy completed before it sent
             # LAYER_STAGED_MSG. Fence the Decode NPU view before acknowledging
             # the layer and allowing Gather to consume the peer-written pages.
-            with record_function_or_nullcontext("dsv32_pd_transfer:decode_full_kv_visibility_fence"):
+            with (
+                self.stage_metrics.measure("decode_full_kv_visibility_fence"),
+                record_function_or_nullcontext("dsv32_pd_transfer:decode_full_kv_visibility_fence"),
+            ):
                 self.memfabric_bm_allocator.synchronize_device_visibility()
             if not self._memfabric_bm_fence_logged:
                 logger.info(
@@ -1097,12 +1198,13 @@ class KVCacheRecvingLayerThread(threading.Thread):
             self.task_tracker.pop(req_id, None)
             self.failed_requests.add(req_id)
 
-    def update_done_task(self, req_id, trans_count, side_channel_path):
+    def update_done_task(self, req_id, trans_count, side_channel_path) -> bool:
         """
         Handle a completed task by adding it to the done_requests set and removing it from the task tracker.
         Args:
             req_id: The ID of the request that has completed.
         """
+        completed = False
         with self.lock:
             if req_id not in self.task_tracker:
                 self.task_tracker[req_id] = set()
@@ -1110,6 +1212,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
             if len(self.task_tracker[req_id]) == trans_count:
                 self.task_tracker.pop(req_id)
                 self.done_requests.add(req_id)
+                completed = True
+        return completed
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -1151,8 +1255,14 @@ class KVCacheRecvingLayerThread(threading.Thread):
                             request_id = msg[1]
                             trans_count = msg[2]
                             side_channel_path = msg[3]
-                            self.update_done_task(request_id, trans_count, side_channel_path)
+                            completed = self.update_done_task(
+                                request_id,
+                                trans_count,
+                                side_channel_path,
+                            )
                             sock.send_multipart((identity, b"", b"ACK"))
+                            if completed:
+                                self.stage_metrics.emit([request_id])
                         elif msg[0] == LAYER_STAGED_MSG:
                             layer_name = msg[2]
                             remote_block_ids = list(msg[3])
@@ -1751,9 +1861,20 @@ class MooncakeLayerwiseConnectorWorker:
             )
         self.uses_sparse_host_relay = self.sparse_kv_transfer_mode == SPARSE_KV_TRANSFER_MODE_HOST_RELAY
         self.uses_memfabric_bm = self.sparse_kv_transfer_mode == SPARSE_KV_TRANSFER_MODE_MEMFABRIC_BM
+        self.stage_metrics_enabled = vllm_config.kv_transfer_config.get_from_extra_config(
+            "sparse_kv_stage_metrics",
+            False,
+        )
+        if not isinstance(self.stage_metrics_enabled, bool):
+            raise ValueError("MooncakeLayerwiseConnector sparse_kv_stage_metrics must be a boolean.")
+        if self.stage_metrics_enabled and not self.uses_memfabric_bm:
+            raise ValueError(
+                "MooncakeLayerwiseConnector sparse_kv_stage_metrics requires sparse_kv_transfer_mode=memfabric_bm."
+            )
         logger.info(
-            "Mooncake sparse KV transfer mode: %s.",
+            "Mooncake sparse KV transfer mode: %s; stage_metrics=%s.",
             self.sparse_kv_transfer_mode,
+            self.stage_metrics_enabled,
         )
         if self.uses_sparse_host_relay and MOONCAKE_FORCE_TCP_ENV in os.environ:
             raise RuntimeError(
@@ -2213,6 +2334,7 @@ class MooncakeLayerwiseConnectorWorker:
                 sparse_host_relay_kv=self.sparse_host_relay_kv,
                 memfabric_bm_allocator=self.memfabric_bm_allocator,
                 memfabric_bm_layer_metadata=self.memfabric_bm_layer_metadata,
+                stage_metrics_enabled=self.stage_metrics_enabled,
                 callback_func=self.send_done_send_signal,
                 layer_callback_func=(
                     self.send_layer_staged_signal if self.sparse_host_staging_kv is not None else None
@@ -2239,6 +2361,7 @@ class MooncakeLayerwiseConnectorWorker:
                 sparse_host_staging_kv=self.sparse_host_staging_kv,
                 sparse_host_relay_kv=self.sparse_host_relay_kv,
                 memfabric_bm_allocator=self.memfabric_bm_allocator,
+                stage_metrics_enabled=self.stage_metrics_enabled,
             )
             self.kv_recv_layer_thread.start()
             self._wait_for_background_thread_start(

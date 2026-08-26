@@ -36,6 +36,7 @@ Commands:
   proxy                 Start the P/D proxy in the foreground.
   ready <role>          Check decode, prefill, or proxy readiness.
   validate              Run the final below/above-Top-K request suite.
+  stage-summary         Summarize Host-observed background transfer timings.
   verify-shutdown       Verify every MemFabric BM worker released its allocator.
   collect               Archive logs, results, revisions, and checksums.
   help                  Show this help.
@@ -74,9 +75,14 @@ MEMFABRIC_BM_HCOM_PORT_BASE=${MEMFABRIC_BM_HCOM_PORT_BASE:-22300}
 MEMFABRIC_BM_ID=${MEMFABRIC_BM_ID:-74}
 ENABLE_TORCH_PROFILER=${ENABLE_TORCH_PROFILER:-false}
 TORCH_PROFILER_DIR=${TORCH_PROFILER_DIR:-"$OUTPUT_DIR/dsv32-pd-transfer-profile/traces"}
+SPARSE_KV_STAGE_METRICS=${SPARSE_KV_STAGE_METRICS:-false}
 
 if [[ "$ENABLE_TORCH_PROFILER" != "true" && "$ENABLE_TORCH_PROFILER" != "false" ]]; then
     echo "ENABLE_TORCH_PROFILER must be true or false, got: $ENABLE_TORCH_PROFILER" >&2
+    exit 1
+fi
+if [[ "$SPARSE_KV_STAGE_METRICS" != "true" && "$SPARSE_KV_STAGE_METRICS" != "false" ]]; then
+    echo "SPARSE_KV_STAGE_METRICS must be true or false, got: $SPARSE_KV_STAGE_METRICS" >&2
     exit 1
 fi
 
@@ -105,6 +111,7 @@ HYBRID_TRANSFER_LOG="$LOG_DIR/dsv32-mooncake-hybrid-transfer-probe.log"
 HOST_RELAY_LOG="$LOG_DIR/dsv32-mooncake-host-relay-probe.log"
 DIRECT_HOST_GATHER_LOG="$LOG_DIR/dsv32-direct-pinned-host-gather-probe.log"
 VALIDATION_OUTPUT="$OUTPUT_DIR/dsv32-pd-real61-4k-$SPARSE_KV_TRANSFER_MODE-final-suite.json"
+STAGE_METRICS_OUTPUT="$OUTPUT_DIR/dsv32-pd-real61-4k-$SPARSE_KV_TRANSFER_MODE-stage-metrics.json"
 PROXY_SCRIPT="$REPO_DIR/examples/disaggregated_prefill_v1/load_balance_proxy_layerwise_server_example.py"
 HOST_TRANSFER_TEST="tests/ut/distributed/kv_transfer/a3_2/"
 HOST_TRANSFER_TEST+="test_mooncake_transfer_engine_npu.py::test_mooncake_host_to_host_tcp_transfer"
@@ -215,11 +222,13 @@ import sys
     bm_hcom_port_base,
     bm_id,
     bm_peer_join_timeout_seconds,
+    stage_metrics,
 ) = sys.argv[1:]
 extra_config = {
     "prefill": {"dp_size": 1, "tp_size": int(tp_size)},
     "decode": {"dp_size": 1, "tp_size": int(tp_size)},
     "sparse_kv_transfer_mode": transfer_mode,
+    "sparse_kv_stage_metrics": stage_metrics == "true",
 }
 if transfer_mode == "memfabric_bm":
     extra_config["memfabric_bm"] = {
@@ -252,7 +261,8 @@ print(json.dumps({
         "$MEMFABRIC_BM_STORE_PORT_BASE" \
         "$MEMFABRIC_BM_HCOM_PORT_BASE" \
         "$MEMFABRIC_BM_ID" \
-        "$ASCEND_TRANSFER_TIMEOUT"
+        "$ASCEND_TRANSFER_TIMEOUT" \
+        "$SPARSE_KV_STAGE_METRICS"
 }
 
 build_additional_config() {
@@ -459,6 +469,21 @@ case "$ACTION" in
             --decode-log "$DECODE_LOG" \
             --proxy-log "$PROXY_LOG"
         ;;
+    stage-summary)
+        if [[ "$SPARSE_KV_TRANSFER_MODE" != "memfabric_bm" ]]; then
+            echo "stage-summary requires SPARSE_KV_TRANSFER_MODE=memfabric_bm" >&2
+            exit 1
+        fi
+        if [[ "$SPARSE_KV_STAGE_METRICS" != "true" ]]; then
+            echo "stage-summary requires SPARSE_KV_STAGE_METRICS=true before service startup" >&2
+            exit 1
+        fi
+        "$MOONCAKE_PYTHON" "$SCRIPT_DIR/poc_tools.py" stage-summary \
+            --tp-size "$TP_SIZE" \
+            --prefill-log "$PREFILL_LOG" \
+            --decode-log "$DECODE_LOG" \
+            --output "$STAGE_METRICS_OUTPUT"
+        ;;
     verify-shutdown)
         if [[ "$SPARSE_KV_TRANSFER_MODE" != "memfabric_bm" ]]; then
             echo "verify-shutdown requires SPARSE_KV_TRANSFER_MODE=memfabric_bm" >&2
@@ -470,6 +495,10 @@ case "$ACTION" in
             --decode-log "$DECODE_LOG"
         ;;
     collect)
+        stage_metrics_args=()
+        if [[ -f "$STAGE_METRICS_OUTPUT" ]]; then
+            stage_metrics_args=(--stage-metrics-output "$STAGE_METRICS_OUTPUT")
+        fi
         "$MOONCAKE_PYTHON" "$SCRIPT_DIR/poc_tools.py" collect \
             --output-dir "$OUTPUT_DIR" \
             --repo-dir "$REPO_DIR" \
@@ -484,6 +513,7 @@ case "$ACTION" in
             --decode-kv-port-base "$DECODE_KV_PORT_BASE" \
             --transfer-mode "$SPARSE_KV_TRANSFER_MODE" \
             --validation-output "$VALIDATION_OUTPUT" \
+            "${stage_metrics_args[@]}" \
             --prefill-log "$PREFILL_LOG" \
             --decode-log "$DECODE_LOG" \
             --proxy-log "$PROXY_LOG"

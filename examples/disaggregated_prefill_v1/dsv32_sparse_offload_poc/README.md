@@ -448,8 +448,53 @@ bash run.sh collect
 D visibility-fence marker 也均为 `8/8`。运行中证据目录为
 `/workspace/w50062541/output/dsv32-pd-real61-4k-memfabric_bm-20260821-104138`。
 该次停服还确认 16 张 NPU 无残留进程、全部应用/BM 端口恢复空闲且 preflight
-重新通过；release 日志采集修复位于后续 revision `cbdbf422d`，等待下一次自然运行
-顺带执行 `verify-shutdown`，不阻塞同机 M2 功能正确性结论。
+重新通过。后续一次停服没有复现原来的 double-free/unmap driver fatal，但 P/D 日志
+均缺少 allocator release marker，因此“进程最终消失”和“allocator 按契约显式释放”
+仍需分开判断。
+
+## 等待双机期间的单机工程收口
+
+单机不再重复已经通过的正确性套件和 A/B benchmark。当前证据状态是：
+
+| 项目 | 状态 | 结论边界 |
+|---|---|---|
+| TP8 + TP8 真实模型正确性 | 已闭环 | 同机 `HOST_TCP` |
+| MemFabric 30/30 请求稳定性 | 已闭环 | 单请求、同机 |
+| `npu_staging` / `memfabric_bm` A/B | 已闭环 | MemFabric TTFT 慢约 6%，不外推双机 |
+| NPU→Host copy / Gather trace | 已闭环 | 前台模型执行线程的 NPU scope |
+| Connector 后台五阶段耗时 | 代码已补，待一次验收 | Host-observed 聚合时间 |
+| allocator 有序释放 | 代码已补，待一次验收 | P/D 各 8 条 release marker |
+
+后台五阶段埋点默认关闭。只在单请求诊断时设置：
+
+```bash
+ENABLE_TORCH_PROFILER=false
+SPARSE_KV_STAGE_METRICS=true
+```
+
+它每个 TP worker 只输出一条聚合 JSON，覆盖 P 侧 visibility wait、MemFabric
+Host-to-Host、Mooncake Indexer、ACK round trip，以及 D 侧 visibility fence；不会像
+逐层日志那样刷屏。服务 ready 后只跑一个 3018-token 请求：
+
+```bash
+cd /workspace/w50062541/code/vllm-ascend/benchmarks/dsv32_pd_transfer
+bash run.sh stage-one 3018
+
+cd /workspace/w50062541/code/vllm-ascend/examples/disaggregated_prefill_v1/dsv32_sparse_offload_poc
+bash run.sh stage-summary
+```
+
+随后正常停止 Proxy、Prefill、Decode，等待两个服务终端都返回 shell，再执行：
+
+```bash
+bash run.sh verify-shutdown
+bash run.sh collect
+```
+
+这一次运行同时承担两个验收目标：`stage-summary` 必须收到 P/D 各 8 个 TP rank
+记录，`verify-shutdown` 必须收到 P/D 各 8 个 allocator release marker，且不得出现
+driver fatal 或残留 NPU worker。两项通过后，单机工程闭环结束；下一阶段只剩双机
+`HOST_RDMA` 正确性、性能和 Decode 干扰验证。
 
 ## 当前边界
 

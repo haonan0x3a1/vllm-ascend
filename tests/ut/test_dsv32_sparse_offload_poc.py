@@ -14,10 +14,10 @@
 # limitations under the License.
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
-
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -38,6 +38,14 @@ def test_service_log_capture_ignores_sigint_until_cleanup_finishes():
     run_script = RUN_SCRIPT_PATH.read_text(encoding="utf-8")
 
     assert '2>&1 | tee -i "$log_file"' in run_script
+
+
+def test_runtime_config_exposes_opt_in_stage_metrics():
+    run_script = RUN_SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert '"sparse_kv_stage_metrics": stage_metrics == "true"' in run_script
+    assert "stage-summary)" in run_script
+    assert '--stage-metrics-output "$STAGE_METRICS_OUTPUT"' in run_script
     assert '2>&1 | tee -i "$PROXY_LOG"' in run_script
 
 
@@ -132,7 +140,7 @@ def test_memfabric_same_host_ports_are_distinct_per_tp_role():
 def test_memfabric_bm_api_is_resolved_from_package_export():
     package = ModuleType("memfabric_hybrid")
     bm_api = ModuleType("bm")
-    setattr(package, "bm", bm_api)
+    package.bm = bm_api
 
     assert POC_TOOLS.resolve_memfabric_bm_api(package) is bm_api
 
@@ -148,10 +156,7 @@ def test_count_lifecycle_records_uses_specific_completion_events():
     decode_log = "\n".join(
         [
             f"scheduler {request_id}",
-            *(
-                f"rank {rank} Number of completed KV cache recv requests: 1 {request_id}"
-                for rank in range(8)
-            ),
+            *(f"rank {rank} Number of completed KV cache recv requests: 1 {request_id}" for rank in range(8)),
         ]
     )
 
@@ -183,9 +188,7 @@ def test_memfabric_runtime_markers_require_every_tp_worker():
 
 def test_memfabric_runtime_markers_reject_a_silent_data_plane_fallback():
     tp_size = 2
-    prefill_log = "\n".join(
-        POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_INIT_MARKER for _ in range(tp_size)
-    )
+    prefill_log = "\n".join(POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_INIT_MARKER for _ in range(tp_size))
     decode_log = "\n".join(
         (
             *(POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_INIT_MARKER for _ in range(tp_size)),
@@ -203,12 +206,8 @@ def test_memfabric_runtime_markers_reject_a_silent_data_plane_fallback():
 
 def test_memfabric_shutdown_markers_require_every_tp_worker():
     tp_size = 2
-    prefill_log = "\n".join(
-        POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER for _ in range(tp_size)
-    )
-    decode_log = "\n".join(
-        POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER for _ in range(tp_size)
-    )
+    prefill_log = "\n".join(POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER for _ in range(tp_size))
+    decode_log = "\n".join(POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER for _ in range(tp_size))
 
     assert POC_TOOLS.require_memfabric_bm_shutdown_markers(prefill_log, decode_log, tp_size) == {
         "prefill_releases": 2,
@@ -219,9 +218,7 @@ def test_memfabric_shutdown_markers_require_every_tp_worker():
 def test_memfabric_shutdown_markers_reject_a_missing_worker_release():
     tp_size = 2
     prefill_log = POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER
-    decode_log = "\n".join(
-        POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER for _ in range(tp_size)
-    )
+    decode_log = "\n".join(POC_TOOLS.MEMFABRIC_BM_ALLOCATOR_RELEASE_MARKER for _ in range(tp_size))
 
     try:
         POC_TOOLS.require_memfabric_bm_shutdown_markers(prefill_log, decode_log, tp_size)
@@ -229,6 +226,88 @@ def test_memfabric_shutdown_markers_reject_a_missing_worker_release():
         assert "prefill_releases" in str(exc)
     else:
         raise AssertionError("missing allocator release markers must fail validation")
+
+
+def test_pd_transfer_stage_summary_requires_all_workers_and_stages():
+    prefill_stages = {
+        stage: {"count": 2, "total_ms": 6.0, "mean_ms": 3.0, "max_ms": 4.0}
+        for stage in POC_TOOLS.EXPECTED_PD_TRANSFER_STAGES["prefill"]
+    }
+    decode_stages = {
+        stage: {"count": 2, "total_ms": 2.0, "mean_ms": 1.0, "max_ms": 1.5}
+        for stage in POC_TOOLS.EXPECTED_PD_TRANSFER_STAGES["decode"]
+    }
+
+    def record(role: str, rank: int, stages: dict) -> str:
+        payload = {
+            "role": role,
+            "tp_rank": rank,
+            "request_ids": ["request-1"],
+            "status": "completed",
+            "stages": stages,
+        }
+        return f"prefix {POC_TOOLS.PD_TRANSFER_STAGE_METRICS_MARKER} {json.dumps(payload)}"
+
+    summary = POC_TOOLS.summarize_pd_transfer_stage_metrics(
+        "\n".join(record("prefill", rank, prefill_stages) for rank in range(2)),
+        "\n".join(record("decode", rank, decode_stages) for rank in range(2)),
+        2,
+    )
+
+    rows = {(row["role"], row["stage"]): row for row in summary["stages"]}
+    host_to_host = rows[("prefill", "memfabric_full_kv_host_to_host")]
+    assert host_to_host["workers"] == 2
+    assert host_to_host["events"] == 4
+    assert host_to_host["mean_per_worker_total_ms"] == 6.0
+    assert host_to_host["mean_event_ms"] == 3.0
+
+
+def test_pd_transfer_stage_summary_rejects_missing_worker():
+    payload = {
+        "role": "prefill",
+        "tp_rank": 0,
+        "status": "completed",
+        "stages": {},
+    }
+    prefill_log = f"{POC_TOOLS.PD_TRANSFER_STAGE_METRICS_MARKER} {json.dumps(payload)}"
+
+    try:
+        POC_TOOLS.summarize_pd_transfer_stage_metrics(prefill_log, "", 2)
+    except RuntimeError as exc:
+        assert "expected 2 prefill worker records" in str(exc)
+    else:
+        raise AssertionError("missing stage-metrics worker record must fail")
+
+
+def test_pd_transfer_stage_summary_rejects_duplicate_rank():
+    def record(role: str, stages: dict) -> str:
+        payload = {
+            "role": role,
+            "tp_rank": 0,
+            "status": "completed",
+            "stages": stages,
+        }
+        return f"{POC_TOOLS.PD_TRANSFER_STAGE_METRICS_MARKER} {json.dumps(payload)}"
+
+    prefill_stages = {
+        stage: {"count": 1, "total_ms": 1.0, "mean_ms": 1.0, "max_ms": 1.0}
+        for stage in POC_TOOLS.EXPECTED_PD_TRANSFER_STAGES["prefill"]
+    }
+    decode_stages = {
+        stage: {"count": 1, "total_ms": 1.0, "mean_ms": 1.0, "max_ms": 1.0}
+        for stage in POC_TOOLS.EXPECTED_PD_TRANSFER_STAGES["decode"]
+    }
+
+    try:
+        POC_TOOLS.summarize_pd_transfer_stage_metrics(
+            "\n".join(record("prefill", prefill_stages) for _ in range(2)),
+            "\n".join(record("decode", decode_stages) for _ in range(2)),
+            2,
+        )
+    except RuntimeError as exc:
+        assert "expected prefill TP ranks" in str(exc)
+    else:
+        raise AssertionError("duplicate stage-metrics TP rank must fail")
 
 
 def test_find_fatal_lines_ignores_unrelated_warnings():
@@ -240,6 +319,38 @@ def test_find_fatal_lines_ignores_unrelated_warnings():
     )
 
     assert matches == ["prefill: RuntimeError: transfer failed"]
+
+
+def test_shutdown_filter_removes_engine_dead_after_manager_stopped():
+    text = "\n".join(
+        (
+            "INFO [shutdown] MPClient: engine manager stopped",
+            "ERROR AsyncLLM output_handler failed.",
+            "ERROR Traceback (most recent call last):",
+            "ERROR vllm.v1.engine.exceptions.EngineDeadError: stopped",
+            "INFO [shutdown] API server: engine client stopped",
+            "INFO Application shutdown complete.",
+        )
+    )
+
+    filtered = POC_TOOLS.remove_expected_async_llm_shutdown_cascade(text)
+
+    assert "Traceback" not in filtered
+    assert "EngineDeadError" not in filtered
+    assert "API server: engine client stopped" in filtered
+
+
+def test_shutdown_filter_keeps_engine_dead_without_orderly_manager_stop():
+    text = "\n".join(
+        (
+            "ERROR AsyncLLM output_handler failed.",
+            "ERROR Traceback (most recent call last):",
+            "ERROR vllm.v1.engine.exceptions.EngineDeadError: crashed",
+            "INFO [shutdown] API server: engine client stopped",
+        )
+    )
+
+    assert POC_TOOLS.remove_expected_async_llm_shutdown_cascade(text) == text
 
 
 def test_parse_devices_rejects_duplicate_physical_cards():

@@ -4398,7 +4398,22 @@ class NPUModelRunner(GPUModelRunner):
     def shutdown(self) -> None:
         """Destroy the BM pool before the parent empties the NPU cache."""
         allocator = getattr(self, "_memfabric_bm_full_kv_allocator", None)
+        uses_memfabric_bm = self._uses_memfabric_bm_full_kv()
+        logger.info(
+            "[shutdown] NPUModelRunner: starting; memfabric_bm=%s, "
+            "allocator_present=%s",
+            uses_memfabric_bm,
+            allocator is not None,
+        )
+        if uses_memfabric_bm and allocator is None:
+            logger.warning(
+                "[shutdown] NPUModelRunner: MemFabric BM mode has no allocator "
+                "to release"
+            )
         if allocator is not None:
+            logger.info(
+                "[shutdown] NPUModelRunner: clearing MemFabric BM tensor aliases"
+            )
             self._clear_memfabric_bm_full_kv_aliases()
             allocator.close()
             del self._memfabric_bm_full_kv_allocator
@@ -4407,6 +4422,7 @@ class NPUModelRunner(GPUModelRunner):
         # must already be closed or torch_npu may try to unmap allocator
         # handles while MemFabric still owns the unified device mapping.
         super().shutdown()
+        logger.info("[shutdown] NPUModelRunner: completed")
 
     def _allocate_sparse_c8_indexer_tensors(
         self,

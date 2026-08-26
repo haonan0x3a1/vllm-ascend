@@ -1533,7 +1533,7 @@ class TestNPUWorkerWeightUpdate(TestBase):
         with self.assertRaises(RuntimeError):
             worker.update_weights({"names": [], "dtype_names": [], "shapes": []})
 
-    @patch("vllm.distributed.kv_transfer.ensure_kv_transfer_shutdown", create=True)
+    @patch("vllm_ascend.worker.worker.ensure_kv_transfer_shutdown")
     def test_shutdown_releases_engine(self, _mock_kv_shutdown):
         engine = MagicMock()
         worker = self._make_worker(engine=engine)
@@ -1542,3 +1542,38 @@ class TestNPUWorkerWeightUpdate(TestBase):
         worker.shutdown()
 
         engine.shutdown.assert_called_once()
+        worker.model_runner.shutdown.assert_called_once()
+
+    @patch("vllm_ascend.worker.worker.ensure_kv_transfer_shutdown")
+    def test_shutdown_releases_model_runner_after_profiler_failure(
+        self,
+        _mock_kv_shutdown,
+    ):
+        worker = self._make_worker(engine=None)
+        worker.profiler = MagicMock()
+        worker.profiler.shutdown.side_effect = RuntimeError("profiler failed")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "NPUWorker shutdown failed in stages: profiler",
+        ):
+            worker.shutdown()
+
+        worker.model_runner.shutdown.assert_called_once()
+
+    @patch("vllm_ascend.worker.worker.ensure_kv_transfer_shutdown")
+    def test_shutdown_does_not_release_model_runner_if_connector_is_alive(
+        self,
+        mock_kv_shutdown,
+    ):
+        worker = self._make_worker(engine=None)
+        worker.profiler = None
+        mock_kv_shutdown.side_effect = RuntimeError("connector failed")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "NPUWorker shutdown failed in stages: kv_connector",
+        ):
+            worker.shutdown()
+
+        worker.model_runner.shutdown.assert_not_called()

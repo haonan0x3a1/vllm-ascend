@@ -376,19 +376,46 @@ class NPUWorker(WorkerBase):
         self._is_checkpoint_format = True
 
     def shutdown(self) -> None:
+        """Release worker resources while preserving the KV-memory order."""
+        errors: list[tuple[str, Exception]] = []
+
+        def run_stage(stage: str, callback) -> bool:
+            logger.info("[shutdown] NPUWorker: starting %s", stage)
+            try:
+                callback()
+            except Exception as exc:
+                logger.exception("[shutdown] NPUWorker: failed %s", stage)
+                errors.append((stage, exc))
+                return False
+            logger.info("[shutdown] NPUWorker: completed %s", stage)
+            return True
+
+        connector_released = True
         if ensure_kv_transfer_shutdown is not None:
-            ensure_kv_transfer_shutdown()
+            connector_released = run_stage(
+                "kv_connector",
+                ensure_kv_transfer_shutdown,
+            )
 
         if self.profiler is not None:
-            self.profiler.shutdown()
+            run_stage("profiler", self.profiler.shutdown)
 
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
-            weight_transfer_engine.shutdown()
+            run_stage("weight_transfer_engine", weight_transfer_engine.shutdown)
 
         if model_runner := getattr(self, "model_runner", None):
             shutdown_fn = getattr(model_runner, "shutdown", None)
             if callable(shutdown_fn):
-                shutdown_fn()
+                if connector_released:
+                    run_stage("model_runner", shutdown_fn)
+                else:
+                    logger.error(
+                        "[shutdown] NPUWorker: skipped model_runner because kv_connector still may reference KV memory"
+                    )
+
+        if errors:
+            stages = ", ".join(stage for stage, _ in errors)
+            raise RuntimeError(f"NPUWorker shutdown failed in stages: {stages}") from errors[0][1]
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks

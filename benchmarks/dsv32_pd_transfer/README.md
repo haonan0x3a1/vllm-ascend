@@ -10,7 +10,9 @@ fixed revision:
 It answers two different questions in separate runs:
 
 1. Headline A/B: TTFT, TPOT, E2E, and throughput with profiling disabled.
-2. Stage breakdown: one explicitly profiled MemFabric request using the trace
+2. Background Host stages: one MemFabric request with low-overhead aggregate
+   timers in the Connector transfer threads.
+3. NPU trace scopes: one explicitly profiled MemFabric request using the trace
    scopes below.
 
 ## One-time setup
@@ -48,6 +50,43 @@ mean MemFabric is slower; positive throughput deltas mean it is faster.
 Each repetition must complete every request and leave Prefill, Decode, and the
 proxy healthy; the suite stops immediately when either check fails.
 
+## One background-stage MemFabric request
+
+Torch profiler scopes are thread-local in this runtime. The model-execution
+thread therefore captured the NPU-to-Host Full-KV copy and Host-to-NPU Gather,
+but did not capture the Connector sender/receiver threads. Use the opt-in Host
+timers for those missing stages.
+
+Set these values in the runtime config before starting the services:
+
+```bash
+ENABLE_TORCH_PROFILER=false
+SPARSE_KV_STAGE_METRICS=true
+```
+
+After all services are ready, run exactly one request:
+
+```bash
+cd /workspace/w50062541/code/vllm-ascend/benchmarks/dsv32_pd_transfer
+bash run.sh stage-one 3018
+
+cd /workspace/w50062541/code/vllm-ascend/examples/disaggregated_prefill_v1/dsv32_sparse_offload_poc
+bash run.sh stage-summary
+```
+
+`stage-summary` requires one completed record from every Prefill and Decode TP
+rank. It reports Host-observed synchronous durations for:
+
+- Prefill visibility-event wait;
+- MemFabric Full-KV Host-to-Host copy;
+- Mooncake Indexer NPU-to-NPU transfer;
+- layer ACK round trip;
+- Decode Full-KV visibility fence.
+
+The aggregate state is shared by work handled on one background thread, so this
+probe deliberately sends one request with no concurrency. These durations are
+not NPU kernel timings and are not added together as end-to-end latency.
+
 ## One profiled MemFabric request
 
 Profiler traces are diagnostic evidence, not headline performance. Set these
@@ -76,6 +115,11 @@ proxy, then stops both profilers. Search the traces for:
 - `dsv32_pd_transfer:layer_ack_round_trip`
 - `dsv32_pd_transfer:decode_full_kv_visibility_fence`
 - `dsv32_pd_transfer:gather_selected_kv_host_to_npu`
+
+Only `copy_full_kv_npu_to_host` and
+`gather_selected_kv_host_to_npu` are expected from the current raw Ascend
+trace. The five background-thread stages are covered by the Host-observed probe
+above; their absence from the raw trace is not a fallback to the old data path.
 
 The Gather scope must be interpreted from its NPU kernels in the trace. Its CPU
 scope duration is dispatch overhead, not the Host-to-NPU Gather execution time.

@@ -16,6 +16,7 @@ Commands:
   ready                         Check Prefill, Decode, and the P/D proxy.
   bench <mode> <input> <run>    Run one headline measurement.
   bench-suite <mode>            Run every configured input and repetition.
+  stage-one <input>             Run one request with background stage metrics.
   profile-one <input>           Capture one MemFabric BM profiler request.
   analyze-profile               Convert raw Ascend traces to trace_view.json.
   summarize-profile             Print the captured PD stage timing summary.
@@ -46,8 +47,13 @@ fi
 # shellcheck disable=SC1090
 source "$RUNTIME_CONFIG"
 ENABLE_TORCH_PROFILER=${ENABLE_TORCH_PROFILER:-false}
+SPARSE_KV_STAGE_METRICS=${SPARSE_KV_STAGE_METRICS:-false}
 if [[ "$ENABLE_TORCH_PROFILER" != "true" && "$ENABLE_TORCH_PROFILER" != "false" ]]; then
     echo "ENABLE_TORCH_PROFILER must be true or false, got: $ENABLE_TORCH_PROFILER" >&2
+    exit 1
+fi
+if [[ "$SPARSE_KV_STAGE_METRICS" != "true" && "$SPARSE_KV_STAGE_METRICS" != "false" ]]; then
+    echo "SPARSE_KV_STAGE_METRICS must be true or false, got: $SPARSE_KV_STAGE_METRICS" >&2
     exit 1
 fi
 
@@ -294,6 +300,17 @@ profile_one() {
     return "$status"
 }
 
+stage_one() {
+    local input_len=$1
+    validate_mode memfabric_bm
+    require_headline_mode
+    if [[ "$SPARSE_KV_STAGE_METRICS" != "true" ]]; then
+        echo "stage-one requires SPARSE_KV_STAGE_METRICS=true before service startup." >&2
+        exit 1
+    fi
+    run_bench memfabric_bm "$input_len" stage "$PROFILE_RESULT_DIR" 1 0
+}
+
 summarize_profile() {
     validate_mode memfabric_bm
     "$MOONCAKE_PYTHON" "$SCRIPT_DIR/profile_tools.py" summarize-traces \
@@ -317,6 +334,7 @@ case "$ACTION" in
         run_bench "${2:-}" "${3:-}" "${4:-}" "$RAW_RESULT_DIR" "$BENCH_NUM_PROMPTS" "$BENCH_NUM_WARMUPS"
         ;;
     bench-suite) bench_suite "${2:-}" ;;
+    stage-one) stage_one "${2:-}" ;;
     profile-one) profile_one "${2:-}" ;;
     analyze-profile) analyze_profile ;;
     summarize-profile) summarize_profile ;;

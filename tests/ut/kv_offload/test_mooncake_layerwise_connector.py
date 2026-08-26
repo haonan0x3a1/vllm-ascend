@@ -59,6 +59,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     ReqMeta,
     SendReqInfo,
     SendTask,
+    TransferStageMetrics,
     ensure_zmq_recv,
     ensure_zmq_send,
     group_concurrent_contiguous,
@@ -73,6 +74,41 @@ for _k, _v in _saved_modules.items():
 
 GET_META_MSG = b"get_meta_msg"
 DONE_SENDING_MSG = b"done_sending_msg"
+
+
+def test_transfer_stage_metrics_aggregate_and_reset() -> None:
+    metrics = TransferStageMetrics(enabled=True, role="prefill", tp_rank=3)
+
+    with patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.time.perf_counter_ns",
+        side_effect=[1_000_000, 4_000_000, 10_000_000, 15_000_000],
+    ):
+        with metrics.measure("host_to_host"):
+            pass
+        with metrics.measure("host_to_host"):
+            pass
+
+    payload = metrics.emit(["request-1"])
+
+    assert payload is not None
+    assert payload["role"] == "prefill"
+    assert payload["tp_rank"] == 3
+    assert payload["stages"]["host_to_host"] == {
+        "count": 2,
+        "total_ms": 8.0,
+        "mean_ms": 4.0,
+        "max_ms": 5.0,
+    }
+    assert metrics.stages == {}
+
+
+def test_transfer_stage_metrics_disabled_has_no_samples() -> None:
+    metrics = TransferStageMetrics(enabled=False, role="decode", tp_rank=0)
+
+    with metrics.measure("fence"):
+        pass
+
+    assert metrics.emit(["request-1"]) is None
 
 
 def _make_layer_metadata(**overrides):
@@ -541,6 +577,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
                     block_size_scale=[1, 1],
                 )
             },
+            stage_metrics_enabled=True,
             layer_callback_func=layer_callback,
         )
         req_meta = self.req_meta_base
@@ -592,6 +629,16 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             "layer0",
             0,
         )
+        self.assertEqual(
+            set(thread.stage_metrics.stages),
+            {
+                "wait_prefill_full_kv_visible",
+                "memfabric_full_kv_host_to_host",
+                "mooncake_indexer_npu_to_npu",
+                "layer_ack_round_trip",
+            },
+        )
+        self.assertTrue(all(aggregate.count == 1 for aggregate in thread.stage_metrics.stages.values()))
 
 
 class TestKVCacheRecvingLayerThread(unittest.TestCase):
@@ -674,12 +721,12 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
         with th.lock:
             th.task_tracker["reqX"] = set()
 
-        th.update_done_task("reqX", 2, "path1")
+        self.assertFalse(th.update_done_task("reqX", 2, "path1"))
         with th.lock:
             self.assertIn("reqX", th.task_tracker)
             self.assertNotIn("reqX", th.done_requests)
 
-        th.update_done_task("reqX", 2, "path2")
+        self.assertTrue(th.update_done_task("reqX", 2, "path2"))
         with th.lock:
             self.assertNotIn("reqX", th.task_tracker)
             self.assertIn("reqX", th.done_requests)
@@ -744,6 +791,7 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
             sparse_host_final_kv_caches={"layer0": final},
             sparse_host_staging_kv=staging,
             memfabric_bm_allocator=allocator,
+            stage_metrics_enabled=True,
         )
 
         thread.persist_staged_layer("layer0", [3, 1, 1])
@@ -751,6 +799,10 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
         torch.testing.assert_close(final[0], expected[0])
         torch.testing.assert_close(final[1], expected[1])
         allocator.synchronize_device_visibility.assert_called_once_with()
+        self.assertEqual(
+            thread.stage_metrics.stages["decode_full_kv_visibility_fence"].count,
+            1,
+        )
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.torch.npu.synchronize")
     def test_persist_host_relay_bridges_through_npu_staging(self, mock_sync):
@@ -1700,6 +1752,36 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         self.assertFalse(worker.uses_sparse_host_relay)
         self.assertIsNone(worker.host_engine)
         self.mock_create_host_transfer_engine.assert_not_called()
+
+    def test_init_enables_stage_metrics_only_for_memfabric_bm(self):
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: {
+            "sparse_kv_transfer_mode": "memfabric_bm",
+            "sparse_kv_stage_metrics": True,
+        }.get(key, default)
+
+        worker = MooncakeLayerwiseConnectorWorker(
+            self.vllm_config,
+            self.kv_cache_config,
+            self.engine_id,
+        )
+
+        self.assertTrue(worker.stage_metrics_enabled)
+
+    def test_init_rejects_stage_metrics_for_npu_staging(self):
+        self.vllm_config.kv_transfer_config.get_from_extra_config.side_effect = lambda key, default: {
+            "sparse_kv_transfer_mode": "npu_staging",
+            "sparse_kv_stage_metrics": True,
+        }.get(key, default)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "sparse_kv_stage_metrics requires",
+        ):
+            MooncakeLayerwiseConnectorWorker(
+                self.vllm_config,
+                self.kv_cache_config,
+                self.engine_id,
+            )
 
     def test_shutdown_stops_threads_before_releasing_cache_references(self):
         worker = object.__new__(MooncakeLayerwiseConnectorWorker)
