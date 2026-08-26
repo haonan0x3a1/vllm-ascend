@@ -4372,20 +4372,41 @@ class NPUModelRunner(GPUModelRunner):
             self._memfabric_bm_full_kv_allocator = allocator
         return allocator.allocate_int8(numel, device=self.device)
 
-    def shutdown(self) -> None:
-        """Release all Tensor aliases before destroying the MemFabric pool."""
-        allocator = getattr(self, "_memfabric_bm_full_kv_allocator", None)
-        super().shutdown()
-        if allocator is None:
-            return
+    def _clear_memfabric_bm_full_kv_aliases(self) -> None:
+        """Drop every model-runner reference to BM-backed Tensor aliases."""
+        if hasattr(self, "kv_caches") and self.kv_caches:
+            for index in range(len(self.kv_caches)):
+                self.kv_caches[index] = None
+            self.kv_caches.clear()
+        if hasattr(self, "cross_layers_kv_cache"):
+            self.cross_layers_kv_cache = None
+            self.cross_layers_attn_backend = None
 
-        # The parent clears bound KV caches and attention-layer references.
-        # Force Python Tensor/Storage finalizers to run before BM unmaps the
-        # backing DRAM pages. The connector has already been shut down by the
-        # Worker, so no background thread may retain or access these aliases.
+        for layer in self.compilation_config.static_forward_context.values():
+            if hasattr(layer, "kv_cache"):
+                layer.kv_cache = (
+                    torch.tensor([])
+                    if isinstance(layer.kv_cache, torch.Tensor)
+                    else []
+                )
+
+        # The connector has already stopped its background threads and dropped
+        # its cache references. Run Tensor/Storage finalizers while the BM pool
+        # is still valid, before its device mapping is destroyed.
         gc.collect()
-        allocator.close()
-        del self._memfabric_bm_full_kv_allocator
+
+    def shutdown(self) -> None:
+        """Destroy the BM pool before the parent empties the NPU cache."""
+        allocator = getattr(self, "_memfabric_bm_full_kv_allocator", None)
+        if allocator is not None:
+            self._clear_memfabric_bm_full_kv_aliases()
+            allocator.close()
+            del self._memfabric_bm_full_kv_allocator
+
+        # GPUModelRunner.shutdown() calls torch.accelerator.empty_cache(). BM
+        # must already be closed or torch_npu may try to unmap allocator
+        # handles while MemFabric still owns the unified device mapping.
+        super().shutdown()
 
     def _allocate_sparse_c8_indexer_tensors(
         self,

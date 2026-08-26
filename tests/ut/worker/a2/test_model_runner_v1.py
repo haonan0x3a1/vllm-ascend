@@ -1,4 +1,5 @@
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -187,20 +188,39 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(allocator.allocate_int8.call_count, 2)
 
     @patch("vllm.v1.worker.gpu_model_runner.GPUModelRunner.shutdown")
-    def test_shutdown_releases_parent_tensors_before_memfabric_pool(
+    def test_shutdown_releases_memfabric_pool_before_parent_empty_cache(
         self,
         mock_parent_shutdown,
     ):
         runner = self._build_runner()
+        runner.kv_caches = [torch.empty(1)]
+        alias_ref = weakref.ref(runner.kv_caches[0])
+        layer = SimpleNamespace(kv_cache=runner.kv_caches[0])
+        runner.compilation_config = SimpleNamespace(
+            static_forward_context={"layer0": layer},
+        )
         allocator = MagicMock()
         runner._memfabric_bm_full_kv_allocator = allocator
         order = []
-        mock_parent_shutdown.side_effect = lambda: order.append("parent")
-        allocator.close.side_effect = lambda: order.append("allocator")
+
+        def close_allocator():
+            self.assertEqual(runner.kv_caches, [])
+            self.assertEqual(layer.kv_cache.numel(), 0)
+            self.assertIsNone(alias_ref())
+            order.append("allocator")
+
+        def shutdown_parent():
+            self.assertFalse(
+                hasattr(runner, "_memfabric_bm_full_kv_allocator")
+            )
+            order.append("parent")
+
+        allocator.close.side_effect = close_allocator
+        mock_parent_shutdown.side_effect = shutdown_parent
 
         runner.shutdown()
 
-        self.assertEqual(order, ["parent", "allocator"])
+        self.assertEqual(order, ["allocator", "parent"])
         self.assertFalse(hasattr(runner, "_memfabric_bm_full_kv_allocator"))
 
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
