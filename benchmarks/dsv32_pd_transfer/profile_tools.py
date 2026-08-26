@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import statistics
 from collections import defaultdict
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 MODES = ("npu_staging", "memfabric_bm")
+PROFILE_SCOPE_PREFIX = "dsv32_pd_transfer:"
 LATENCY_METRICS = (
     "mean_ttft_ms",
     "median_ttft_ms",
@@ -215,6 +217,119 @@ def print_summary(summary: dict[str, Any]) -> None:
         )
 
 
+def _trace_role(source: Path) -> str:
+    for part in reversed(source.parts):
+        if part in ("prefill", "decode"):
+            return part
+    return "unknown"
+
+
+def _load_trace_events(source: Path) -> list[dict[str, Any]]:
+    opener = gzip.open if source.suffix == ".gz" else open
+    try:
+        with opener(source, "rt", encoding="utf-8") as trace_file:
+            payload = json.load(trace_file)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    if isinstance(payload, dict):
+        events = payload.get("traceEvents", [])
+    elif isinstance(payload, list):
+        events = payload
+    else:
+        return []
+    return [event for event in events if isinstance(event, dict)]
+
+
+def _scope_durations_us(events: list[dict[str, Any]]) -> dict[str, list[float]]:
+    durations: dict[str, list[float]] = defaultdict(list)
+    stacks: dict[tuple[Any, Any], list[tuple[str, float]]] = defaultdict(list)
+    for event in events:
+        name = event.get("name")
+        phase = event.get("ph")
+        if phase == "X" and isinstance(name, str) and name.startswith(PROFILE_SCOPE_PREFIX):
+            duration = event.get("dur")
+            if isinstance(duration, (int, float)) and duration >= 0:
+                durations[name].append(float(duration))
+            continue
+
+        thread_key = (event.get("pid"), event.get("tid"))
+        if phase == "B" and isinstance(name, str):
+            timestamp = event.get("ts")
+            if isinstance(timestamp, (int, float)):
+                stacks[thread_key].append((name, float(timestamp)))
+        elif phase == "E" and stacks[thread_key]:
+            begin_name, begin_timestamp = stacks[thread_key].pop()
+            timestamp = event.get("ts")
+            if (
+                begin_name.startswith(PROFILE_SCOPE_PREFIX)
+                and isinstance(timestamp, (int, float))
+                and timestamp >= begin_timestamp
+            ):
+                durations[begin_name].append(float(timestamp) - begin_timestamp)
+    return durations
+
+
+def summarize_trace_scopes(trace_dir: Path) -> dict[str, Any]:
+    sources = sorted(
+        {
+            *trace_dir.rglob("*.json"),
+            *trace_dir.rglob("*.json.gz"),
+        }
+    )
+    by_stage: dict[tuple[str, str], dict[str, list[float]]] = defaultdict(dict)
+    matched_sources: set[str] = set()
+    for source in sources:
+        source_durations = _scope_durations_us(_load_trace_events(source))
+        if not source_durations:
+            continue
+        source_name = str(source)
+        matched_sources.add(source_name)
+        role = _trace_role(source)
+        for stage, durations in source_durations.items():
+            by_stage[(role, stage)][source_name] = durations
+
+    if not by_stage:
+        raise ValueError(
+            f"No {PROFILE_SCOPE_PREFIX} events found under {trace_dir}. "
+            "Keep the trace directory and inspect its file layout before rerunning the model."
+        )
+
+    stages = []
+    for (role, stage), by_source in sorted(by_stage.items()):
+        all_durations = [duration for durations in by_source.values() for duration in durations]
+        per_trace_totals = [sum(durations) for durations in by_source.values()]
+        stages.append(
+            {
+                "role": role,
+                "stage": stage,
+                "trace_files": len(by_source),
+                "events": len(all_durations),
+                "mean_per_trace_total_ms": statistics.fmean(per_trace_totals) / 1000.0,
+                "max_per_trace_total_ms": max(per_trace_totals) / 1000.0,
+                "mean_event_ms": statistics.fmean(all_durations) / 1000.0,
+                "max_event_ms": max(all_durations) / 1000.0,
+                "sources": sorted(by_source),
+            }
+        )
+    return {
+        "trace_dir": str(trace_dir),
+        "json_files_scanned": len(sources),
+        "trace_files_matched": len(matched_sources),
+        "stages": stages,
+    }
+
+
+def print_trace_summary(summary: dict[str, Any]) -> None:
+    print("role     trace files  events  mean/trace total  mean/event  max/event  stage")
+    for item in summary["stages"]:
+        print(
+            f"{item['role']:<8} {item['trace_files']:>11}  {item['events']:>6}  "
+            f"{item['mean_per_trace_total_ms']:>16.3f} ms  "
+            f"{item['mean_event_ms']:>10.3f} ms  "
+            f"{item['max_event_ms']:>9.3f} ms  {item['stage']}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -232,6 +347,9 @@ def main() -> None:
     summarize.add_argument("--output", type=Path, required=True)
     validate = subparsers.add_parser("validate-result")
     validate.add_argument("--result", type=Path, required=True)
+    summarize_traces = subparsers.add_parser("summarize-traces")
+    summarize_traces.add_argument("--trace-dir", type=Path, required=True)
+    summarize_traces.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     if args.command == "preflight":
@@ -254,6 +372,14 @@ def main() -> None:
             "Benchmark result: PASS; "
             f"source={args.result}, completed={result['completed']}, failed={result['failed']}"
         )
+        return
+
+    if args.command == "summarize-traces":
+        summary = summarize_trace_scopes(args.trace_dir)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        print_trace_summary(summary)
+        print(f"Trace summary saved to: {args.output}")
         return
 
     summary = summarize_results(load_results(args.result_dir))

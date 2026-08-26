@@ -17,6 +17,7 @@ Commands:
   bench <mode> <input> <run>    Run one headline measurement.
   bench-suite <mode>            Run every configured input and repetition.
   profile-one <input>           Capture one MemFabric BM profiler request.
+  summarize-profile             Print the captured PD stage timing summary.
   summarize                     Compare npu_staging with memfabric_bm.
   help                          Show this help.
 
@@ -69,6 +70,7 @@ done
 RAW_RESULT_DIR="$OUTPUT_DIR/dsv32-pd-transfer-profile/raw/$BENCH_CAMPAIGN"
 PROFILE_RESULT_DIR="$OUTPUT_DIR/dsv32-pd-transfer-profile/profiler/$BENCH_CAMPAIGN"
 SUMMARY_PATH="$OUTPUT_DIR/dsv32-pd-transfer-profile/summary-$BENCH_CAMPAIGN.json"
+PROFILE_STAGE_SUMMARY_PATH="$PROFILE_RESULT_DIR/stage-summary.json"
 
 validate_mode() {
     local mode=$1
@@ -290,6 +292,13 @@ profile_one() {
     return "$status"
 }
 
+summarize_profile() {
+    validate_mode memfabric_bm
+    "$MOONCAKE_PYTHON" "$SCRIPT_DIR/profile_tools.py" summarize-traces \
+        --trace-dir "$TORCH_PROFILER_DIR/$SPARSE_KV_TRANSFER_MODE" \
+        --output "$PROFILE_STAGE_SUMMARY_PATH"
+}
+
 prepare_environment
 case "$ACTION" in
     preflight) preflight ;;
@@ -300,6 +309,7 @@ case "$ACTION" in
         ;;
     bench-suite) bench_suite "${2:-}" ;;
     profile-one) profile_one "${2:-}" ;;
+    summarize-profile) summarize_profile ;;
     summarize)
         "$MOONCAKE_PYTHON" "$SCRIPT_DIR/profile_tools.py" summarize \
             --result-dir "$RAW_RESULT_DIR" \

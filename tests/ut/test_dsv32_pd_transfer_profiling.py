@@ -174,3 +174,85 @@ def test_summary_refuses_to_compare_different_revisions() -> None:
                 _result("memfabric_bm", 1, revision="different-revision"),
             ]
         )
+
+
+def test_trace_summary_reports_per_role_trace_means(tmp_path: Path) -> None:
+    traces = tmp_path / "traces" / "memfabric_bm"
+    prefill_0 = traces / "prefill" / "rank0" / "trace_view.json"
+    prefill_1 = traces / "prefill" / "rank1" / "trace_view.json"
+    decode_0 = traces / "decode" / "rank0" / "trace_view.json"
+    for source in (prefill_0, prefill_1, decode_0):
+        source.parent.mkdir(parents=True, exist_ok=True)
+
+    prefill_0.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    {
+                        "name": "dsv32_pd_transfer:memfabric_full_kv_host_to_host",
+                        "ph": "X",
+                        "dur": 2000,
+                    },
+                    {"name": "unrelated", "ph": "X", "dur": 9999},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    prefill_1.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "dsv32_pd_transfer:memfabric_full_kv_host_to_host",
+                    "ph": "B",
+                    "ts": 100,
+                    "pid": 1,
+                    "tid": 2,
+                },
+                {"ph": "E", "ts": 4100, "pid": 1, "tid": 2},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    decode_0.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    {
+                        "name": "dsv32_pd_transfer:decode_full_kv_visibility_fence",
+                        "ph": "X",
+                        "dur": 500,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = PROFILE_TOOLS.summarize_trace_scopes(traces)
+
+    by_stage = {(item["role"], item["stage"]): item for item in summary["stages"]}
+    host_transfer = by_stage[
+        ("prefill", "dsv32_pd_transfer:memfabric_full_kv_host_to_host")
+    ]
+    assert host_transfer["trace_files"] == 2
+    assert host_transfer["events"] == 2
+    assert host_transfer["mean_per_trace_total_ms"] == 3.0
+    assert host_transfer["mean_event_ms"] == 3.0
+    assert host_transfer["max_event_ms"] == 4.0
+
+    fence = by_stage[
+        ("decode", "dsv32_pd_transfer:decode_full_kv_visibility_fence")
+    ]
+    assert fence["mean_per_trace_total_ms"] == 0.5
+
+
+def test_trace_summary_rejects_missing_custom_scopes(tmp_path: Path) -> None:
+    source = tmp_path / "trace_view.json"
+    source.write_text(
+        json.dumps({"traceEvents": [{"name": "unrelated", "ph": "X", "dur": 1}]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="No dsv32_pd_transfer"):
+        PROFILE_TOOLS.summarize_trace_scopes(tmp_path)

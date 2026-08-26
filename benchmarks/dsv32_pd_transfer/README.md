@@ -62,6 +62,7 @@ After all services are ready:
 
 ```bash
 bash run.sh profile-one 3018
+bash run.sh summarize-profile
 ```
 
 The script starts both engine profilers directly, sends one request through the
@@ -77,6 +78,11 @@ proxy, then stops both profilers. Search the traces for:
 
 The Gather scope must be interpreted from its NPU kernels in the trace. Its CPU
 scope duration is dispatch overhead, not the Host-to-NPU Gather execution time.
+`summarize-profile` scans the generated Chrome-trace JSON files and prints each
+custom scope's event count, mean per-trace-file total, mean event duration,
+and maximum event duration. It keeps the source-file list in
+`profiler/$BENCH_CAMPAIGN/stage-summary.json`; totals across TP ranks must not be
+interpreted as wall-clock latency.
 
 ## Current evidence boundary
 
