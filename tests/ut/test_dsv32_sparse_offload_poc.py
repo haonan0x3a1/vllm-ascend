@@ -38,6 +38,7 @@ def test_service_log_capture_ignores_sigint_until_cleanup_finishes():
     run_script = RUN_SCRIPT_PATH.read_text(encoding="utf-8")
 
     assert '2>&1 | tee -i "$log_file"' in run_script
+    assert '2>&1 | tee -i "$PROXY_LOG"' in run_script
 
 
 def test_runtime_config_exposes_opt_in_stage_metrics():
@@ -46,7 +47,15 @@ def test_runtime_config_exposes_opt_in_stage_metrics():
     assert '"sparse_kv_stage_metrics": stage_metrics == "true"' in run_script
     assert "stage-summary)" in run_script
     assert '--stage-metrics-output "$STAGE_METRICS_OUTPUT"' in run_script
-    assert '2>&1 | tee -i "$PROXY_LOG"' in run_script
+
+
+def test_runtime_uses_graceful_shutdown_timeout_and_scoped_stop():
+    run_script = RUN_SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert '--shutdown-timeout "$SHUTDOWN_TIMEOUT_SECONDS"' in run_script
+    assert 'stop_role "${2:-}"' in run_script
+    assert 'kill -TERM "$pid"' in run_script
+    assert "pkill" not in run_script
 
 
 def test_runtime_modules_load_torch_before_custom_extensions():

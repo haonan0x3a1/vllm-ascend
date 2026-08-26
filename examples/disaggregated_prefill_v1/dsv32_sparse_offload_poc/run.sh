@@ -35,6 +35,7 @@ Commands:
   prefill               Start the Prefill service in the foreground.
   proxy                 Start the P/D proxy in the foreground.
   ready <role>          Check decode, prefill, or proxy readiness.
+  stop <role>           Gracefully stop prefill or decode via its API PID.
   validate              Run the final below/above-Top-K request suite.
   stage-summary         Summarize Host-observed background transfer timings.
   verify-shutdown       Verify every MemFabric BM worker released its allocator.
@@ -76,6 +77,7 @@ MEMFABRIC_BM_ID=${MEMFABRIC_BM_ID:-74}
 ENABLE_TORCH_PROFILER=${ENABLE_TORCH_PROFILER:-false}
 TORCH_PROFILER_DIR=${TORCH_PROFILER_DIR:-"$OUTPUT_DIR/dsv32-pd-transfer-profile/traces"}
 SPARSE_KV_STAGE_METRICS=${SPARSE_KV_STAGE_METRICS:-false}
+SHUTDOWN_TIMEOUT_SECONDS=${SHUTDOWN_TIMEOUT_SECONDS:-120}
 
 if [[ "$ENABLE_TORCH_PROFILER" != "true" && "$ENABLE_TORCH_PROFILER" != "false" ]]; then
     echo "ENABLE_TORCH_PROFILER must be true or false, got: $ENABLE_TORCH_PROFILER" >&2
@@ -83,6 +85,10 @@ if [[ "$ENABLE_TORCH_PROFILER" != "true" && "$ENABLE_TORCH_PROFILER" != "false" 
 fi
 if [[ "$SPARSE_KV_STAGE_METRICS" != "true" && "$SPARSE_KV_STAGE_METRICS" != "false" ]]; then
     echo "SPARSE_KV_STAGE_METRICS must be true or false, got: $SPARSE_KV_STAGE_METRICS" >&2
+    exit 1
+fi
+if [[ ! "$SHUTDOWN_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SHUTDOWN_TIMEOUT_SECONDS must be a positive integer, got: $SHUTDOWN_TIMEOUT_SECONDS" >&2
     exit 1
 fi
 
@@ -341,6 +347,7 @@ print(json.dumps({
         --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
         --block-size "$BLOCK_SIZE" \
         --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+        --shutdown-timeout "$SHUTDOWN_TIMEOUT_SECONDS" \
         --no-enable-prefix-caching \
         --enforce-eager \
         --additional-config "$additional_config" \
@@ -360,6 +367,42 @@ ready() {
     esac
     curl --noproxy '*' --max-time 30 --fail-with-body --show-error "$url"
     echo
+}
+
+stop_role() {
+    local role=${1:-}
+    local log_file api_port
+    case "$role" in
+        prefill)
+            log_file=$PREFILL_LOG
+            api_port=$PREFILL_API_PORT
+            ;;
+        decode)
+            log_file=$DECODE_LOG
+            api_port=$DECODE_API_PORT
+            ;;
+        *)
+            echo "stop requires one of: prefill, decode" >&2
+            exit 1
+            ;;
+    esac
+
+    local pid
+    pid=$(grep -oE '\(APIServer pid=[0-9]+\)' "$log_file" | tail -n 1 | tr -cd '0-9')
+    if [[ -z "$pid" || ! -r "/proc/$pid/cmdline" ]]; then
+        echo "No running $role APIServer PID found in $log_file" >&2
+        exit 1
+    fi
+
+    local cmdline
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+    if [[ "$cmdline" != *"vllm.entrypoints.cli.main serve"* || "$cmdline" != *"--port $api_port"* ]]; then
+        echo "Refusing to signal PID $pid because it is not the expected $role APIServer: $cmdline" >&2
+        exit 1
+    fi
+
+    kill -TERM "$pid"
+    echo "Sent SIGTERM to $role APIServer PID $pid; wait for its service terminal to return to shell."
 }
 
 prepare_environment
@@ -456,6 +499,9 @@ case "$ACTION" in
         ;;
     ready)
         ready "${2:-}"
+        ;;
+    stop)
+        stop_role "${2:-}"
         ;;
     validate)
         "$MOONCAKE_PYTHON" "$SCRIPT_DIR/poc_tools.py" validate \
